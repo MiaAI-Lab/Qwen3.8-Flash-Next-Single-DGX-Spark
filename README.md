@@ -27,19 +27,28 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
-With the shipped `.env.sample` (262,144 native context, MTP 3,
-`KV_TARGET_GIB=20`, `MAX_NUM_SEQS=4`), measured on this host 2026-09-04:
+`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
+`KV_CACHE_DTYPE=auto`, `MAX_NUM_SEQS=4`**. Everything below was measured on
+this host on 2026-09-04; each row names the configuration it came from, because
+the numbers move a lot between them.
 
-| | |
-|---|---|
-| Available KV cache | 21.28 GiB = **736,837 tokens** (2.81x a full 262k request) |
-| Host MemAvailable under load | **~10 GiB**, with ~10 GiB page cache |
-| KV dtype / size | bf16, ~28.8 KiB per token |
+| Configuration | KV pool | Prefill @400k | Decode (prose, idle) | Needles 5/50/95% |
+|---|---|---|---|---|
+| 262k, `KV_TARGET_GIB=20`, BF16 | 21.28 GiB = 736,837 tok (2.81x a 262k req) | — | — | — |
+| 512k YaRN, `KV_TARGET_GIB=20`, BF16 | 19.2 GiB = 704,558 tok (1.34x a 512k req) | 1,537 tok/s (TTFT 260.3 s) | 28.3 tok/s (sd 2.6) | 3/3 PASS |
+| 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s) | 27.1 tok/s (sd 1.3) | 3/3 PASS |
 
-Speed numbers below are from the identical recipe on the sibling Spark and
-have **not** yet been re-measured here: decode ~25 tok/s prose / ~30 tok/s code
-(MTP 3, temp 0), prefill ~1,750 tok/s at 200k, needle at 90% depth of a 201k
-prompt retrieved correctly.
+Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
+during a 400k prefill — see the safety rules for why that floor matters.
+
+Two honest gaps: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
+BF16) has not been benchmarked — the 262k row above is from the older
+`KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. And no
+**short-context** prefill has been measured in any configuration; all prefill
+figures are at 400k.
+
+Reference numbers from the identical recipe on a sibling Spark, not reproduced
+here: ~30 tok/s decode on code, ~1,750 tok/s prefill at 200k.
 
 ## Multimodal (images and video)
 
@@ -116,16 +125,19 @@ actually reads. The existing `mrope_section`, `rope_theta` and
 `partial_rotary_factor` are preserved, so the attention path keeps the same
 `MRotaryEmbedding` and mrope stays enabled.
 
-512k fits the shipped profile with **no other change**: it needs 14.4 GiB of KV
-against the ~20 GiB the default `KV_TARGET_GIB=20` already provides, and the GPU
-budget and cgroup cap are unchanged from 262k. Measured on this host at
-`YARN=1` (2026-09-04):
+512k fits with **no other change**: it needs 14.4 GiB of KV, well inside what
+`KV_TARGET_GIB` provides at either 20 or the shipped 22, and the GPU budget and
+cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
+`KV_TARGET_GIB=20` (2026-09-04):
 
 | | |
 |---|---|
-| Available KV cache | 19.14 GiB = **701,554 tokens** (1.34x a full 524,288 request) |
+| Available KV cache | 19.2 GiB = **704,558 tokens** (1.34x a full 524,288 request) |
 | Host MemAvailable idle | ~11.3 GiB |
 | Output | coherent; MTP 3 and YaRN run together without incident |
+
+At `KV_TARGET_GIB=22` with FP8 the same context gets 2.73x headroom instead of
+1.34x — see [FP8 KV cache](#fp8-kv-cache-opt-in).
 
 400k prefill stress test (`bench/longctx.py --target 400000`, salted to defeat
 prefix caching, needles at 5% / 50% / 95% depth):
@@ -154,6 +166,71 @@ YaRN trades some short-context accuracy for the longer window, so leave it off
 unless you need more than 262k. The 512k path serves correctly but its decode
 and prefill speeds have not yet been benchmarked.
 
+### FP8 KV cache (opt-in)
+
+`KV_CACHE_DTYPE=fp8` roughly doubles the KV pool by storing the main KV in
+fp8-e4m3 and dequantising each tile inside the QSA Triton kernels. Off by
+default (`auto` = BF16).
+
+```
+KV_CACHE_DTYPE=auto   # BF16 (default)
+KV_CACHE_DTYPE=fp8    # ~2x KV pool, enables a 1M context
+```
+
+Measured on this host 2026-09-04, identical prompts, `YARN=1`,
+`KV_TARGET_GIB=22`, idle server:
+
+| | BF16 | FP8 | Δ |
+|---|---|---|---|
+| KV pool | 704,558 tok | **1,431,164 tok** | **+103%** |
+| Concurrency @ 524,288 | 1.34x | **2.73x** | +104% |
+| KV memory | 19.2 GiB | 22.2 GiB | — |
+| Prefill @400k | 1,537 tok/s | 1,495 tok/s | −2.7% |
+| TTFT @400k | 260.3 s | 267.7 s | +2.8% |
+| Decode (prose, idle) | 28.3 tok/s (sd 2.6) | 27.1 tok/s (sd 1.3) | −4% |
+| Needles @400k (5/50/95%) | 3/3 PASS | **3/3 PASS** | same |
+
+Capacity works out at **2.03x tokens per GiB** — only the 12 full-attention
+layers shrink (~84% of bytes/token); the QSA side/compressor caches stay BF16.
+That is why `KV_MULT` in `start.sh` is 0.58, not 0.5.
+
+**Two caveats before trusting these numbers.**
+
+*The speed cost is measured at one point on the curve.* The reference
+implementation (see credit below) reported **−30% prefill** and −9% decode,
+against our −2.7% and −4%. That is very likely not a contradiction: their
+prefill figure is at **32k**, ours at **400k**. FP8 halves `block_n` to fit
+GB10 shared memory, which costs occupancy and launch overhead on a short
+kernel but amortises away over a 400k context. **Short-context prefill with
+FP8 has not been measured here and is probably materially worse than −2.7%.**
+
+*Quality is not settled.* Needle retrieval passing at 5/50/95% depth shows the
+scales and dequantisation are broadly right, and short factual/arithmetic
+answers were correct. It does **not** clear the failure mode that matters: the
+reference measured a long-reasoning benchmark falling from **6/6 to 2/6** with
+FP8 KV. This is sparse attention — quantised keys perturb which blocks the
+indexer selects, not merely the attention output — so degradation can appear
+as fluent, plausible, wrong reasoning while needles still pass. No
+long-reasoning A/B has been run on this host. Treat FP8 as a capacity trade
+for workloads you have validated yourself.
+
+### PLE mmap access pattern
+
+The packed PLE table is advised `MADV_RANDOM` (in `patch_ple_offload.py`).
+Without it the kernel faults in a ~64 KiB window to serve each 90-byte row
+lookup. Measured on this host:
+
+| | default mmap | `MADV_RANDOM` |
+|---|---|---|
+| Disk read per decoded token | ~1,366 KiB | **57 KiB** (−24x) |
+| Decode | 26.3 tok/s (sd 1.6) | 28.3 tok/s (sd 2.6) |
+| Host MemAvailable | ~10.9 GiB | **~12.95 GiB** |
+
+The decode difference is within noise — decode was never disk-*throughput*
+bound (1.4 MiB/token at 26 tok/s is only ~36 MB/s). The real win is the
+~2 GiB of unified memory no longer wasted on readahead that is thrown away,
+which is what makes `KV_TARGET_GIB=22` viable.
+
 ## Safety rules
 
 Each of these cost a hard host hang during bring-up.
@@ -166,11 +243,16 @@ Each of these cost a hard host hang during bring-up.
   launches ComfyUI (a GPU co-tenant) as soon as anything answers there.
   `start.sh` refuses port 8888 while that service is active.
 - **Never set `PLE_OFFLOAD=false` at TP=1** — 99 GB through UVM hangs the host.
-- **FP8 KV cache is unsupported** by this model's QSA attention backend
-  (`supported_kv_cache_dtypes = ["auto","bfloat16"]`).
-- **Do not raise `YARN_CEILING_MODEL_LEN` past 524288.** A 1M context needs
-  ~28.8 GiB of KV, which drives the container cap to 112 GiB against a
-  105 GiB hard ceiling. `start.sh` refuses it twice over; don't work around it.
+- **The stock QSA backend refuses FP8 KV** (`supported_kv_cache_dtypes =
+  ["auto","bfloat16"]`). `patch_qsa_fp8_kv.py` in this repo adds it; without
+  that patch `KV_CACHE_DTYPE=fp8` cannot work, and reading a quantised cache
+  as BF16 would produce silent garbage rather than an error.
+- **Do not raise `YARN_CEILING_MODEL_LEN` past 524288 at BF16.** A 1M context
+  needs ~28.8 GiB of KV, driving the container cap to 112 GiB against a 105 GiB
+  hard ceiling; `start.sh` refuses it at two independent checks. With
+  `KV_CACHE_DTYPE=fp8` a 1M request needs only ~16.7 GiB and the budget does
+  fit — but 1M has **never been run on this host**, at either dtype. Raising
+  the ceiling means you are the one testing it.
 - `docker --memory` does not bound GPU allocations on GB10, only host-side
   memory. vLLM's `--gpu-memory-utilization` is what bounds the GPU.
 

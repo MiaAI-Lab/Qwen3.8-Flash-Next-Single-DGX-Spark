@@ -223,6 +223,15 @@ patch(
             '    k_cache = _qsa_as_fp8(k_cache, kv_quant_mode, "key")\n'
             '    v_cache = _qsa_as_fp8(v_cache, kv_quant_mode, "value")\n',
         ),
+        # -- the runtime dtype assert: fp8 caches are legal now -------------
+        (
+            "    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16\n",
+            "    assert q.dtype == torch.bfloat16\n"
+            "    if kv_quant_mode:\n"
+            "        assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn\n"
+            "    else:\n"
+            "        assert k_cache.dtype == v_cache.dtype == torch.bfloat16\n",
+        ),
         (
             "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)\n",
             "    if kv_quant_mode:\n"
