@@ -168,8 +168,8 @@ case "$KV_CACHE_DTYPE" in
     auto|bfloat16) ;;
     fp8|fp8_e4m3)
         warn "KV_CACHE_DTYPE=$KV_CACHE_DTYPE: FP8 KV is a CAPACITY TRADE, not a free win."
-        warn "     ~1.7x more KV tokens (1M context becomes reachable), but the reference"
-        warn "     implementation measured ~30% slower prefill, ~9% slower decode, and a"
+        warn "     ~1.7x more KV tokens (1M context becomes reachable). The speed cost is"
+        warn "     now small here (see README), but the reference implementation measured a"
         warn "     long-reasoning benchmark falling from 6/6 to 2/6. This is sparse"
         warn "     attention: quantised keys perturb which blocks the indexer selects."
         warn "     Re-validate quality on your own workload before trusting it."
