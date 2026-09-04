@@ -5,6 +5,89 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-05
+
+### Fixed
+
+- **The GPU budget had no term for the host, and three servers died of it**
+  (2026-09-04, `KV_TARGET_GIB=22`, under a five-agent qwen-code harness sending
+  370 requests averaging 72k input tokens). `start.sh` sized the GPU budget as
+  `weights + overhead + MTP + KV_TARGET_GIB` and vLLM, which detects this GPU
+  as integrated and treats host `MemAvailable` as free GPU memory, filled the
+  GPU side to exactly that number. That left 20.7 GiB of the 121.6 GiB pool for
+  a host that needs at least 22: other containers and sessions ~7 GiB, vLLM's
+  host-side processes ~6, PLE page cache ≥6, free pages the NVIDIA driver needs
+  ≥3 — before 2–3 GiB of per-request growth that the CUDA caching allocator
+  never returns while serving (this build's UMA release valve is only called
+  from the model loader). The servers idled 1–3 GiB above the 6 GiB watchdog
+  floor, the driver logged `NV_ERR_NO_MEMORY` at `MemFree` ~3 GiB, and the
+  watchdog fired. The previous entry's reading of deaths 1–2 as watchdog noise
+  was wrong; the debounce stays, it just was not the cause.
+
+  `start.sh` now caps the budget from the host side:
+  `min(weights + overhead + MTP + max(kv_need, KV_TARGET_GIB), MemTotal −
+  HOST_RESERVE_GIB)`, `HOST_RESERVE_GIB` defaulting to 26, KV derived from the
+  capped budget ("KV target 22 reduced to 16.67 by HOST_RESERVE_GIB=26"), and
+  refuses to launch if the capped KV is under what `MAX_MODEL_LEN` needs. It
+  prints the reserve and the live non-vLLM host footprint (warns above 9 GiB),
+  and warns when a pinned `GPU_MEMORY_UTILIZATION` exceeds the cap. The cgroup
+  cap logic is unchanged; GPU allocations are not charged to it on GB10, so it
+  never protected the host from this. `.env.sample` ships `KV_TARGET_GIB=16`
+  and `HOST_RESERVE_GIB=26`.
+
+  Measured on this host, same day, shipped profile (262k, FP8, MTP 3,
+  `MAX_NUM_SEQS=5`), no kernel tunables applied:
+
+  | | old (`KV_TARGET_GIB=22`, GMU 0.830) | new (GMU 0.780) |
+  |---|---|---|
+  | GPU budget | 100.9 GiB | 94.87 GiB |
+  | KV pool (FP8) | 22.2 GiB | 16.46 GiB = 992,584 tok (3.79x a 262k req) |
+  | time to `/health` | — | 10 min 51 s |
+  | host MemAvailable idle | 6.9–8.8 GiB | 15.7 GiB at +2 min; 15.5–16.4 over 40 min |
+  | host MemFree idle | ~4.9 GiB | 4.4–5.2 GiB |
+  | after two ~90k prompts | ~6.9 GiB, never back | 15.2 GiB 60 s after the second (min 14.9 during; MemFree ≥ 3.5) |
+  | five concurrent ~60k prompts | died under the harness | 14.57 GiB at +60 s (min 14.26; MemFree ≥ 3.24); 5/5 completed, no watchdog event |
+  | `NV_ERR_NO_MEMORY` (`journalctl -k`) | 63 between 16:50 and 23:59 on 2026-09-04 | **0** across launch, both tests and 50 idle minutes |
+
+  The per-request growth is still there and is now budgeted for, not fixed:
+  the first 90k prompt moved the watchdog's `driver` figure from 95.6 to
+  96.4 GiB and `MemAvailable` from 16.2 to 15.05 GiB, permanently.
+  The second 90k prompt added nothing (96.4 → 96.4 GiB); five concurrent 60k
+  prompts added 0.2 GiB (96.6). Session minimum over launch, both tests and
+  50 idle minutes: `MemAvailable` 14.26 GiB, `MemFree` 3.24 GiB.
+
+- **Watchdog: a second floor, richer timeline, logs archived before the stop**
+  (`files/memwatch.sh`). It now also stops the container when `MemFree` stays
+  under `MEMWATCH_MIN_FREE_GIB` (default 2) for 5 samples — but only while
+  `MemAvailable` is under `MEMWATCH_FREE_GATE_GIB` (default 10). The gate was
+  learned the hard way: the ungated version killed a healthy launch at 00:49
+  because `MemFree` fell to 0.9 GiB while 32 GiB of weights streamed through
+  the page cache (`MemAvailable` 32 GiB, zero driver errors). With the stock
+  kernel watermarks `MemFree` is only meaningful once the cache is gone.
+  Every 10 s it counts `NV_ERR_NO_MEMORY` in `journalctl -k` and logs any
+  non-zero count. The 5 s timeline adds `cached`, `anon`, `shmem`, `mapped`,
+  `sunreclaim` and a derived `driver` figure (`MemTotal − MemFree − Buffers −
+  Cached − AnonPages − Slab − PageTables − KernelStack`), which is where the
+  growth shows. Before `docker stop` it writes `docker logs --tail 3000` and a
+  copy of its own log to `logs/archive/`; the grace period is 30 s
+  (`MEMWATCH_GRACE`), and `start.sh` archives the previous run's container and
+  watchdog logs before it relaunches. Observed: vLLM ignores SIGTERM while
+  loading weights, so a stop in that phase ends in the SIGKILL fallback.
+
+- **Stale comment in `.env`**: `MAX_NUM_BATCHED_TOKENS=2048` was labelled
+  "local override: faster prefill" from the reverted 8192 experiment.
+
+### Added
+
+- **`files/sysctl-spark3.conf`** — `vm.min_free_kbytes=4194304`,
+  `vm.watermark_scale_factor=300`, `vm.swappiness=30`, the values a sibling
+  Spark measured six crash-free bring-ups with. `start.sh` warns when the box
+  is at the kernel defaults (45155 / 10) and prints the `sysctl -p` command.
+  **Not applied** by anything in this repo and not yet measured here: at those
+  values the same physical state reads roughly 11–15 GiB lower in
+  `MemAvailable` (computed from the kernel's watermark formula), so the 6 GiB
+  watchdog floor has to be re-derived against a measured run first.
+
 ## 2026-09-04
 
 ### Fixed
