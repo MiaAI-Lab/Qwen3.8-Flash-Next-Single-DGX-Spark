@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next on ONE DGX Spark (TP=1)
+<h1 align="center">Qwen3.8-Flash-Next on ONE DGX Spark (TP=1)</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
