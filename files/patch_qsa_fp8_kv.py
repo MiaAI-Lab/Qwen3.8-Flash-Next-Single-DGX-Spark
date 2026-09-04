@@ -6,24 +6,24 @@
 Credit, for this file only: the FP8-KV approach comes from
 lancelind/qwen3.8-Flash-DGX (Apache-2.0). Nothing else in this repository
 derives from that project. Reimplemented here against this image's own
-sources: dequantise each K/V tile inside the Triton kernels using vLLM's
-canonical ``_cast_kv_tile`` rather than duplicating the maths, so upstream
-fixes are inherited.
+sources. The per-tensor K/V scales are applied after the tensor-core dots.
+This is algebraically equivalent before rounding, avoids materialising FP32
+dequantisation tiles, and lets FP8 use the same tile width as BF16 on GB10.
 
 Why FP8 KV is worth having: the main KV is 12 full-attention layers x 2 KV
 heads x 256 dims x (K+V) x 2 B = 24,576 B/token, ~84% of the 29,294 B/token
 this model spends. Halving it lifts a 19 GiB pool from ~700k to ~1.2M tokens,
 which is what makes a 1M-token context fit on one Spark.
 
-Why it is OFF by default: on the reference implementation a long-reasoning
-benchmark regressed from 6/6 to 2/6 with FP8 KV, prefill lost ~30% and decode
-~9%. This is sparse attention -- quantising keys perturbs which blocks the
-indexer selects, not merely the attention output. Treat it as a capacity
-trade, not a free win, and re-validate quality on your own workload.
+Why it remains a trade: on the reference implementation a long-reasoning
+benchmark regressed from 6/6 to 2/6 with FP8 KV. This is sparse attention --
+quantising keys perturbs which blocks the indexer selects, not merely the
+attention output. Treat it as a capacity trade, not a free win, and
+re-validate quality on your own workload.
 
 Inert unless --kv-cache-dtype is fp8: KV_QUANT_MODE is a tl.constexpr, so the
-dequantisation branches are eliminated at Triton compile time and the BF16
-path emits the same code as before.
+cast/scale branches are eliminated at Triton compile time and the BF16 path
+emits the same code as before.
 
 Inputs:  files/qsa_ops_patched.py.orig     (nvidia/ops/qsa.py from the image)
          files/qsa_nvidia_patched.py.orig  (nvidia/qsa.py from the image)
@@ -68,8 +68,8 @@ _QSA_DEFAULT_SCALE: dict[torch.device, torch.Tensor] = {}
 def _qsa_scale_ptr(scale, device):
     """Return a 0-d fp32 scale the kernels can always dereference.
 
-    ``_cast_kv_tile`` loads the scale unconditionally in FP8 mode, so a real
-    tensor must exist even when the caller passes nothing.
+    The kernels dereference this only in FP8 mode, but a real tensor keeps the
+    launch signature uniform across both compile-time variants.
     """
     if scale is not None:
         return scale.to(device=device, dtype=torch.float32).reshape(())
@@ -104,12 +104,7 @@ def _qsa_as_fp8(cache, kv_quant_mode, what):
 patch(
     "qsa_ops_patched.py",
     [
-        # -- import the canonical dequantiser + local helpers ----------------
-        (
-            "from vllm.triton_utils import HAS_TRITON, tl, triton\n",
-            "from vllm.triton_utils import HAS_TRITON, tl, triton\n"
-            "from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile\n",
-        ),
+        # -- local cache/scale helpers ---------------------------------------
         (
             "\n\ndef _validate_mqa(q: torch.Tensor) -> None:",
             HELPERS + "\ndef _validate_mqa(q: torch.Tensor) -> None:",
@@ -133,11 +128,13 @@ patch(
             "    KV_QUANT_MODE: tl.constexpr,\n"
             ") -> None:\n",
         ),
-        # -- MQA kernel: dequantise keys before scoring ----------------------
+        # -- MQA kernel: cast keys; apply the scalar after the dot ------------
         (
             "        scores = tl.dot(keys, query, out_dtype=tl.float32)\n",
-            "        keys = _cast_kv_tile(keys, query, k_scale_ptr, KV_QUANT_MODE)\n"
-            "        scores = tl.dot(keys, query, out_dtype=tl.float32)\n",
+            "        keys = keys.to(query.dtype)\n"
+            "        scores = tl.dot(keys, query, out_dtype=tl.float32)\n"
+            "        if KV_QUANT_MODE:\n"
+            "            scores *= tl.load(k_scale_ptr)\n",
         ),
         # -- decode/prefill sparse GQA kernel: signature ---------------------
         (
@@ -165,14 +162,22 @@ patch(
             "    row = tl.program_id(0)\n"
             "    kv_head = tl.program_id(1)\n",
         ),
-        # -- decode kernel: dequantise K and V before the dots ---------------
+        # -- sparse attention: hoist scalar scales outside tensor-core dots --
         (
             "        scores = tl.dot(query, keys)\n"
             "        # Scaling scores avoids re-quantizing a scaled query to BF16.\n",
-            "        keys = _cast_kv_tile(keys, query, k_scale_ptr, KV_QUANT_MODE)\n"
-            "        values = _cast_kv_tile(values, query, v_scale_ptr, KV_QUANT_MODE)\n"
+            "        keys = keys.to(query.dtype)\n"
+            "        values = values.to(query.dtype)\n"
             "        scores = tl.dot(query, keys)\n"
+            "        if KV_QUANT_MODE:\n"
+            "            scores *= tl.load(k_scale_ptr)\n"
             "        # Scaling scores avoids re-quantizing a scaled query to BF16.\n",
+        ),
+        (
+            "    output_mask = head_offsets[:, None] < GROUP_SIZE\n",
+            "    if KV_QUANT_MODE:\n"
+            "        normalized_output *= tl.load(v_scale_ptr)\n"
+            "    output_mask = head_offsets[:, None] < GROUP_SIZE\n",
         ),
         # -- MQA wrapper: accept a scale + mode, reinterpret the cache -------
         (
@@ -231,14 +236,6 @@ patch(
             "        assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn\n"
             "    else:\n"
             "        assert k_cache.dtype == v_cache.dtype == torch.bfloat16\n",
-        ),
-        (
-            "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)\n",
-            "    if kv_quant_mode:\n"
-            "        # Dequantised tiles need BF16 staging in shared memory; halve the\n"
-            "        # tile width so occupancy stays inside GB10's SMEM budget.\n"
-            "        block_n = max(16, block_n // 2)\n"
-            "    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)\n",
         ),
         (
             "        block_table.shape[0],\n"

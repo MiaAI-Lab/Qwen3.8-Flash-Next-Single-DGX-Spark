@@ -47,7 +47,8 @@
 #
 # Context above the native 262144 needs YaRN. MAX_MODEL_LEN is the YARN=0
 # length; YARN_MAX_MODEL_LEN (default 524288) is served instead when YARN=1.
-# Both live in .env, so the 0/1 flag alone switches between them. 1M does not fit.
+# Both live in .env, so the 0/1 flag alone switches between them. 1M does not
+# fit with BF16; FP8 has the arithmetic capacity but remains unvalidated here.
 # ---------------------------------------------------------------------------
 #
 # Usage:
@@ -125,8 +126,8 @@ YARN_MAX_MODEL_LEN="${_CLI_YARN_MAX_MODEL_LEN:-${YARN_MAX_MODEL_LEN:-524288}}"
 # after re-doing the Step 2 budget arithmetic.
 YARN_CEILING_MODEL_LEN="${YARN_CEILING_MODEL_LEN:-524288}"
 GPU_MEMORY_UTILIZATION="${_CLI_GMU:-${GPU_MEMORY_UTILIZATION:-}}"   # empty => derived in Step 2
-MAX_NUM_SEQS="${_CLI_MAX_NUM_SEQS:-${MAX_NUM_SEQS:-4}}"
-MAX_NUM_BATCHED_TOKENS="${_CLI_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:-2048}}"
+MAX_NUM_SEQS="${_CLI_MAX_NUM_SEQS:-${MAX_NUM_SEQS:-8}}"
+MAX_NUM_BATCHED_TOKENS="${_CLI_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:-8192}}"
 MTP_NUM_SPECULATIVE_TOKENS="${_CLI_MTP:-${MTP_NUM_SPECULATIVE_TOKENS:-0}}"
 KV_CACHE_DTYPE="${_CLI_KV_CACHE_DTYPE:-${KV_CACHE_DTYPE:-auto}}"
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-}"          # optional hard pin, bytes
@@ -221,6 +222,19 @@ MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
        Fetch it first:  ./download.sh $MODEL_ID"
 SNAPSHOT_REL="snapshots/$(ls "$MODEL_PATH/snapshots" | head -1)"
 [[ -f "$MODEL_PATH/$SNAPSHOT_REL/config.json" ]] || err "No snapshot under $MODEL_PATH/snapshots"
+python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY' || err "Checkpoint snapshot is incomplete. Resume it with: ./download.sh $MODEL_ID"
+import json
+import pathlib
+import sys
+
+snapshot = pathlib.Path(sys.argv[1])
+index = snapshot / "model.safetensors.index.json"
+if not index.is_file():
+    raise SystemExit(1)
+weight_map = json.loads(index.read_text()).get("weight_map", {})
+raise SystemExit(0 if weight_map and all((snapshot / name).is_file()
+                                         for name in set(weight_map.values())) else 1)
+PY
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 
 # ---------------------------------------------------------------------------

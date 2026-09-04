@@ -45,13 +45,30 @@ HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 ORG="${MODEL_ID%%/*}"; NAME="${MODEL_ID##*/}"
 MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
 
+snapshot_complete() {  # <snapshot-dir>
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+snapshot = pathlib.Path(sys.argv[1])
+index = snapshot / "model.safetensors.index.json"
+if not index.is_file():
+    raise SystemExit(1)
+weight_map = json.loads(index.read_text()).get("weight_map", {})
+raise SystemExit(0 if weight_map and all((snapshot / name).is_file()
+                                         for name in set(weight_map.values())) else 1)
+PY
+}
+
 info "Model:  $MODEL_ID"
 info "Cache:  $HF_CACHE_DIR"
 
-# Already complete? start.sh's own check is a snapshot containing config.json.
+# Already complete? Require every shard named by the safetensors index. A
+# config.json appears early in a partial download and is not sufficient.
 if [[ -d "$MODEL_PATH" ]]; then
     SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
-    if [[ -n "$SNAP" && -f "$MODEL_PATH/snapshots/$SNAP/config.json" ]]; then
+    if [[ -n "$SNAP" ]] && snapshot_complete "$MODEL_PATH/snapshots/$SNAP"; then
         ok "Already in cache: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
         info "Nothing to do. Run ./start.sh next."
         exit 0
@@ -96,7 +113,7 @@ fi
 [[ -d "$MODEL_PATH" ]] || err "Download finished but $MODEL_PATH is missing."
 SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
 [[ -n "$SNAP" ]] || err "No snapshot directory under $MODEL_PATH/snapshots"
-[[ -f "$MODEL_PATH/snapshots/$SNAP/config.json" ]] || err "Snapshot has no config.json — the download is incomplete. Rerun this script."
+snapshot_complete "$MODEL_PATH/snapshots/$SNAP" || err "Snapshot is missing one or more indexed weight shards — the download is incomplete. Rerun this script."
 
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 info "Next:  ./start.sh"

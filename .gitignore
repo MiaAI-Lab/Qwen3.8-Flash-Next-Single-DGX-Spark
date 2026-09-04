@@ -24,6 +24,10 @@
 !/start.sh
 !/stop.sh
 
+# --- reproducible performance sweep -----------------------------------
+!/bench/perf_sweep.py
+!/bench/compare.py
+
 # --- launcher support and patch generators -----------------------------
 !/files/memwatch.sh
 !/files/build_ple_packed_table.py
@@ -33,8 +37,6 @@
 !/files/patch_qsa_fp8_kv.py
 
 # Deliberately NOT tracked:
-#   bench/                    local benchmark scripts; the published numbers
-#                             were measured with sparkDash instead
 #   .env                      may contain HF_TOKEN
 #   HANDOFF.md, docs/         host-specific notes, not needed to run
 #   logs/, *.log              runtime output

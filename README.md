@@ -33,7 +33,8 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
-`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`**. Everything below was measured on
+`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=8`, `MAX_NUM_BATCHED_TOKENS=8192`**.
+Everything below was measured on
 this host on 2026-09-04; each row names the configuration it came from, because
 the numbers move a lot between them.
 
@@ -47,6 +48,34 @@ the numbers move a lot between them.
 Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
 during a 400k prefill — see the safety rules for why that floor matters.
 
+### Reproducible optimization sweep
+
+The repository now includes `bench/perf_sweep.py` and `bench/compare.py`.
+The sweep disables thinking, forces 192 output tokens, salts every prompt to
+avoid prefix-cache hits, and measures two single streams, a calibrated 32k
+prefill, and 1/4/8 concurrent streams. These are one-run measurements on this
+host; decode varies with generated content because MTP acceptance varies.
+
+| Profile | 32k prefill | C1 decode | C4 decode | C8 decode | C8 TTFT p95 | FP8 KV pool |
+|---|---:|---:|---:|---:|---:|---:|
+| Original QSA, 2k batch, 4 seqs | 1,827 tok/s | 24.06 tok/s | 56.44 tok/s | 60.16 tok/s | 13.87 s | 1,323,445 tok |
+| Scale-hoisted QSA, 2k batch, 4 seqs | 1,942 tok/s | 23.36 tok/s | **60.91 tok/s** | 60.43 tok/s | 13.89 s | 1,282,724 tok |
+| Scale-hoisted QSA, 8k batch, 8 seqs (new default) | **2,167 tok/s** | **24.29 tok/s** | 57.42 tok/s | **90.52 tok/s** | **1.70 s** | 1,249,637 tok |
+| New default vs original | **+18.6%** | +1.0% | +1.7% | **+50.5%** | **−87.8%** | −5.6% |
+
+At concurrency 8, end-to-end p95 fell 30.0% (26.08 to 18.25 s). The wider
+scheduler costs about 0.13 GiB of CUDA graphs and leaves a 1.25M-token KV pool,
+still 4.77 times one maximum-length 262k request.
+
+The kernel-only result is easiest to see in isolation. On synthetic 512-row,
+top-k-2048 inputs, sparse QSA fell from 2.984 to 1.772 ms (−40.6%, or +68.4%
+inverse throughput), and the block selector fell from 0.1392 to 0.1008 ms
+(−27.6%). Both one-row decode cases were unchanged. Against the original
+kernel on identical tensors, maximum sparse-attention error was 1.53e-5 (one
+BF16 ULP); the BF16 path was bit-identical. This numerical test does not replace
+a workload-specific quality evaluation. Exact text hashes are not useful here:
+two identical requests to the same running server produced different hashes.
+
 Two honest gaps: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
 BF16) has not been benchmarked — the 262k row above is from the older
 `KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. Short-context (32k) prefill is now measured for both
@@ -56,8 +85,8 @@ dtypes; see the FP8 section.
 
 The prefill sweep and prose decode numbers below were measured with
 [sparkDash](https://github.com/MiaAI-Lab/sparkDash) against this server
-(`KV_CACHE_DTYPE=fp8`, 512k YaRN). Benchmark scripts are not shipped in this
-repo; use sparkDash to reproduce them.
+(`KV_CACHE_DTYPE=fp8`, 512k YaRN). Use sparkDash to reproduce that historical
+sweep; use `bench/perf_sweep.py` for the optimization A/B above.
 
 **Prefill** — throughput peaks around 32-64k, then falls away as attention cost
 grows with context:
@@ -121,8 +150,8 @@ Three things to know before leaning on it:
   speed. Text-only requests are unaffected.
 - **Video is token-hungry.** Frame count and resolution drive prompt length
   fast. At `YARN=1` you have only 1.34x a full-length request in KV across
-  `MAX_NUM_SEQS=4`, so concurrent video work contends; the 262k profile
-  (2.81x) has far more headroom for it.
+  the historical four-sequence profile, so concurrent video work contends;
+  the 262k profile (2.81x) has far more headroom for it.
 - **Long video at 512k is untested here.** The tests above were long-text *or*
   short-multimodal, never both at once.
 
@@ -196,7 +225,7 @@ of the context — MTP's best case, not typical decode speed.
 | `YARN=0` with `MAX_MODEL_LEN` > 262144 | refused: tells you to set `YARN=1` |
 | `YARN_MAX_MODEL_LEN` > `YARN_CEILING_MODEL_LEN` (524288) | refused: above the validated ceiling |
 | `YARN=1` with `YARN_MAX_MODEL_LEN` at or below 262144 | warns, serves that length with native rope |
-| 1M even with the ceiling raised | refused by the Step 2 budget check (cap 112 GiB vs 105 GiB ceiling) |
+| 1M with BF16, even with the ceiling raised | refused by the Step 2 budget check (cap 112 GiB vs 105 GiB ceiling) |
 
 YaRN trades some short-context accuracy for the longer window, so leave it off
 unless you need more than 262k. The 512k path serves correctly but its decode
@@ -240,14 +269,15 @@ Two consequences worth knowing:
   answers, disabling it is a large win; leave it on for anything that needs
   actual multi-step reasoning.
 
-### FP8 KV cache (opt-in)
+### FP8 KV cache (default)
 
 `KV_CACHE_DTYPE=fp8` roughly doubles the KV pool by storing the main KV in
-fp8-e4m3 and dequantising each tile inside the QSA Triton kernels. **This is
-the shipped default**, on the strength of the measurements below.
+fp8-e4m3. The QSA Triton kernels cast FP8 tiles to BF16 for tensor-core dots
+and apply the global K/V scales once to the accumulators. **This is the shipped
+default**, on the strength of the measurements below.
 
 ```
-KV_CACHE_DTYPE=fp8    # ~2x KV pool, enables a 1M context (default)
+KV_CACHE_DTYPE=fp8    # ~2x KV pool; 1M needs a separately validated ceiling raise (default)
 KV_CACHE_DTYPE=auto   # BF16 KV, if you would rather not take the trade
 ```
 
@@ -271,10 +301,11 @@ Only the 12 full-attention layers shrink (~84% of bytes/token); the QSA
 side/compressor caches stay BF16, which is why the gain is ~1.85x rather than
 2x, and why `KV_MULT` in `start.sh` is 0.58 rather than 0.5.
 
-**The short-context penalty is real but small.** FP8 halves `block_n` to fit
-GB10 shared memory, which costs more on a short kernel than a long one: −6.1%
-at 32k versus −2.7% at 400k. That is far milder than the −30% the reference
-implementation reported at 32k.
+**The old short-context penalty is recoverable.** The original FP8 patch
+materialised FP32 dequantisation tiles and halved `block_n` to fit GB10 shared
+memory; it measured −6.1% against BF16 at 32k. Hoisting the per-tensor scales
+outside the dots removes that FP32 tile and restores the BF16 tile width. The
+new default is 18.6% faster than the old FP8 default at 32k in the sweep above.
 
 **On quality.** Both dtypes score 11/11 on the reasoning suite
 (4 multi-step short tasks, 4 long chain-of-thought up to ~4,800 reasoning
@@ -291,25 +322,17 @@ isolated PASS or FAIL at 95% depth says little, and comparisons need matched
 sample counts on both sides. The 3/3 results quoted elsewhere in this README
 are single samples and should be read with that in mind.
 
-**Two caveats before trusting these numbers.**
-
-*The speed cost is measured at one point on the curve.* The reference
-implementation (see credit below) reported **−30% prefill** and −9% decode,
-against our −2.7% and −4%. That is very likely not a contradiction: their
-prefill figure is at **32k**, ours at **400k**. FP8 halves `block_n` to fit
-GB10 shared memory, which costs occupancy and launch overhead on a short
-kernel but amortises away over a 400k context. **Short-context prefill with
-FP8 has not been measured here and is probably materially worse than −2.7%.**
-
-*Quality is not settled.* Needle retrieval passing at 5/50/95% depth shows the
+**A caveat before trusting these numbers: quality is not settled.** Needle
+retrieval passing at 5/50/95% depth shows the
 scales and dequantisation are broadly right, and short factual/arithmetic
 answers were correct. It does **not** clear the failure mode that matters: the
 reference measured a long-reasoning benchmark falling from **6/6 to 2/6** with
 FP8 KV. This is sparse attention — quantised keys perturb which blocks the
 indexer selects, not merely the attention output — so degradation can appear
-as fluent, plausible, wrong reasoning while needles still pass. No
-long-reasoning A/B has been run on this host. Treat FP8 as a capacity trade
-for workloads you have validated yourself.
+as fluent, plausible, wrong reasoning while needles still pass. The scale-hoist
+change has a one-BF16-ULP numerical bound in the tensor A/B, but no new
+long-reasoning A/B has been run. Treat FP8 as a capacity trade for workloads
+you have validated yourself.
 
 ### PLE mmap access pattern
 
@@ -393,8 +416,10 @@ buffer or missing quant scales) — see the patch notes below.
 - `files/build_ple_packed_table.py` — one-time packed PLE table builder
   (27 GB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
 
-Benchmarks are not part of this repo. The published prefill and decode numbers
-were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
+`bench/perf_sweep.py` runs the salted end-to-end sweep described above, and
+`bench/compare.py` prints deltas between two result JSON files. The older
+published prefill and decode curves were measured with
+[sparkDash](https://github.com/MiaAI-Lab/sparkDash).
 
 ## What is patched and why
 
@@ -415,13 +440,14 @@ were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
   90-byte row lookup, and measurements here showed **24x** more disk read per
   decoded token (1,366 -> 57 KiB/token) plus ~2 GiB of page cache wasted on
   readahead that is never used.
-- **FP8 KV cache** (`patch_qsa_fp8_kv.py`, opt-in via `KV_CACHE_DTYPE=fp8`):
-  dequantises each K/V tile inside the QSA Triton kernels with vLLM's
-  `_cast_kv_tile`, plumbs `k_scale`/`v_scale` into the kernels, relaxes the
-  four BF16-only guards and the inherited FlashAttention rejection, and halves
-  `block_n` under quantisation. Raises the KV pool from ~800k to ~1.38M tokens,
-  which is what makes a 1M context arithmetically possible on one Spark.
-  **Off by default** and a real trade — see the warning `start.sh` prints.
+- **FP8 KV cache** (`patch_qsa_fp8_kv.py`, via `KV_CACHE_DTYPE=fp8`): casts
+  FP8 K/V tiles to BF16 for the tensor-core dots, hoists the global scales to
+  the FP32 accumulator/output, plumbs `k_scale`/`v_scale` into the kernels, and
+  relaxes the four BF16-only guards plus the inherited FlashAttention
+  rejection. Avoiding FP32 tiles lets FP8 keep the BF16 `block_n`. It raises
+  the KV pool from ~800k to ~1.25M tokens under the new eight-sequence profile.
+  **On by default** and still a real quality trade — see the warning `start.sh`
+  prints.
   The FP8-KV approach is credited to
   [lancelind/qwen3.8-Flash-DGX](https://github.com/lancelind/qwen3.8-Flash-DGX)
   (Apache-2.0), reimplemented here against this image's own sources. That
