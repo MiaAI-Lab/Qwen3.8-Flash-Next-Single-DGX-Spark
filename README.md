@@ -32,7 +32,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
-`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
+`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
 `KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
@@ -47,15 +47,14 @@ configuration it came from, because the numbers move a lot between them.
 Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
 during a 400k prefill — see the safety rules for why that floor matters.
 
-One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=20`,
-FP8) has not been benchmarked end to end — the 262k row above is at the same KV
-target but BF16, and predates the `MADV_RANDOM` mmap change. Short-context
+One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
+FP8) has not been benchmarked end to end — the 262k row above is at a lower KV
+target and BF16, and predates the `MADV_RANDOM` mmap change. Short-context
 (32k) prefill is now measured for both dtypes; see the FP8 section.
 
-`KV_TARGET_GIB` shipped as 22 until 2026-09-04. It was lowered to 20 because 22
-left host `MemAvailable` only ~1.6 GiB above the watchdog floor on this box, and
-a slow drift under sustained load crossed it after ~4.5 h — `memwatch.sh` then
-killed the container. 20 still yields ~1.26M FP8 tokens at 262k.
+`KV_TARGET_GIB` was briefly lowered to 20 on 2026-09-04 after two servers were
+killed by the watchdog. That turned out to be a watchdog bug, not a memory
+problem — see [Watchdog](#watchdog) — so the default is 22 again.
 
 ### Prefill and decode, measured with sparkDash
 
@@ -97,16 +96,15 @@ or edit the line in `.env` to make it stick.
 
 It is paid for out of the KV pool, not the GPU budget. 8,192 chunks raise peak
 activation to 1.27 GiB, and vLLM profiles that *before* it sizes the KV cache,
-so the pool absorbs it: 1,145,289 tokens on this host, still 4.37x a full 262k
-request. The best matched evidence for the size of that trade is PR #2's own
-pair at `KV_TARGET_GIB=22`, 1,282,724 → 1,249,637 tokens — about **−2.6%** of
-pool for **+11%** prefill.
+so the pool absorbs it: 1,145,289 tokens measured at `KV_TARGET_GIB=20`,
+still 4.37x a full 262k request. The best matched evidence for the size of that
+trade is PR #2's own pair at `KV_TARGET_GIB=22`, 1,282,724 → 1,249,637 tokens —
+about **−2.6%** of pool for **+11%** prefill.
 
-Host `MemAvailable` was 8.1-8.3 GiB idle and low-watered at 7.4 GiB across the
-8,192 sweep, above where the run that tripped the watchdog started. That is
-minutes of observation, not hours, which is why it is offered as a knob rather
-than shipped on: if you serve long sessions near the memory floor, measure it
-on your own workload before committing to it.
+Host `MemAvailable` sat at 8.1-8.3 GiB idle and low-watered at 7.4 GiB across
+the 8,192 sweep. It is offered as a knob rather than a default because the
+supporting observation is minutes, not hours: if you serve long sessions near
+the memory floor, measure it on your own workload before committing to it.
 
 **Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count:
 
@@ -175,7 +173,7 @@ MAX_MODEL_LEN=65536 MTP_NUM_SPECULATIVE_TOKENS=0 ./start.sh
 The safety-relevant knobs are `KV_TARGET_GIB` (how much KV to target; the main
 consumer of host memory) and `HOST_SLACK_GIB` (container cgroup cap = GPU
 budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin;
-raising it above the shipped 20 is what eats the watchdog's headroom first.
+raising it above the shipped 22 is what eats that margin first.
 
 ### Long context beyond 262k (YaRN)
 
@@ -201,7 +199,7 @@ actually reads. The existing `mrope_section`, `rope_theta` and
 `MRotaryEmbedding` and mrope stays enabled.
 
 512k fits with **no other change**: it needs 14.4 GiB of KV, well inside what
-`KV_TARGET_GIB` provides at the shipped 20 or at 22, and the GPU budget and
+`KV_TARGET_GIB` provides at 20 or at the shipped 22, and the GPU budget and
 cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
 `KV_TARGET_GIB=20` (2026-09-04):
 
@@ -395,6 +393,24 @@ Each of these cost a hard host hang during bring-up.
   unified pool hangs the kernel with no OOM kill and no logs. `KV_TARGET_GIB`
   is the knob that eats it. The page cache is not spare memory — it is what
   keeps PLE lookups off NVMe.
+
+### Watchdog
+
+`files/memwatch.sh` kills the container when host `MemAvailable` stays under
+`MEMWATCH_MIN_GIB` (default 6). It polls every second, logs a timeline every
+5 s, and logs **every** sample once within 1 GiB of the floor.
+
+The trigger needs **5 consecutive** sub-floor samples. A single sample is not
+enough, and this matters: `MemAvailable` on this workload moves ~107 MiB
+between samples with excursions past 1 GiB, and two servers were killed here by
+one transient dip while the readings on either side sat 400-700 MiB above the
+floor. A lone excursion now logs `recovered after N sub-floor sample(s)` and
+resets the counter.
+
+It stops the container with SIGTERM and a 10 s grace period
+(`MEMWATCH_GRACE`), falling back to SIGKILL, so vLLM can unlink its POSIX
+shared memory — a hard kill leaks those segments onto the host's `/dev/shm`
+until reboot, because the container runs with `--ipc host`.
 - **`comfy-h3.service` must stay disabled.** It polls `127.0.0.1:8888` and
   launches ComfyUI (a GPU co-tenant) as soon as anything answers there.
   `start.sh` refuses port 8888 while that service is active.
@@ -479,8 +495,8 @@ were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
   scales once to the score and the normalised output, plumbs `k_scale`/
   `v_scale` into the kernels, and relaxes the four BF16-only guards and the
   inherited FlashAttention rejection. Avoiding an FP32 dequantisation tile lets
-  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to ~1.26M tokens
-  at the shipped `KV_TARGET_GIB=20`, which is what makes a 1M context
+  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to ~1.38M tokens
+  at the shipped `KV_TARGET_GIB=22`, which is what makes a 1M context
   arithmetically possible on one Spark. **On by default** and still a real
   quality trade — see the warning `start.sh` prints.
   The FP8-KV approach is credited to
