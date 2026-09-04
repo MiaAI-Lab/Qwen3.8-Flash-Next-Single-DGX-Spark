@@ -33,9 +33,9 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
-`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`**. Everything below was measured on
-this host on 2026-09-04; each row names the configuration it came from, because
-the numbers move a lot between them.
+`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8192`**.
+Everything below was measured on this host on 2026-09-04; each row names the
+configuration it came from, because the numbers move a lot between them.
 
 | Configuration | KV pool | Prefill @400k | Decode (prose, idle) | Needles 5/50/95% |
 |---|---|---|---|---|
@@ -59,24 +59,37 @@ killed the container. 20 still yields ~1.26M FP8 tokens at 262k.
 
 ### Prefill and decode, measured with sparkDash
 
-The prefill sweep and prose decode numbers below were measured with
-[sparkDash](https://github.com/MiaAI-Lab/sparkDash) against this server
-(`KV_CACHE_DTYPE=fp8`, 512k YaRN). Benchmark scripts are not shipped in this
-repo; use sparkDash to reproduce them.
+Both sweeps below were measured with
+[sparkDash](https://github.com/MiaAI-Lab/sparkDash) against this server.
+Benchmark scripts are not shipped in this repo; use sparkDash to reproduce
+them. The two prefill columns are **not** a clean A/B — they differ in rope
+config and KV target as well as chunk width — so each is labelled with what it
+was measured at.
 
-**Prefill** — throughput peaks around 32-64k, then falls away as attention cost
-grows with context:
+**Prefill.** At the old 2,048-token chunk width throughput peaked around 32-64k
+and fell away with context. At the shipped 8,192 it is flat from 16k out to
+128k, because per-chunk overhead is amortised over 4x fewer chunks:
 
-| context | TTFT | prefill |
+| context | 2,048 chunks (512k YaRN, `KV_TARGET_GIB=22`) | 8,192 chunks (262k native, `KV_TARGET_GIB=20`) |
 |---|---|---|
-| 8k | 5.00 s | 1,646 tok/s |
-| 16k | 8.00 s | 2,052 tok/s |
-| 32k | 15.83 s | **2,073 tok/s** |
-| 64k | 32.20 s | 2,037 tok/s |
-| 128k | 67.41 s | 1,945 tok/s |
-| 256k | 146.40 s | 1,791 tok/s |
+| 8k | 5.00 s · 1,646 tok/s | **3.69 s · 2,228 tok/s** |
+| 16k | 8.00 s · 2,052 tok/s | **7.16 s · 2,293 tok/s** |
+| 32k | 15.83 s · 2,073 tok/s | **13.87 s · 2,366 tok/s** |
+| 64k | 32.20 s · 2,037 tok/s | **28.31 s · 2,316 tok/s** |
+| 128k | 67.41 s · 1,945 tok/s | **58.88 s · 2,227 tok/s** |
+| 256k | 146.40 s · 1,791 tok/s | not re-measured |
 
-**Decode on prose**, by concurrent stream count:
+The one matched pair — same server, same kernel, only the chunk width changed —
+is 32k: **2,133 → 2,366 tok/s (+10.9%), TTFT 15.38 → 13.87 s (−9.8%)**. The
+rest of the right-hand column is one run each and should be read as indicative.
+
+What it costs: 8,192 chunks raise peak activation to 1.27 GiB. vLLM profiles
+that *before* it sizes the KV cache, so it comes out of the pool rather than
+out of the GPU budget — 1,145,289 tokens here, still 4.37x a full 262k request.
+Host `MemAvailable` was 8.1-8.3 GiB idle and low-watered at 7.4 GiB across the
+sweep above.
+
+**Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count:
 
 | streams | TTFT | aggregate | per stream |
 |---|---|---|---|
