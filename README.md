@@ -240,6 +240,11 @@ buffer or missing quant scales) — see the patch notes below.
   `block_n` under quantisation. Raises the KV pool from ~800k to ~1.38M tokens,
   which is what makes a 1M context arithmetically possible on one Spark.
   **Off by default** and a real trade — see the warning `start.sh` prints.
+  The FP8-KV approach is credited to
+  [lancelind/qwen3.8-Flash-DGX](https://github.com/lancelind/qwen3.8-Flash-DGX)
+  (Apache-2.0), reimplemented here against this image's own sources. That
+  credit applies to this one patch; nothing else in this repository derives
+  from that project.
 
 ## License
 
