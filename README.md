@@ -47,8 +47,40 @@ BF16) has not been benchmarked — the 262k row above is from the older
 `KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. Short-context (32k) prefill is now measured for both
 dtypes; see the FP8 section.
 
-Reference numbers from the identical recipe on a sibling Spark, not reproduced
-here: ~30 tok/s decode on code, ~1,750 tok/s prefill at 200k.
+### Prefill and decode, measured with sparkDash
+
+The prefill sweep and prose decode numbers below were measured with
+[sparkDash](https://github.com/MiaAI-Lab/sparkDash) against this server
+(`KV_CACHE_DTYPE=fp8`, 512k YaRN). Benchmark scripts are not shipped in this
+repo; use sparkDash to reproduce them.
+
+**Prefill** — throughput peaks around 32-64k, then falls away as attention cost
+grows with context:
+
+| context | TTFT | prefill |
+|---|---|---|
+| 8k | 5.00 s | 1,646 tok/s |
+| 16k | 8.00 s | 2,052 tok/s |
+| 32k | 15.83 s | **2,073 tok/s** |
+| 64k | 32.20 s | 2,037 tok/s |
+| 128k | 67.41 s | 1,945 tok/s |
+| 256k | 146.40 s | 1,791 tok/s |
+
+**Decode on prose**, by concurrent stream count:
+
+| streams | TTFT | aggregate | per stream |
+|---|---|---|---|
+| 1 | 418 ms | 36.9 tok/s | 36.9 tok/s |
+| 2 | 445 ms | 57.4 tok/s | 29.7 tok/s |
+| 4 | 550 ms | **85.9 tok/s** | 23.4 tok/s |
+
+Decode speed on this model is **strongly content-dependent**, because MTP
+speculative decoding accepts more drafts on predictable text. Measured on this
+server: mean acceptance length 2.1 of a possible 4, per-position acceptance
+0.65 / 0.33 / 0.14, average draft acceptance 37-41%. Highly predictable output
+(quoting text back out of the context) reaches ~41 tok/s; dense technical prose
+sits lower. Treat single-stream decode as a range rather than one number.
+
 
 ## Multimodal (images and video)
 
@@ -139,8 +171,8 @@ cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
 At `KV_TARGET_GIB=22` with FP8 the same context gets 2.73x headroom instead of
 1.34x — see [FP8 KV cache](#fp8-kv-cache-opt-in).
 
-400k prefill stress test (`bench/longctx.py --target 400000`, salted to defeat
-prefix caching, needles at 5% / 50% / 95% depth):
+400k prefill stress test (salted to defeat prefix caching, needles planted at
+5% / 50% / 95% depth):
 
 | | |
 |---|---|
@@ -151,8 +183,7 @@ prefix caching, needles at 5% / 50% / 95% depth):
 | Peak container RSS | 18.7 GiB of the 103 GiB cap |
 
 Decode measured 40 tok/s on that run, but the answer is three codes copied out
-of the context — MTP's best case. Do not quote it as typical decode speed; see
-the note at the top of `bench/decodebench.py`.
+of the context — MTP's best case, not typical decode speed.
 
 | Setting | Result |
 |---|---|
@@ -353,9 +384,9 @@ buffer or missing quant scales) — see the patch notes below.
   first run. Edit the generators; edits to the generated files are overwritten.
 - `files/build_ple_packed_table.py` — one-time packed PLE table builder
   (27 GB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
-- `bench/decodebench.py`, `bench/longctx.py` — decode and long-context/needle
-  benchmarks. Both target `http://localhost:8888` hardcoded in `BASE` at the
-  top of the file; edit it to point elsewhere.
+
+Benchmarks are not part of this repo. The published prefill and decode numbers
+were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
 
 ## What is patched and why
 

@@ -31,7 +31,7 @@
     Tell us how you verified this change. For this kit that usually means:
 
       * `bash -n start.sh stop.sh files/memwatch.sh` (syntax check)
-      * `python3 -m py_compile files/*.py bench/*.py`
+      * `python3 -m py_compile files/*.py`
       * `shellcheck start.sh stop.sh` if available
       * `./start.sh --no-launch` to check the derived memory budget and the docker
         command without starting anything

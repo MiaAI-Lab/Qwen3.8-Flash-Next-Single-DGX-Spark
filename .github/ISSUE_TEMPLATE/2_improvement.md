@@ -46,8 +46,8 @@ assignees: ""
      can. The README records results in this shape:
 
        * KV pool (GiB and tokens) from `docker logs vllm-fn-tp1 | grep "GPU KV cache size"`
-       * prefill tok/s and TTFT from `python3 bench/longctx.py --target N`
-       * decode tok/s from `python3 bench/decodebench.py`
+       * prefill tok/s and TTFT, and decode tok/s, measured with sparkDash
+         (https://github.com/MiaAI-Lab/sparkDash)
        * host MemAvailable under load, and the low-water mark during a long prefill
        * needle retrieval PASS/FAIL at 5/50/95% depth
 

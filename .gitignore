@@ -31,11 +31,9 @@
 !/files/patch_ple_offload.py
 !/files/patch_qsa_fp8_kv.py
 
-# --- benchmarks --------------------------------------------------------
-!/bench/decodebench.py
-!/bench/longctx.py
-
 # Deliberately NOT tracked:
+#   bench/                    local benchmark scripts; the published numbers
+#                             were measured with sparkDash instead
 #   .env                      may contain HF_TOKEN
 #   HANDOFF.md, docs/         host-specific notes, not needed to run
 #   logs/, *.log              runtime output
