@@ -28,7 +28,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
-`KV_CACHE_DTYPE=auto`, `MAX_NUM_SEQS=4`**. Everything below was measured on
+`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`**. Everything below was measured on
 this host on 2026-09-04; each row names the configuration it came from, because
 the numbers move a lot between them.
 
@@ -169,12 +169,12 @@ and prefill speeds have not yet been benchmarked.
 ### FP8 KV cache (opt-in)
 
 `KV_CACHE_DTYPE=fp8` roughly doubles the KV pool by storing the main KV in
-fp8-e4m3 and dequantising each tile inside the QSA Triton kernels. Off by
-default (`auto` = BF16).
+fp8-e4m3 and dequantising each tile inside the QSA Triton kernels. **This is
+the shipped default**, on the strength of the measurements below.
 
 ```
-KV_CACHE_DTYPE=auto   # BF16 (default)
-KV_CACHE_DTYPE=fp8    # ~2x KV pool, enables a 1M context
+KV_CACHE_DTYPE=fp8    # ~2x KV pool, enables a 1M context (default)
+KV_CACHE_DTYPE=auto   # BF16 KV, if you would rather not take the trade
 ```
 
 Measured on this host 2026-09-04, identical prompts, `YARN=1`,

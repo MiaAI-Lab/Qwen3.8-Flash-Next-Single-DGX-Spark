@@ -8,6 +8,11 @@
 
 # --- github metadata ---------------------------------------------------
 !/.github/FUNDING.yml
+!/.github/PULL_REQUEST_TEMPLATE.md
+!/.github/ISSUE_TEMPLATE/config.yml
+!/.github/ISSUE_TEMPLATE/1_bug.md
+!/.github/ISSUE_TEMPLATE/2_improvement.md
+!/.github/ISSUE_TEMPLATE/3_feature_request.md
 
 # --- top level ---------------------------------------------------------
 !/.gitignore
