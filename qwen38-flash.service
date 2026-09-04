@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# systemd user unit for the single-Spark Qwen3.8-Flash-Next server.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp qwen38-flash.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now qwen38-flash
+#   loginctl enable-linger "$USER"        # start at boot without login
+#
+# start.sh stays in the foreground following logs until /health answers;
+# Type=simple + the long TimeoutStartSec accommodate that. The memwatch
+# watchdog is a child of start.sh, so supervision and watchdog share a
+# lifecycle. Restart=on-failure only: a clean ./stop.sh (or
+# systemctl --user stop) stays down.
+[Unit]
+Description=Qwen3.8-Flash-Next vLLM server (single Spark, TP=1)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/qwen38-flash-next
+ExecStart=%h/qwen38-flash-next/start.sh
+ExecStop=%h/qwen38-flash-next/stop.sh
+# Weight load takes ~10-12 min; first boot additionally builds the ~27 GB
+# packed PLE table. Do not let systemd kill the start early.
+TimeoutStartSec=30min
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
