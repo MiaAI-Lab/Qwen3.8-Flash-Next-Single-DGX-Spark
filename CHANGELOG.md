@@ -91,21 +91,38 @@ as promises.
 
 ### Reverted
 
-- **`KV_TARGET_GIB` 22 → 20 → 22.** Lowered in `554f295` on the theory that the
-  watchdog kills were a memory problem, restored in `c79f765` once they turned
-  out to be a watchdog bug. The default is 22, as before.
+- **`KV_TARGET_GIB` 22 → 20 → 22 → 20.** Lowered in `554f295` on the theory that
+  the watchdog kills were a memory problem, restored in `c79f765` once those two
+  kills turned out to be a watchdog bug, then lowered again once a third server
+  died on a genuine sustained decline. Both things were true: the watchdog fired
+  on noise *and* the host margin at 22 is thin. The default is 20.
 
 - **`MAX_NUM_BATCHED_TOKENS` default 2048 → 8192 → 2048.** Defaulted in
   `677f4ab`, backed out in `366f6df` and documented as an opt-in instead. See
   above for the measurements.
 
+### Verified
+
+- **The debounced watchdog correctly distinguished a real event from noise.** A
+  third server died at 23:53 on a monotonic descent — 7,101 MiB to 5,726 MiB in
+  9 seconds, still falling — and the trigger fired after 5 consecutive sub-floor
+  samples. The per-sample near-floor logging captured the whole descent, which
+  the old script could not have shown. Unlike the two earlier kills, the
+  container's own cgroup was *growing* through this one (10,716 → 12,348 MiB),
+  so the mechanism differs from the slow drift.
+
+  The 10 s SIGTERM grace was not enough — `docker stop` escalated to SIGKILL and
+  the exit code was still 137, so the shm-leak protection did not take effect.
+
 ### Known open
 
-- The slow decline in host `MemAvailable` under sustained long-context prefill
-  is unexplained. `memwatch.sh` logs `MemAvailable`, `MemFree`, `SwapFree` and
+- Host `MemAvailable` has two unexplained behaviours: a slow decline under
+  sustained long-context prefill, and at least one burst that consumed ~1.4 GiB
+  in 9 seconds. `memwatch.sh` logs `MemAvailable`, `MemFree`, `SwapFree` and
   the container's cgroup usage; adding `Mapped`/`Cached`/`AnonPages` would let
   the next descent identify its own cause.
 - The shipped default (262k, `KV_TARGET_GIB=22`, FP8, 2048 chunks) has still not
   been benchmarked end to end.
 - Whether the 6 GiB watchdog floor is the right threshold has never been
   examined; it was chosen during bring-up.
+- `MEMWATCH_GRACE` (10 s) is too short for vLLM to shut down cleanly.

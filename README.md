@@ -32,7 +32,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
-`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
+`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
 `KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
@@ -47,14 +47,19 @@ configuration it came from, because the numbers move a lot between them.
 Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
 during a 400k prefill — see the safety rules for why that floor matters.
 
-One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
+One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=20`,
 FP8) has not been benchmarked end to end — the 262k row above is at a lower KV
 target and BF16, and predates the `MADV_RANDOM` mmap change. Short-context
 (32k) prefill is now measured for both dtypes; see the FP8 section.
 
-`KV_TARGET_GIB` was briefly lowered to 20 on 2026-09-04 after two servers were
-killed by the watchdog. That turned out to be a watchdog bug, not a memory
-problem — see [Watchdog](#watchdog) — so the default is 22 again.
+`KV_TARGET_GIB` shipped as 22 until 2026-09-04. Two things turned out to be
+true at once. Two servers were killed by a watchdog bug — a single noisy sample
+under the floor, see [Watchdog](#watchdog) — and separately, the host margin at
+22 is genuinely thin: ~7.1 GiB `MemAvailable` idle, against ~8.1-8.3 GiB at 20.
+A later burst consumed ~1.4 GiB in 9 seconds and took a 22 server under the
+floor for real, on a sustained decline the fixed watchdog correctly acted on.
+The default is 20 for that margin; 22 remains a supported setting if your
+workload does not produce those bursts.
 
 ### Prefill and decode, measured with sparkDash
 
@@ -173,7 +178,7 @@ MAX_MODEL_LEN=65536 MTP_NUM_SPECULATIVE_TOKENS=0 ./start.sh
 The safety-relevant knobs are `KV_TARGET_GIB` (how much KV to target; the main
 consumer of host memory) and `HOST_SLACK_GIB` (container cgroup cap = GPU
 budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin;
-raising it above the shipped 22 is what eats that margin first.
+raising it above the shipped 20 is what eats that margin first.
 
 ### Long context beyond 262k (YaRN)
 
@@ -199,7 +204,7 @@ actually reads. The existing `mrope_section`, `rope_theta` and
 `MRotaryEmbedding` and mrope stays enabled.
 
 512k fits with **no other change**: it needs 14.4 GiB of KV, well inside what
-`KV_TARGET_GIB` provides at 20 or at the shipped 22, and the GPU budget and
+`KV_TARGET_GIB` provides at the shipped 20 or at 22, and the GPU budget and
 cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
 `KV_TARGET_GIB=20` (2026-09-04):
 
@@ -495,8 +500,8 @@ were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
   scales once to the score and the normalised output, plumbs `k_scale`/
   `v_scale` into the kernels, and relaxes the four BF16-only guards and the
   inherited FlashAttention rejection. Avoiding an FP32 dequantisation tile lets
-  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to ~1.38M tokens
-  at the shipped `KV_TARGET_GIB=22`, which is what makes a 1M context
+  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to ~1.26M tokens
+  at the shipped `KV_TARGET_GIB=20` (~1.38M at 22), which is what makes a 1M context
   arithmetically possible on one Spark. **On by default** and still a real
   quality trade — see the warning `start.sh` prints.
   The FP8-KV approach is credited to
