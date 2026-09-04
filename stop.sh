@@ -9,8 +9,24 @@
 # host's /dev/shm and survives until reboot. Use --force to skip the wait.
 set -euo pipefail
 
-CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
-STOP_TIMEOUT="${STOP_TIMEOUT:-30}"      # seconds before docker escalates to SIGKILL
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Match start.sh's configuration behavior. Preserve explicit environment
+# overrides, then load the deployment's .env even when stop.sh is called from
+# another working directory.
+_ENV_CONTAINER_NAME="${TP1_CONTAINER_NAME:-}"
+_ENV_STOP_TIMEOUT="${STOP_TIMEOUT:-}"
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    # shellcheck source=.env
+    source "$SCRIPT_DIR/.env"
+fi
+
+CONTAINER_NAME="${_ENV_CONTAINER_NAME:-${TP1_CONTAINER_NAME:-vllm-fn-tp1}}"
+STOP_TIMEOUT="${_ENV_STOP_TIMEOUT:-${STOP_TIMEOUT:-30}}"  # seconds before docker escalates to SIGKILL
+[[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]] || {
+    echo "STOP_TIMEOUT must be a non-negative integer (got: '$STOP_TIMEOUT')" >&2
+    exit 1
+}
 
 FORCE=false
 for arg in "$@"; do
