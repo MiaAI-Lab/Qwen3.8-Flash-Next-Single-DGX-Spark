@@ -32,7 +32,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
-`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=22`,
+`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
 `KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`**. Everything below was measured on
 this host on 2026-09-04; each row names the configuration it came from, because
 the numbers move a lot between them.
@@ -47,10 +47,15 @@ the numbers move a lot between them.
 Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
 during a 400k prefill — see the safety rules for why that floor matters.
 
-Two honest gaps: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
-BF16) has not been benchmarked — the 262k row above is from the older
-`KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. Short-context (32k) prefill is now measured for both
-dtypes; see the FP8 section.
+One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=20`,
+FP8) has not been benchmarked end to end — the 262k row above is at the same KV
+target but BF16, and predates the `MADV_RANDOM` mmap change. Short-context
+(32k) prefill is now measured for both dtypes; see the FP8 section.
+
+`KV_TARGET_GIB` shipped as 22 until 2026-09-04. It was lowered to 20 because 22
+left host `MemAvailable` only ~1.6 GiB above the watchdog floor on this box, and
+a slow drift under sustained load crossed it after ~4.5 h — `memwatch.sh` then
+killed the container. 20 still yields ~1.26M FP8 tokens at 262k.
 
 ### Prefill and decode, measured with sparkDash
 
@@ -137,7 +142,8 @@ MAX_MODEL_LEN=65536 MTP_NUM_SPECULATIVE_TOKENS=0 ./start.sh
 
 The safety-relevant knobs are `KV_TARGET_GIB` (how much KV to target; the main
 consumer of host memory) and `HOST_SLACK_GIB` (container cgroup cap = GPU
-budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin.
+budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin;
+raising it above the shipped 20 is what eats the watchdog's headroom first.
 
 ### Long context beyond 262k (YaRN)
 
@@ -163,7 +169,7 @@ actually reads. The existing `mrope_section`, `rope_theta` and
 `MRotaryEmbedding` and mrope stays enabled.
 
 512k fits with **no other change**: it needs 14.4 GiB of KV, well inside what
-`KV_TARGET_GIB` provides at either 20 or the shipped 22, and the GPU budget and
+`KV_TARGET_GIB` provides at the shipped 20 or at 22, and the GPU budget and
 cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
 `KV_TARGET_GIB=20` (2026-09-04):
 
@@ -326,7 +332,7 @@ lookup. Measured on this host:
 The decode difference is within noise — decode was never disk-*throughput*
 bound (1.4 MiB/token at 26 tok/s is only ~36 MB/s). The real win is the
 ~2 GiB of unified memory no longer wasted on readahead that is thrown away,
-which is what makes `KV_TARGET_GIB=22` viable.
+which is what funds the KV pool `KV_TARGET_GIB` asks for.
 
 ## Safety rules
 
