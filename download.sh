@@ -67,7 +67,11 @@ info "Cache:  $HF_CACHE_DIR"
 # Already complete? Require every shard named by the safetensors index. A
 # config.json appears early in a partial download and is not sufficient.
 if [[ -d "$MODEL_PATH" ]]; then
-    SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
+    if [[ -f "$MODEL_PATH/refs/main" ]]; then
+        SNAP="$(cat "$MODEL_PATH/refs/main")"
+    else
+        SNAP="$(ls -t "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
+    fi
     if [[ -n "$SNAP" ]] && snapshot_complete "$MODEL_PATH/snapshots/$SNAP"; then
         ok "Already in cache: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
         info "Nothing to do. Run ./start.sh next."
@@ -111,7 +115,11 @@ fi
 
 # Verify exactly what start.sh will look for, so a broken download fails here.
 [[ -d "$MODEL_PATH" ]] || err "Download finished but $MODEL_PATH is missing."
-SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
+if [[ -f "$MODEL_PATH/refs/main" ]]; then
+    SNAP="$(cat "$MODEL_PATH/refs/main")"
+else
+    SNAP="$(ls -t "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
+fi
 [[ -n "$SNAP" ]] || err "No snapshot directory under $MODEL_PATH/snapshots"
 snapshot_complete "$MODEL_PATH/snapshots/$SNAP" || err "Snapshot is missing one or more indexed weight shards — the download is incomplete. Rerun this script."
 

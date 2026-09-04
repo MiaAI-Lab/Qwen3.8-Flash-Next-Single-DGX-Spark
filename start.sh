@@ -219,7 +219,11 @@ ORG="${MODEL_ID%%/*}"; NAME="${MODEL_ID##*/}"
 MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
 [[ -d "$MODEL_PATH" ]] || err "Checkpoint not in cache: $MODEL_PATH
        Fetch it first:  ./download.sh $MODEL_ID"
-SNAPSHOT_REL="snapshots/$(ls "$MODEL_PATH/snapshots" | head -1)"
+if [[ -f "$MODEL_PATH/refs/main" ]]; then
+    SNAPSHOT_REL="snapshots/$(cat "$MODEL_PATH/refs/main")"
+else
+    SNAPSHOT_REL="snapshots/$(ls -t "$MODEL_PATH/snapshots" | head -1)"
+fi
 [[ -f "$MODEL_PATH/$SNAPSHOT_REL/config.json" ]] || err "No snapshot under $MODEL_PATH/snapshots"
 python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY' || err "Checkpoint snapshot is incomplete. Resume it with: ./download.sh $MODEL_ID"
 import json
@@ -409,7 +413,7 @@ if [[ -n "$YARN_FACTOR" ]]; then
     # Deep-merged into text_config.rope_parameters, which is what this model
     # reads (nvidia/qsa.py) and what vLLM's max-len check scales by. The
     # existing mrope_section / rope_theta / partial_rotary_factor survive.
-    VLLM_ARGS+=("--hf-overrides" "$(printf "'{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":%s,\"original_max_position_embeddings\":%s}}}'" "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
+    VLLM_ARGS+=("--hf-overrides" "$(printf '{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":%s,\"original_max_position_embeddings\":%s}}}' "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
 fi
 VLLM_ARGS+=("--load-format" "safetensors")
 VLLM_ARGS+=("--safetensors-load-strategy" "lazy")
@@ -421,10 +425,14 @@ VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s}'" "$MTP_NUM_SPECULATIVE_TOKENS")")
+    VLLM_ARGS+=("--speculative-config" "$(printf '{\"method\":\"mtp\",\"num_speculative_tokens\":%s}' "$MTP_NUM_SPECULATIVE_TOKENS")")
 fi
-VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":0,\"cudagraph_mode\":\"%s\"}'" "$CUDAGRAPH_MODE")")
-[[ -n "$EXTRA_VLLM_ARGS" ]] && VLLM_ARGS+=("$EXTRA_VLLM_ARGS")
+VLLM_ARGS+=("--compilation-config" "$(printf '{\"mode\":0,\"cudagraph_mode\":\"%s\"}' "$CUDAGRAPH_MODE")")
+if [[ -n "$EXTRA_VLLM_ARGS" ]]; then
+    # Word-split like a shell command line (e.g. "--api-key k --disable-log-requests").
+    read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"
+    VLLM_ARGS+=("${_EXTRA_VLLM[@]}")
+fi
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 
 info ""
@@ -444,6 +452,9 @@ info "  Port:       $PORT"
 info ""
 
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
+# Note: no HF_TOKEN in the generated script — the server runs offline
+# (HF_HUB_OFFLINE=1) and the token value must not persist in .last_launch.sh.
+# download.sh passes it explicitly to the fetch container when needed.
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
 docker run \\
@@ -457,7 +468,6 @@ docker run \\
     -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
     -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
     -e HF_HOME=/root/.cache/huggingface \\
-    ${HF_TOKEN:+-e HF_TOKEN=$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
