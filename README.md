@@ -444,8 +444,8 @@ source of your modified version.
 ### What the license does and does not cover
 
 It covers the files in this repository — the launcher, the patch generators,
-the packed-table builder, the watchdog and the benchmarks. It does **not**
-relicense anything they operate on, each of which carries its own terms:
+the packed-table builder and the watchdog. It does **not** relicense anything
+they operate on, each of which carries its own terms:
 
 - **vLLM** (Apache-2.0) — not redistributed here. `start.sh` extracts the
   pristine `*.orig` sources from the container image at runtime, and the patch
