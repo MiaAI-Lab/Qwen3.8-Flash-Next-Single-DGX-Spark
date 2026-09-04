@@ -221,6 +221,19 @@ MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
        Fetch it first:  ./download.sh $MODEL_ID"
 SNAPSHOT_REL="snapshots/$(ls "$MODEL_PATH/snapshots" | head -1)"
 [[ -f "$MODEL_PATH/$SNAPSHOT_REL/config.json" ]] || err "No snapshot under $MODEL_PATH/snapshots"
+python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY' || err "Checkpoint snapshot is incomplete. Resume it with: ./download.sh $MODEL_ID"
+import json
+import pathlib
+import sys
+
+snapshot = pathlib.Path(sys.argv[1])
+index = snapshot / "model.safetensors.index.json"
+if not index.is_file():
+    raise SystemExit(1)
+weight_map = json.loads(index.read_text()).get("weight_map", {})
+raise SystemExit(0 if weight_map and all((snapshot / name).is_file()
+                                         for name in set(weight_map.values())) else 1)
+PY
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 
 # ---------------------------------------------------------------------------
