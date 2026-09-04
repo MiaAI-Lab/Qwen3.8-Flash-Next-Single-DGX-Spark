@@ -36,16 +36,16 @@ the numbers move a lot between them.
 |---|---|---|---|---|
 | 262k, `KV_TARGET_GIB=20`, BF16 | 21.28 GiB = 736,837 tok (2.81x a 262k req) | — | — | — |
 | 512k YaRN, `KV_TARGET_GIB=20`, BF16 | 19.2 GiB = 704,558 tok (1.34x a 512k req) | 1,537 tok/s (TTFT 260.3 s) | 28.3 tok/s (sd 2.6) | 3/3 PASS |
-| 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s) | 27.1 tok/s (sd 1.3) | 3/3 PASS |
+| 512k YaRN, `KV_TARGET_GIB=22`, BF16 | 796,196 tok (1.52x a 512k req) | 1,883 tok/s @32k | — | 12/14 (see FP8 section) |
+| 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s); 1,769 tok/s @32k | 27.1 tok/s (sd 1.3) | 15/20 (see FP8 section) |
 
 Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
 during a 400k prefill — see the safety rules for why that floor matters.
 
 Two honest gaps: the **shipped default itself** (262k, `KV_TARGET_GIB=22`,
 BF16) has not been benchmarked — the 262k row above is from the older
-`KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. And no
-**short-context** prefill has been measured in any configuration; all prefill
-figures are at 400k.
+`KV_TARGET_GIB=20` profile and predates the `MADV_RANDOM` mmap change. Short-context (32k) prefill is now measured for both
+dtypes; see the FP8 section.
 
 Reference numbers from the identical recipe on a sibling Spark, not reproduced
 here: ~30 tok/s decode on code, ~1,750 tok/s prefill at 200k.
@@ -180,19 +180,42 @@ KV_CACHE_DTYPE=auto   # BF16 KV, if you would rather not take the trade
 Measured on this host 2026-09-04, identical prompts, `YARN=1`,
 `KV_TARGET_GIB=22`, idle server:
 
+All rows below are at matched settings (`KV_TARGET_GIB=22`, 512k YaRN) unless
+noted. KV pool varies a little between restarts, so a range is given.
+
 | | BF16 | FP8 | Δ |
 |---|---|---|---|
-| KV pool | 704,558 tok | **1,431,164 tok** | **+103%** |
-| Concurrency @ 524,288 | 1.34x | **2.73x** | +104% |
-| KV memory | 19.2 GiB | 22.2 GiB | — |
+| KV pool | 779,671–796,196 tok | **1,431,164–1,502,014 tok** | **~1.8–1.9x** |
+| Concurrency @ 524,288 | 1.49–1.52x | **2.73–2.86x** | ~+85% |
 | Prefill @400k | 1,537 tok/s | 1,495 tok/s | −2.7% |
-| TTFT @400k | 260.3 s | 267.7 s | +2.8% |
+| Prefill @32k (2 runs each) | 1,883 tok/s | 1,769 tok/s | −6.1% |
 | Decode (prose, idle) | 28.3 tok/s (sd 2.6) | 27.1 tok/s (sd 1.3) | −4% |
-| Needles @400k (5/50/95%) | 3/3 PASS | **3/3 PASS** | same |
+| Reasoning suite (11 tasks) | **11/11** | **11/11** | same |
+| Needle miss rate @32k | 2/14 (14%) | 5/20 (25%) | p=0.67, **n.s.** |
 
-Capacity works out at **2.03x tokens per GiB** — only the 12 full-attention
-layers shrink (~84% of bytes/token); the QSA side/compressor caches stay BF16.
-That is why `KV_MULT` in `start.sh` is 0.58, not 0.5.
+Only the 12 full-attention layers shrink (~84% of bytes/token); the QSA
+side/compressor caches stay BF16, which is why the gain is ~1.85x rather than
+2x, and why `KV_MULT` in `start.sh` is 0.58 rather than 0.5.
+
+**The short-context penalty is real but small.** FP8 halves `block_n` to fit
+GB10 shared memory, which costs more on a short kernel than a long one: −6.1%
+at 32k versus −2.7% at 400k. That is far milder than the −30% the reference
+implementation reported at 32k.
+
+**On quality.** Both dtypes score 11/11 on the reasoning suite
+(4 multi-step short tasks, 4 long chain-of-thought up to ~4,800 reasoning
+tokens, 3 tasks combining three facts from a ~100k-token context). Both max it
+out, so the honest reading is *no gross regression at n=11* — enough to rule
+out the 6/6 → 2/6 collapse the reference measured, not enough to detect finer
+drift. A suite everything passes cannot rank anything.
+
+**A caution about needle tests on this model.** The 95%-depth needle at 32k is
+flaky *regardless of KV dtype*: BF16 missed it 2/14 times, FP8 5/20, which
+Fisher's exact test cannot distinguish (p=0.67). The two shallower needles were
+found 34/34 times in both. So a single needle run is weak evidence here — an
+isolated PASS or FAIL at 95% depth says little, and comparisons need matched
+sample counts on both sides. The 3/3 results quoted elsewhere in this README
+are single samples and should be read with that in mind.
 
 **Two caveats before trusting these numbers.**
 
