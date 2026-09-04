@@ -24,8 +24,11 @@
 !/download.sh
 !/start.sh
 !/stop.sh
+!/qwen38-flash.service
 
 # --- launcher support and patch generators -----------------------------
+!/scripts/smoke-test.sh
+
 !/files/memwatch.sh
 !/files/build_ple_packed_table.py
 !/files/patch_ple_layer.py

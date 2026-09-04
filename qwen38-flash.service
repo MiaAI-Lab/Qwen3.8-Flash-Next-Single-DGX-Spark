@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# systemd user unit for the single-Spark Qwen3.8-Flash-Next server.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp qwen38-flash.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now qwen38-flash
+#   loginctl enable-linger "$USER"        # start at boot without login
+#
+# start.sh launches the container, waits for /health, then EXITS 0 — the
+# container and the memwatch watchdog (nohup'd by start.sh) are the daemons.
+# Hence Type=oneshot + RemainAfterExit: the unit stays "active" after
+# start.sh returns, ExecStop brings the stack down, and a failed start.sh
+# (non-zero exit) marks the unit failed. Restart=on-failure covers start.sh
+# failing at boot (e.g. KV not yet released by another container); a crash
+# of the already-running container is vLLM's/docker's business — the
+# watchdog in start.sh handles the memory-emergency case.
+# NOTE: docker.service is a system unit; a user unit cannot order against or
+# require it. Docker autostart is a system-level assumption (it is enabled by
+# default on the DGX Spark OS). If you run this as a system unit instead
+# (/etc/systemd/system, with User=malvavisco and absolute paths), restore:
+#   After=docker.service network-online.target
+#   Requires=docker.service
+[Unit]
+Description=Qwen3.8-Flash-Next vLLM server (single Spark, TP=1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/qwen38-flash-next
+ExecStart=%h/qwen38-flash-next/start.sh
+ExecStop=%h/qwen38-flash-next/stop.sh
+# Weight load takes ~10-12 min; first boot additionally builds the ~27 GB
+# packed PLE table. Do not let systemd kill the start early.
+TimeoutStartSec=30min
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
