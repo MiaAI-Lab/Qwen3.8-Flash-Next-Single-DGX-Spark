@@ -40,20 +40,18 @@ for candidate in \
     fi
 done
 if [[ -z "$CG_PATH" ]]; then
-    echo "$(date '+%F %T') WARN: container cgroup memory file not readable; container= will log 0MiB (last resort: docker stats)"
+    echo "$(date '+%F %T') WARN: container cgroup memory file not readable; falling back to docker stats for the container= timeline"
 fi
 
 tick=0
 below=0
+cg=0
 while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
     free=$(awk '/MemFree/{print $2}' /proc/meminfo)
     swapfree=$(awk '/SwapFree/{print $2}' /proc/meminfo)
     if [[ -n "$CG_PATH" ]]; then
         cg=$(cat "$CG_PATH" 2>/dev/null || echo 0)
-    else
-        # ~100 ms per call; only when the timeline is actually printed below.
-        cg=0
     fi
 
     if (( avail < MIN_KB )); then
@@ -77,8 +75,14 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
 
     if (( tick % 5 == 0 || avail < NEAR_KB )); then
         if [[ -z "$CG_PATH" ]]; then
-            cg=$(docker stats --no-stream --format '{{.MemUsage}}' "$CONTAINER" 2>/dev/null | grep -oE '^[0-9.]+' | head -1)
-            cg=$(python3 -c "print(int(float('${cg:-0}')*2**20))" 2>/dev/null || echo 0)  # MiB -> KiB
+            # ~100 ms per call, so only on printed ticks. docker stats prints
+            # e.g. "8.87GiB / 105GiB" — honour the unit suffix, and note it
+            # reports the working set while memory.current includes page
+            # cache, so the fallback reads lower than the cgroup path.
+            raw=$(docker stats --no-stream --format '{{.MemUsage}}' "$CONTAINER" 2>/dev/null)
+            cg=$(awk '{tok=$1; v=tok; gsub(/[A-Za-z]/,"",v); u=tok; gsub(/[0-9.]/,"",u);
+                       m=(u=="GiB"?2**30:(u=="MiB"?2**20:(u=="KiB"?2**10:(u=="B"?1:2**30))));
+                       printf "%d", v*m}' <<< "${raw:-0MiB}")
         fi
         echo "$(date '+%T') avail=$((avail/1024))MiB free=$((free/1024))MiB swapfree=$((swapfree/1024))MiB container=$((cg/1048576))MiB"
     fi

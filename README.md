@@ -462,10 +462,10 @@ For a fuller post-launch check:
 PORT=9000 API_KEY=xyz ./scripts/smoke-test.sh # against a non-default port / authenticated server
 ```
 
-The smoke test sends the same temperature-0 prompt twice and flags differing
-outputs — on GB10 the stock QSA top-k kernel is non-deterministic (drops
-candidates), so a failure there is a known stack property, not necessarily a
-broken deployment.
+The smoke test sends the same temperature-0 prompt twice and warns on
+differing outputs — on GB10 the stock QSA top-k kernel is non-deterministic
+(drops candidates, upstream vllm#51782), so a warning there is a known stack
+property (and a pass is luck, not proof), not a broken deployment.
 
 ## Monitoring
 
@@ -476,7 +476,7 @@ worth watching on this deployment:
 |---|---|
 | `vllm:num_requests_waiting` | Non-zero means requests are queued behind `MAX_NUM_SEQS` — with the default 4, queueing is otherwise silent and looks exactly like a slow GPU |
 | `vllm:request_queue_time_seconds_*` | Time spent queued; rises before decode slows |
-| `vllm:gpu_cache_usage_perc` | KV pool occupancy; sustained near 1.0 means context pressure |
+| `vllm:kv_cache_usage_perc` | KV pool occupancy; sustained near 1.0 means context pressure |
 | `vllm:generation_tokens_total` / `vllm:prompt_tokens_total` | Throughput; derive tok/s with `rate()` |
 
 Example: `rate(vllm:generation_tokens_total[1m])` for decode tok/s,
