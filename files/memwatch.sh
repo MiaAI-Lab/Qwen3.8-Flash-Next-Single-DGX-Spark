@@ -22,13 +22,39 @@ NEAR_KB=$(( MIN_KB + 1048576 ))     # verbose logging band: floor + 1 GiB
 GRACE="${MEMWATCH_GRACE:-10}"       # seconds to let vLLM unlink its POSIX shm
 echo "$(date '+%F %T') watchdog start: container=$CONTAINER floor=${MIN_GIB}GiB" \
      "trigger=${CONSEC} consecutive samples"
+
+# Resolve the container's memory.current path once. The systemd-driver path
+# below does not exist with the cgroupfs driver, cgroup v1, or rootless
+# docker; probing at startup turns a silent "container=0MiB forever" into a
+# one-time warning.
+CID=$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null || echo "")
+CG_PATH=""
+for candidate in \
+    "/sys/fs/cgroup/system.slice/docker-${CID}.scope/memory.current" \
+    "/sys/fs/cgroup/system.slice/docker-${CID}.scope/memory.usage_in_bytes" \
+    "/sys/fs/cgroup/memory/docker/${CID}/memory.usage_in_bytes" \
+    "/sys/fs/cgroup/memory/system.slice/docker-${CID}.scope/memory.usage_in_bytes"; do
+    if [[ -n "$CID" && -r "$candidate" ]]; then
+        CG_PATH="$candidate"
+        break
+    fi
+done
+if [[ -z "$CG_PATH" ]]; then
+    echo "$(date '+%F %T') WARN: container cgroup memory file not readable; container= will log 0MiB (last resort: docker stats)"
+fi
+
 tick=0
 below=0
 while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
     free=$(awk '/MemFree/{print $2}' /proc/meminfo)
     swapfree=$(awk '/SwapFree/{print $2}' /proc/meminfo)
-    cg=$(cat /sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null).scope/memory.current 2>/dev/null || echo 0)
+    if [[ -n "$CG_PATH" ]]; then
+        cg=$(cat "$CG_PATH" 2>/dev/null || echo 0)
+    else
+        # ~100 ms per call; only when the timeline is actually printed below.
+        cg=0
+    fi
 
     if (( avail < MIN_KB )); then
         below=$(( below + 1 ))
@@ -50,6 +76,10 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     fi
 
     if (( tick % 5 == 0 || avail < NEAR_KB )); then
+        if [[ -z "$CG_PATH" ]]; then
+            cg=$(docker stats --no-stream --format '{{.MemUsage}}' "$CONTAINER" 2>/dev/null | grep -oE '^[0-9.]+' | head -1)
+            cg=$(python3 -c "print(int(float('${cg:-0}')*2**20))" 2>/dev/null || echo 0)  # MiB -> KiB
+        fi
         echo "$(date '+%T') avail=$((avail/1024))MiB free=$((free/1024))MiB swapfree=$((swapfree/1024))MiB container=$((cg/1048576))MiB"
     fi
     tick=$((tick+1))

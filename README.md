@@ -455,6 +455,33 @@ inside its reasoning, so `content` comes back empty on a perfectly healthy
 server. Gibberish in either field means the PLE path has regressed (bf16 IPC
 buffer or missing quant scales) — see the patch notes below.
 
+For a fuller post-launch check:
+
+```
+./scripts/smoke-test.sh                       # health, coherence, determinism, context, metrics
+PORT=9000 API_KEY=xyz ./scripts/smoke-test.sh # against a non-default port / authenticated server
+```
+
+The smoke test sends the same temperature-0 prompt twice and flags differing
+outputs — on GB10 the stock QSA top-k kernel is non-deterministic (drops
+candidates), so a failure there is a known stack property, not necessarily a
+broken deployment.
+
+## Monitoring
+
+vLLM exposes Prometheus metrics at `http://<host>:8888/metrics`. The series
+worth watching on this deployment:
+
+| Series | Why |
+|---|---|
+| `vllm:num_requests_waiting` | Non-zero means requests are queued behind `MAX_NUM_SEQS` — with the default 4, queueing is otherwise silent and looks exactly like a slow GPU |
+| `vllm:request_queue_time_seconds_*` | Time spent queued; rises before decode slows |
+| `vllm:gpu_cache_usage_perc` | KV pool occupancy; sustained near 1.0 means context pressure |
+| `vllm:generation_tokens_total` / `vllm:prompt_tokens_total` | Throughput; derive tok/s with `rate()` |
+
+Example: `rate(vllm:generation_tokens_total[1m])` for decode tok/s,
+`vllm:num_requests_waiting > 0` as a queueing alert.
+
 ## Layout
 
 - `download.sh` — fetches the checkpoint into the Hugging Face cache
@@ -472,6 +499,11 @@ buffer or missing quant scales) — see the patch notes below.
   first run. Edit the generators; edits to the generated files are overwritten.
 - `files/build_ple_packed_table.py` — one-time packed PLE table builder
   (27 GB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
+- `scripts/smoke-test.sh` — post-launch verification (health, coherent
+  generation, temperature-0 determinism, served context, metrics endpoint).
+- `qwen38-flash.service` — optional systemd user unit: boots the server at
+  login (or at boot with `loginctl enable-linger`), restarts on failure,
+  and keeps the memwatch watchdog in the same lifecycle.
 
 Benchmarks are not part of this repo. The published prefill and decode numbers
 were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
