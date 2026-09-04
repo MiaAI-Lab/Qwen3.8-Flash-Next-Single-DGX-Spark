@@ -166,6 +166,44 @@ YaRN trades some short-context accuracy for the longer window, so leave it off
 unless you need more than 262k. The 512k path serves correctly but its decode
 and prefill speeds have not yet been benchmarked.
 
+### Reasoning is on by default
+
+This build reasons before answering, and `start.sh` passes
+`--reasoning-parser qwen3`, so the thinking block arrives in a separate
+`reasoning` field rather than inside `content`. The chat template enables it
+whenever the flag is unset:
+
+```jinja
+{%- if enable_thinking is undefined or enable_thinking is true %}
+```
+
+Turn it off **per request** — no restart, so reasoning and non-reasoning
+traffic can share one server:
+
+```json
+{"model":"qwen3.8-flash-next",
+ "chat_template_kwargs":{"enable_thinking":false},
+ "messages":[{"role":"user","content":"What is 17*23? One line."}]}
+```
+
+Measured on this host:
+
+| | default | `enable_thinking: false` |
+|---|---|---|
+| reasoning tokens | 41 | **0** |
+| completion tokens | 47 | **12** |
+| `content` | `"\n\n391"` | `"17 * 23 = 391"` |
+
+Two consequences worth knowing:
+
+- **It is why `content` can come back empty.** With a small `max_tokens` the
+  reply is often still inside its reasoning. Budget ~400+ tokens, or disable
+  thinking. This is not a bug — see the sanity test above.
+- **It dominates latency on simple work.** Reasoning ran to 4,841 tokens on the
+  hardest task in our suite. For extraction, classification or short factual
+  answers, disabling it is a large win; leave it on for anything that needs
+  actual multi-step reasoning.
+
 ### FP8 KV cache (opt-in)
 
 `KV_CACHE_DTYPE=fp8` roughly doubles the KV pool by storing the main KV in
