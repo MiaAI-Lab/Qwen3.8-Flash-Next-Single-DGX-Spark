@@ -33,7 +33,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
-`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=8192`**.
+`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
 
@@ -66,11 +66,12 @@ them. The two prefill columns are **not** a clean A/B — they differ in rope
 config and KV target as well as chunk width — so each is labelled with what it
 was measured at.
 
-**Prefill.** At the old 2,048-token chunk width throughput peaked around 32-64k
-and fell away with context. At the shipped 8,192 it is flat from 16k out to
-128k, because per-chunk overhead is amortised over 4x fewer chunks:
+**Prefill.** At the shipped 2,048-token chunk width throughput peaks around
+32-64k and falls away with context. Raising `MAX_NUM_BATCHED_TOKENS` to 8,192
+flattens it from 16k out to 128k, because per-chunk overhead is amortised over
+4x fewer chunks:
 
-| context | 2,048 chunks (512k YaRN, `KV_TARGET_GIB=22`) | 8,192 chunks (262k native, `KV_TARGET_GIB=20`) |
+| context | shipped: 2,048 chunks (512k YaRN, `KV_TARGET_GIB=22`) | opt-in: 8,192 chunks (262k native, `KV_TARGET_GIB=20`) |
 |---|---|---|
 | 8k | 5.00 s · 1,646 tok/s | **3.69 s · 2,228 tok/s** |
 | 16k | 8.00 s · 2,052 tok/s | **7.16 s · 2,293 tok/s** |
@@ -83,11 +84,29 @@ The one matched pair — same server, same kernel, only the chunk width changed 
 is 32k: **2,133 → 2,366 tok/s (+10.9%), TTFT 15.38 → 13.87 s (−9.8%)**. The
 rest of the right-hand column is one run each and should be read as indicative.
 
-What it costs: 8,192 chunks raise peak activation to 1.27 GiB. vLLM profiles
-that *before* it sizes the KV cache, so it comes out of the pool rather than
-out of the GPU budget — 1,145,289 tokens here, still 4.37x a full 262k request.
+### Raising the prefill chunk width (opt-in)
+
+**The 8,192 column is not the default.** If you want the faster prefill and
+TTFT above, set it yourself:
+
+```
+MAX_NUM_BATCHED_TOKENS=8192 ./start.sh     # one launch
+```
+
+or edit the line in `.env` to make it stick.
+
+It is paid for out of the KV pool, not the GPU budget. 8,192 chunks raise peak
+activation to 1.27 GiB, and vLLM profiles that *before* it sizes the KV cache,
+so the pool absorbs it: 1,145,289 tokens on this host, still 4.37x a full 262k
+request. The best matched evidence for the size of that trade is PR #2's own
+pair at `KV_TARGET_GIB=22`, 1,282,724 → 1,249,637 tokens — about **−2.6%** of
+pool for **+11%** prefill.
+
 Host `MemAvailable` was 8.1-8.3 GiB idle and low-watered at 7.4 GiB across the
-sweep above.
+8,192 sweep, above where the run that tripped the watchdog started. That is
+minutes of observation, not hours, which is why it is offered as a knob rather
+than shipped on: if you serve long sessions near the memory floor, measure it
+on your own workload before committing to it.
 
 **Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count:
 
