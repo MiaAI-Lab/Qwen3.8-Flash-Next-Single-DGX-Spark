@@ -20,6 +20,7 @@
 !/README.md
 # the serving profile. /.env itself stays ignored: it may hold HF_TOKEN.
 !/.env.sample
+!/download.sh
 !/start.sh
 !/stop.sh
 

@@ -15,9 +15,14 @@ model: text, images and video all work out of the box (see below). Nothing here 
 
 ```
 cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
+./download.sh              # fetch the ~99 GB checkpoint (resumable)
 ./start.sh                 # ~10-12 min to /health; serves on :8888
 ./stop.sh                  # container + watchdog, graceful
 ```
+
+`start.sh` never downloads anything — it resolves the checkpoint from the local
+Hugging Face cache and fails fast if it is absent. Budget ~130 GiB of free disk:
+99 GB for the checkpoint plus the ~27 GB packed PLE table built on first launch.
 
 `./start.sh --no-launch` prints the derived memory budget and the docker
 command without running anything. `./stop.sh` sends SIGTERM and waits up to
@@ -372,6 +377,9 @@ buffer or missing quant scales) — see the patch notes below.
 
 ## Layout
 
+- `download.sh` — fetches the checkpoint into the Hugging Face cache
+  (resumable; honours `HF_TOKEN` for gated repos). Uses the host's
+  `huggingface_hub` if present, otherwise the container image.
 - `start.sh` — launcher: derives the GPU budget from live memory,
   builds the packed PLE table on first run, regenerates the patched vLLM
   files, starts the container and `files/memwatch.sh`.
