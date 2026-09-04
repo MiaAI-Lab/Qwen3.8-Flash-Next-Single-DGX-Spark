@@ -16,7 +16,7 @@ model: text, images and video all work out of the box (see below). Nothing here 
 ```
 cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
 ./download.sh              # fetch the ~99 GB checkpoint (resumable)
-./start.sh                 # ~10-12 min to /health; serves on :8888
+./start.sh                 # ~10-12 min to /health; serves on 127.0.0.1:8888
 ./stop.sh                  # container + watchdog, graceful
 ```
 
@@ -179,6 +179,16 @@ The safety-relevant knobs are `KV_TARGET_GIB` (how much KV to target; the main
 consumer of host memory) and `HOST_SLACK_GIB` (container cgroup cap = GPU
 budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin;
 raising it above the shipped 20 is what eats that margin first.
+
+### Network binding
+
+The API binds to loopback by default (`BIND=127.0.0.1`). The container uses
+host networking, so setting `BIND=0.0.0.0` exposes the unauthenticated vLLM
+API on every host interface. Only opt into a non-loopback bind when access is
+intentional and protected by a firewall, reverse proxy, or equivalent control.
+
+Override the bind for one launch with `BIND=0.0.0.0 ./start.sh`, or edit the
+value in `.env`. A visible warning is printed for every non-loopback bind.
 
 ### Long context beyond 262k (YaRN)
 
