@@ -37,13 +37,16 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 `MAX_NUM_BATCHED_TOKENS=2048`**.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
+Decode numbers are not in this table: they predate the 2026-09-05 optimisation
+pass and are superseded by the [sparkDash sweep](#prefill-and-decode-measured-with-sparkdash)
+below (46.3 tok/s single-stream prose).
 
-| Configuration | KV pool | Prefill @400k | Decode (prose, idle) | Needles 5/50/95% |
-|---|---|---|---|---|
-| 262k, `KV_TARGET_GIB=20`, BF16 | 21.28 GiB = 736,837 tok (2.81x a 262k req) | — | — | — |
-| 512k YaRN, `KV_TARGET_GIB=20`, BF16 | 19.2 GiB = 704,558 tok (1.34x a 512k req) | 1,537 tok/s (TTFT 260.3 s) | 28.3 tok/s (sd 2.6) | 3/3 PASS |
-| 512k YaRN, `KV_TARGET_GIB=22`, BF16 | 796,196 tok (1.52x a 512k req) | 1,883 tok/s @32k | — | 12/14 (see FP8 section) |
-| 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s); 1,769 tok/s @32k | 27.1 tok/s (sd 1.3) | 15/20 (see FP8 section) |
+| Configuration | KV pool | Prefill @400k | Needles 5/50/95% |
+|---|---|---|---|
+| 262k, `KV_TARGET_GIB=20`, BF16 | 21.28 GiB = 736,837 tok (2.81x a 262k req) | — | — |
+| 512k YaRN, `KV_TARGET_GIB=20`, BF16 | 19.2 GiB = 704,558 tok (1.34x a 512k req) | 1,537 tok/s (TTFT 260.3 s) | 3/3 PASS |
+| 512k YaRN, `KV_TARGET_GIB=22`, BF16 | 796,196 tok (1.52x a 512k req) | 1,883 tok/s @32k | 12/14 (see FP8 section) |
+| 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s); 1,769 tok/s @32k | 15/20 (see FP8 section) |
 
 The shipped profile itself (262k, `HOST_RESERVE_GIB=26`, `KV_TARGET_GIB=16`,
 FP8, `MAX_NUM_SEQS=5`) was measured on 2026-09-05:
@@ -380,7 +383,6 @@ noted. KV pool varies a little between restarts, so a range is given.
 | Concurrency @ 524,288 | 1.49–1.52x | **2.73–2.86x** | ~+85% |
 | Prefill @400k | 1,537 tok/s | 1,495 tok/s | −2.7% |
 | Prefill @32k (2 runs each) | 1,883 tok/s | 1,769 tok/s | −6.1% |
-| Decode (prose, idle) | 28.3 tok/s (sd 2.6) | 27.1 tok/s (sd 1.3) | −4% |
 | Reasoning suite (11 tasks) | **11/11** | **11/11** | same |
 | Needle miss rate @32k | 2/14 (14%) | 5/20 (25%) | p=0.67, **n.s.** |
 
@@ -456,11 +458,10 @@ lookup. Measured on this host:
 | | default mmap | `MADV_RANDOM` |
 |---|---|---|
 | Disk read per decoded token | ~1,366 KiB | **57 KiB** (−24x) |
-| Decode | 26.3 tok/s (sd 1.6) | 28.3 tok/s (sd 2.6) |
 | Host MemAvailable | ~10.9 GiB | **~12.95 GiB** |
 
-The decode difference is within noise — decode was never disk-*throughput*
-bound (1.4 MiB/token at 26 tok/s is only ~36 MB/s). The real win is the
+Decode speed did not change measurably — decode was never disk-*throughput*
+bound (1.4 MiB/token at ~26 tok/s, the rate at the time, is only ~36 MB/s). The real win is the
 ~2 GiB of unified memory no longer wasted on readahead that is thrown away,
 which is what funds the KV pool `KV_TARGET_GIB` asks for.
 
