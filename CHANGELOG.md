@@ -55,6 +55,11 @@ as promises.
   The second 90k prompt added nothing (96.4 → 96.4 GiB); five concurrent 60k
   prompts added 0.2 GiB (96.6). Session minimum over launch, both tests and
   50 idle minutes: `MemAvailable` 14.26 GiB, `MemFree` 3.24 GiB.
+  A further hour with the qwen-code harness pointed at the server passed with
+  no watchdog event, `MemAvailable` never under 13.9 GiB and the driver figure
+  at 96.5–96.8 GiB — but the harness only sent two ~55k-token requests in that
+  hour before waiting on its operator, so the five-agent, 370-request load has
+  not yet been replayed against this budget.
 
 - **Watchdog: a second floor, richer timeline, logs archived before the stop**
   (`files/memwatch.sh`). It now also stops the container when `MemFree` stays

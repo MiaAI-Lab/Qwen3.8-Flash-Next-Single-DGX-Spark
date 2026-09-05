@@ -57,6 +57,7 @@ FP8, `MAX_NUM_SEQS=5`) was measured on 2026-09-05:
 | Host MemAvailable, 40 idle minutes | 15.5–16.4 GiB (MemFree ≥ 4.4 GiB) |
 | Host MemAvailable after two ~90k prompts | 16.2 → 15.05 GiB after the first, 15.2 GiB 60 s after the second (min 14.9 during prefill; MemFree ≥ 3.5 GiB) |
 | Host MemAvailable, five concurrent ~60k prompts | 14.9 → 14.57 GiB at +60 s (min 14.26 during; MemFree ≥ 3.24 GiB); 5/5 completed, no watchdog event |
+| One hour under the qwen-code harness | min MemAvailable 13.9 GiB, driver 96.5 → 96.6 GiB; the harness sent only two ~55k requests then idled, so this is not the 370-request load that killed the old config |
 | `NV_ERR_NO_MEMORY` in `journalctl -k` | 0 across launch and all of the above |
 
 The idle figure used to be quoted here as ~12.9 GiB; that came from a run at
