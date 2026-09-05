@@ -28,7 +28,9 @@ Hugging Face cache and fails fast if it is absent. Budget ~130 GiB of free disk:
 command without running anything. `./stop.sh` sends SIGTERM and waits up to
 `STOP_TIMEOUT` (default 30 s) so vLLM can unlink its POSIX shared memory —
 the container runs with `--ipc host`, so segments it leaves behind leak onto
-the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
+the host's `/dev/shm` until reboot. `./stop.sh` reads `.env`, including a
+custom `TP1_CONTAINER_NAME`; an explicit environment value still takes
+precedence. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
