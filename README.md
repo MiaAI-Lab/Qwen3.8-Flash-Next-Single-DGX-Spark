@@ -87,6 +87,59 @@ them. The two prefill columns are **not** a clean A/B — they differ in rope
 config and KV target as well as chunk width — so each is labelled with what it
 was measured at.
 
+#### 2026-09-05: after the decode optimisation pass
+
+Measured on the shipped profile (512k YaRN, 2,048 chunks, `MAX_NUM_SEQS=4`,
+MTP 3, FP8 KV, `KV_TARGET_GIB=20` → 16.18 GiB = 974,768 tokens) with
+`CUDAGRAPH_CAPTURE_SIZES=auto`, the PLE gather prefetch, and reduced-vocabulary
+drafting (`MTP_DRAFT_VOCAB`, 65,536 tokens) all active. The "before" columns are
+the same rope config and chunk width, so decode is a matched pair; prefill
+differs only in `KV_TARGET_GIB` (22 → 20), which does not affect prefill rate.
+
+**Decode on prose**, by concurrent stream count:
+
+| streams | TTFT | aggregate | per stream | before | change |
+|---|---|---|---|---|---|
+| 1 | 270 ms | **46.3 tok/s** | 46.3 tok/s | 36.9 | **+25.5%** |
+| 2 | 466 ms | **73.0 tok/s** | 36.5 tok/s | 57.4 | +27.2% |
+| 3 | 355 ms | **91.9 tok/s** | 31.2 tok/s | — | — |
+| 4 | 346 ms | **108.1 tok/s** | 27.7 tok/s | 85.9 | +25.8% |
+
+Almost all of that is the reduced draft vocabulary. The MTP drafter reads its
+own 1.18 GiB BF16 `lm_head` once per draft step, three of the four `lm_head`
+reads in an MTP-3 engine step; slicing it to 65,536 rows saves 2.61 GiB per
+step, and decode here is close enough to the memory-bandwidth wall that bytes
+removed convert almost one-for-one into time. Accuracy is unchanged — the
+target model verifies every drafted token — measured at 250 MGSM problems per
+language, English 94.8% vs 93.6% and Chinese 86.4% vs 86.4%. See the CHANGELOG
+entry for the full method.
+
+**Prefill**, same chunk width as the shipped column below:
+
+| context | TTFT | prefill | before | change |
+|---|---|---|---|---|
+| 8k | 4.67 s | **1,764 tok/s** | 1,646 | +7.2% |
+| 16k | 7.25 s | **2,265 tok/s** | 2,052 | +10.4% |
+| 32k | 14.49 s | **2,265 tok/s** | 2,073 | +9.3% |
+| 64k | 29.52 s | **2,222 tok/s** | 2,037 | +9.1% |
+| 128k | 62.15 s | **2,110 tok/s** | 1,945 | +8.5% |
+| 256k | 137.03 s | **1,913 tok/s** | 1,791 | +6.8% |
+
+The prefill gain is most likely the PLE page-fault prefetch rather than the
+draft vocabulary, which does not touch prefill: the PLE row gather runs for
+every prefilled token, so a 2,048-token chunk gathers 16 rows per token —
+~32,768 of them — against the ~256 a 4-stream MTP-3 decode step gathers. That
+gather is single-threaded and was taking each
+missing 4 KiB page fault on its own; batching the reads with
+`posix_fadvise(WILLNEED)` measured 13x on a cold 280-row gather in isolation and
+only ~3% on decode, where there are too few faults per step for it to matter.
+This was not isolated with an A/B, so read the attribution as inference from
+the mechanism, not as a measurement.
+
+These numbers came from one run each. The decode figures are content-dependent
+for the reason given at the end of this section, and the `x3` TTFT below `x2`
+is run-to-run noise.
+
 **Prefill.** At the shipped 2,048-token chunk width throughput peaks around
 32-64k and falls away with context. Raising `MAX_NUM_BATCHED_TOKENS` to 8,192
 flattens it from 16k out to 128k, because per-chunk overhead is amortised over
@@ -128,13 +181,15 @@ the 8,192 sweep. It is offered as a knob rather than a default because the
 supporting observation is minutes, not hours: if you serve long sessions near
 the memory floor, measure it on your own workload before committing to it.
 
-**Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count:
+**Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count.
+These are the pre-2026-09-05 figures, kept because the tables above are stated
+as deltas against them:
 
 | streams | TTFT | aggregate | per stream |
 |---|---|---|---|
 | 1 | 418 ms | 36.9 tok/s | 36.9 tok/s |
 | 2 | 445 ms | 57.4 tok/s | 29.7 tok/s |
-| 4 | 550 ms | **85.9 tok/s** | 23.4 tok/s |
+| 4 | 550 ms | 85.9 tok/s | 23.4 tok/s |
 
 Decode speed on this model is **strongly content-dependent**, because MTP
 speculative decoding accepts more drafts on predictable text. Measured on this
