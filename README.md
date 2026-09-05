@@ -34,8 +34,9 @@ precedence. `./stop.sh --force` skips the wait.
 
 ## Measured profile
 
-`.env.sample` ships **262,144 context (YaRN off), MTP 3, `KV_TARGET_GIB=20`,
-`KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**.
+`.env.sample` ships **262,144 context (YaRN off), MTP 3, `HOST_RESERVE_GIB=26`,
+`KV_TARGET_GIB=16`, `KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`,
+`MAX_NUM_BATCHED_TOKENS=2048`**.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
 
@@ -46,22 +47,38 @@ configuration it came from, because the numbers move a lot between them.
 | 512k YaRN, `KV_TARGET_GIB=22`, BF16 | 796,196 tok (1.52x a 512k req) | 1,883 tok/s @32k | — | 12/14 (see FP8 section) |
 | 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s); 1,769 tok/s @32k | 27.1 tok/s (sd 1.3) | 15/20 (see FP8 section) |
 
-Host `MemAvailable` sits at ~12.9 GiB idle and dipped to a low-water 10.97 GiB
-during a 400k prefill — see the safety rules for why that floor matters.
+The shipped profile itself (262k, `HOST_RESERVE_GIB=26`, `KV_TARGET_GIB=16`,
+FP8, `MAX_NUM_SEQS=5`) was measured on 2026-09-05:
+
+| | |
+|---|---|
+| GPU budget | GMU 0.780 = 94.87 GiB |
+| Available KV cache | 16.46 GiB = **992,584 tokens** (3.79x a 262k request) |
+| Time to `/health` | 10 min 51 s (checkpoint read from NVMe) |
+| Host MemAvailable, 2 min after `/health` | 15.7 GiB (MemFree 5.1 GiB) |
+| Host MemAvailable, 40 idle minutes | 15.5–16.4 GiB (MemFree ≥ 4.4 GiB) |
+| Host MemAvailable after two ~90k prompts | 16.2 → 15.05 GiB after the first, 15.2 GiB 60 s after the second (min 14.9 during prefill; MemFree ≥ 3.5 GiB) |
+| Host MemAvailable, five concurrent ~60k prompts | 14.9 → 14.57 GiB at +60 s (min 14.26 during; MemFree ≥ 3.24 GiB); 5/5 completed, no watchdog event |
+| 2.5 h under the qwen-code harness (~38 requests, 19 of them 50–100k tokens, up to 3 concurrent) | 14.2–14.9 GiB between turns, min 12.8 GiB at 3 concurrent; driver 96.6 → 97.5 GiB in one step |
+| `NV_ERR_NO_MEMORY` in `journalctl -k` | 0 across launch and all of the above |
+
+The idle figure used to be quoted here as ~12.9 GiB; that came from a run at
+`KV_TARGET_GIB=20` before the day's co-tenants were on the box. See the safety
+rules for why the number matters.
 
 One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=20`,
 FP8) has not been benchmarked end to end — the 262k row above is at a lower KV
 target and BF16, and predates the `MADV_RANDOM` mmap change. Short-context
 (32k) prefill is now measured for both dtypes; see the FP8 section.
 
-`KV_TARGET_GIB` shipped as 22 until 2026-09-04. Two things turned out to be
-true at once. Two servers were killed by a watchdog bug — a single noisy sample
-under the floor, see [Watchdog](#watchdog) — and separately, the host margin at
-22 is genuinely thin: ~7.1 GiB `MemAvailable` idle, against ~8.1-8.3 GiB at 20.
-A later burst consumed ~1.4 GiB in 9 seconds and took a 22 server under the
-floor for real, on a sustained decline the fixed watchdog correctly acted on.
-The default is 20 for that margin; 22 remains a supported setting if your
-workload does not produce those bursts.
+`KV_TARGET_GIB` shipped as 22, then 20, until 2026-09-05. Both lost servers:
+three on 2026-09-04. The rows above at 22 are real measurements, but the host
+they were taken on had 6.9–8.8 GiB of `MemAvailable` left, against a 6 GiB
+watchdog floor and a GPU driver that refuses allocations before that. The
+budget is now capped from the host side (`HOST_RESERVE_GIB`, see
+[Safety rules](#safety-rules)); the KV pool is whatever the cap leaves, and 16
+sits just under it. 20 and 22 are no longer reachable through `KV_TARGET_GIB`
+alone; a pinned `GPU_MEMORY_UTILIZATION` still gets you there, with a warning.
 
 ### Prefill and decode, measured with sparkDash
 
@@ -71,6 +88,59 @@ Benchmark scripts are not shipped in this repo; use sparkDash to reproduce
 them. The two prefill columns are **not** a clean A/B — they differ in rope
 config and KV target as well as chunk width — so each is labelled with what it
 was measured at.
+
+#### 2026-09-05: after the decode optimisation pass
+
+Measured on the shipped profile (512k YaRN, 2,048 chunks, `MAX_NUM_SEQS=4`,
+MTP 3, FP8 KV, `KV_TARGET_GIB=20` → 16.18 GiB = 974,768 tokens) with
+`CUDAGRAPH_CAPTURE_SIZES=auto`, the PLE gather prefetch, and reduced-vocabulary
+drafting (`MTP_DRAFT_VOCAB`, 65,536 tokens) all active. The "before" columns are
+the same rope config and chunk width, so decode is a matched pair; prefill
+differs only in `KV_TARGET_GIB` (22 → 20), which does not affect prefill rate.
+
+**Decode on prose**, by concurrent stream count:
+
+| streams | TTFT | aggregate | per stream | before | change |
+|---|---|---|---|---|---|
+| 1 | 270 ms | **46.3 tok/s** | 46.3 tok/s | 36.9 | **+25.5%** |
+| 2 | 466 ms | **73.0 tok/s** | 36.5 tok/s | 57.4 | +27.2% |
+| 3 | 355 ms | **91.9 tok/s** | 31.2 tok/s | — | — |
+| 4 | 346 ms | **108.1 tok/s** | 27.7 tok/s | 85.9 | +25.8% |
+
+Almost all of that is the reduced draft vocabulary. The MTP drafter reads its
+own 1.18 GiB BF16 `lm_head` once per draft step, three of the four `lm_head`
+reads in an MTP-3 engine step; slicing it to 65,536 rows saves 2.61 GiB per
+step, and decode here is close enough to the memory-bandwidth wall that bytes
+removed convert almost one-for-one into time. Accuracy is unchanged — the
+target model verifies every drafted token — measured at 250 MGSM problems per
+language, English 94.8% vs 93.6% and Chinese 86.4% vs 86.4%. See the CHANGELOG
+entry for the full method.
+
+**Prefill**, same chunk width as the shipped column below:
+
+| context | TTFT | prefill | before | change |
+|---|---|---|---|---|
+| 8k | 4.67 s | **1,764 tok/s** | 1,646 | +7.2% |
+| 16k | 7.25 s | **2,265 tok/s** | 2,052 | +10.4% |
+| 32k | 14.49 s | **2,265 tok/s** | 2,073 | +9.3% |
+| 64k | 29.52 s | **2,222 tok/s** | 2,037 | +9.1% |
+| 128k | 62.15 s | **2,110 tok/s** | 1,945 | +8.5% |
+| 256k | 137.03 s | **1,913 tok/s** | 1,791 | +6.8% |
+
+The prefill gain is most likely the PLE page-fault prefetch rather than the
+draft vocabulary, which does not touch prefill: the PLE row gather runs for
+every prefilled token, so a 2,048-token chunk gathers 16 rows per token —
+~32,768 of them — against the ~256 a 4-stream MTP-3 decode step gathers. That
+gather is single-threaded and was taking each
+missing 4 KiB page fault on its own; batching the reads with
+`posix_fadvise(WILLNEED)` measured 13x on a cold 280-row gather in isolation and
+only ~3% on decode, where there are too few faults per step for it to matter.
+This was not isolated with an A/B, so read the attribution as inference from
+the mechanism, not as a measurement.
+
+These numbers came from one run each. The decode figures are content-dependent
+for the reason given at the end of this section, and the `x3` TTFT below `x2`
+is run-to-run noise.
 
 **Prefill.** At the shipped 2,048-token chunk width throughput peaks around
 32-64k and falls away with context. Raising `MAX_NUM_BATCHED_TOKENS` to 8,192
@@ -113,13 +183,15 @@ the 8,192 sweep. It is offered as a knob rather than a default because the
 supporting observation is minutes, not hours: if you serve long sessions near
 the memory floor, measure it on your own workload before committing to it.
 
-**Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count:
+**Decode on prose** (2,048 chunks, 512k YaRN), by concurrent stream count.
+These are the pre-2026-09-05 figures, kept because the tables above are stated
+as deltas against them:
 
 | streams | TTFT | aggregate | per stream |
 |---|---|---|---|
 | 1 | 418 ms | 36.9 tok/s | 36.9 tok/s |
 | 2 | 445 ms | 57.4 tok/s | 29.7 tok/s |
-| 4 | 550 ms | **85.9 tok/s** | 23.4 tok/s |
+| 4 | 550 ms | 85.9 tok/s | 23.4 tok/s |
 
 Decode speed on this model is **strongly content-dependent**, because MTP
 speculative decoding accepts more drafts on predictable text. Measured on this
@@ -177,10 +249,12 @@ knob can be overridden per launch:
 MAX_MODEL_LEN=65536 MTP_NUM_SPECULATIVE_TOKENS=0 ./start.sh
 ```
 
-The safety-relevant knobs are `KV_TARGET_GIB` (how much KV to target; the main
-consumer of host memory) and `HOST_SLACK_GIB` (container cgroup cap = GPU
-budget + this). `KV_TARGET_GIB=16` gives ~590k tokens and more host margin;
-raising it above the shipped 20 is what eats that margin first.
+The safety-relevant knob is `HOST_RESERVE_GIB` (default 26): the GPU budget
+is capped at `MemTotal − HOST_RESERVE_GIB` no matter what `KV_TARGET_GIB`
+asks for, and `start.sh` prints "KV target X reduced to Y" when the cap binds.
+`KV_TARGET_GIB` is a wish under that cap (16 gives ~1M FP8 tokens here).
+`HOST_SLACK_GIB` sizes the container cgroup cap (GPU budget + this); it bounds
+host-side memory only and does not protect the host from the GPU side.
 
 ### Long context beyond 262k (YaRN)
 
@@ -394,30 +468,23 @@ which is what funds the KV pool `KV_TARGET_GIB` asks for.
 
 ## Safety rules
 
-Each of these cost a hard host hang during bring-up.
+Each of these cost a hard host hang or a dead server during bring-up.
 
-- **Keep host MemAvailable at or above ~10 GiB under load.** Exhausting the
-  unified pool hangs the kernel with no OOM kill and no logs. `KV_TARGET_GIB`
-  is the knob that eats it. The page cache is not spare memory — it is what
-  keeps PLE lookups off NVMe.
-
-### Watchdog
-
-`files/memwatch.sh` kills the container when host `MemAvailable` stays under
-`MEMWATCH_MIN_GIB` (default 6). It polls every second, logs a timeline every
-5 s, and logs **every** sample once within 1 GiB of the floor.
-
-The trigger needs **5 consecutive** sub-floor samples. A single sample is not
-enough, and this matters: `MemAvailable` on this workload moves ~107 MiB
-between samples with excursions past 1 GiB, and two servers were killed here by
-one transient dip while the readings on either side sat 400-700 MiB above the
-floor. A lone excursion now logs `recovered after N sub-floor sample(s)` and
-resets the counter.
-
-It stops the container with SIGTERM and a 10 s grace period
-(`MEMWATCH_GRACE`), falling back to SIGKILL, so vLLM can unlink its POSIX
-shared memory — a hard kill leaks those segments onto the host's `/dev/shm`
-until reboot, because the container runs with `--ipc host`.
+- **Budget the GPU from the host side.** vLLM detects this GPU as integrated
+  and treats host `MemAvailable` — page cache included — as free GPU memory,
+  then fills the GPU side to exactly `GMU × MemTotal`. Nothing in vLLM keeps
+  anything back for the host. `start.sh` therefore caps the budget at
+  `MemTotal − HOST_RESERVE_GIB` (26 GiB by default) and derives the KV pool
+  from the remainder. What the reserve has to hold, measured here: other
+  containers and sessions ~7 GiB (`start.sh` prints the live figure as "host
+  footprint now" and warns above 9), vLLM's own host-side processes ~6, the PLE
+  page cache that keeps decode off NVMe ≥6, free pages the NVIDIA driver needs
+  to allocate at all ≥3, and 2–3 GiB of per-request growth (below). The page
+  cache is not spare memory.
+- **Keep host `MemAvailable` at or above ~10 GiB under load.** Exhausting the
+  unified pool hangs the kernel with no OOM kill and no logs; the driver starts
+  refusing allocations (`NV_ERR_NO_MEMORY` in `journalctl -k`, which works
+  without sudo) well before that, at `MemFree` ~3 GiB.
 - **`comfy-h3.service` must stay disabled.** It polls `127.0.0.1:8888` and
   launches ComfyUI (a GPU co-tenant) as soon as anything answers there.
   `start.sh` refuses port 8888 while that service is active.
@@ -434,9 +501,78 @@ until reboot, because the container runs with `--ipc host`.
   the ceiling means you are the one testing it.
 - `docker --memory` does not bound GPU allocations on GB10, only host-side
   memory. vLLM's `--gpu-memory-utilization` is what bounds the GPU.
+- **Kernel VM tunables.** The box ships with `vm.min_free_kbytes=45155` and
+  `vm.watermark_scale_factor=10`: a 44 MB free-page floor and reclaim that
+  starts at 0.1 %. `files/sysctl-spark3.conf` holds the values a sibling Spark
+  measured six crash-free bring-ups with; `start.sh` warns when the box is at
+  the defaults. They are **not applied** by anything in this repo, and the
+  file's header explains why the watchdog floor must be re-derived before
+  they are: at those values the same physical state reads roughly 11–15 GiB
+  lower in `MemAvailable` (computed from the kernel's watermark formula, not
+  measured here).
 
-`files/memwatch.sh` runs alongside the container and kills it if MemAvailable
-drops below `MEMWATCH_MIN_GIB` (default 6). Its log is under `logs/`.
+### What happened on 2026-09-04
+
+Three servers died in one evening at `KV_TARGET_GIB=22`, all under a qwen-code
+agent harness (up to five agents, 370 requests averaging 72k input tokens over
+five hours, pointed at `127.0.0.1:8888`). The budget arithmetic left 20.7 GiB
+of the 121.6 GiB pool for everything that is not the GPU, against the ≥22 GiB
+listed above. `sar` shows the first server spending its last hour at 6.3–6.6
+GiB of `MemAvailable`; the kernel log shows the driver refusing four
+allocations in the eight seconds before the second death; the watchdog's own
+log shows the third at `MemFree` 2.6 GiB. The earlier reading of the first two
+deaths as watchdog noise was wrong: the debounce added that day is a good
+change and does not touch the cause.
+
+The growth is real and permanent. Each new largest request (70–95k tokens)
+grows driver-side memory by ~2 GiB — workspaces the startup profile never
+touched, held by PyTorch's caching allocator, which this build only releases
+under pressure inside the model loader, never while serving. In the watchdog
+log it appears as the container cgroup going *down* (PLE page cache evicted)
+while `MemAvailable` goes down and `MemFree` stays flat; the new `driver`
+column makes it visible directly. The reserve is sized to absorb it.
+
+### Watchdog
+
+`files/memwatch.sh` runs alongside the container, polls `/proc/meminfo` every
+second, and stops the container on either of two floors, each debounced over
+**5 consecutive** samples (a lone excursion logs `recovered after N sub-floor
+sample(s)` and resets the counter — `MemAvailable` moves ~107 MiB between
+samples here, with excursions past 1 GiB):
+
+- `MemAvailable < MEMWATCH_MIN_GIB` (default 6): the page cache is gone.
+- `MemFree < MEMWATCH_MIN_FREE_GIB` (default 2) **while** `MemAvailable <
+  MEMWATCH_FREE_GATE_GIB` (default 10): the driver's failure point. The gate
+  is not optional. With the stock watermarks `MemFree` legitimately sits near
+  zero whenever the page cache is full of reclaimable data — measured during
+  weight loading: `MemFree` 0.9 GiB, `MemAvailable` 32 GiB, zero driver
+  errors — and an ungated version of this trigger killed a healthy launch.
+
+Every 10 s it counts `NV_ERR_NO_MEMORY` lines in `journalctl -k` and logs any
+non-zero count. Read it together with `MemAvailable`: a handful during
+startup, when the driver takes the weights and then the KV pool in two large
+bursts while `MemFree` is transiently ~1 GiB under the page cache from the
+checkpoint read, is the driver bouncing off free pages and retrying (measured
+2026-09-05 08:15–08:16: five of them at `MemAvailable` 17–34 GiB, launch
+succeeded; the launch seven hours earlier had none — it depends on where
+kswapd is when the burst lands). The fatal pattern is the same line with
+`MemAvailable` under ~10 GiB, when there is no cache left to reclaim. The
+timeline
+(every 5 s, every sample once within 1 GiB of a floor) carries `avail`,
+`free`, `swapfree`, the container cgroup, `cached`, `anon`, `shmem`, `mapped`,
+`sunreclaim` and the derived `driver` figure (`MemTotal − MemFree − Buffers −
+Cached − AnonPages − Slab − PageTables − KernelStack`: memory outside page
+cache, anon and cgroup accounting, i.e. taken through the NVIDIA driver;
+95.5 GiB at idle here against a 94.87 GiB budget).
+
+Before stopping it archives `docker logs --tail 3000` and a copy of its own
+log to `logs/archive/<container>-<timestamp>-{container,memwatch}.log`, then
+sends SIGTERM with a 30 s grace period (`MEMWATCH_GRACE`) and falls back to
+SIGKILL, so vLLM can unlink its POSIX shared memory — a hard kill leaks those
+segments onto the host's `/dev/shm` until reboot, because the container runs
+with `--ipc host`. vLLM does not honour SIGTERM while still loading weights;
+a stop in that phase ends in the SIGKILL. `start.sh` archives the previous
+container and watchdog logs the same way before it relaunches.
 
 ## Sanity test
 
@@ -462,9 +598,10 @@ buffer or missing quant scales) — see the patch notes below.
 - `download.sh` — fetches the checkpoint into the Hugging Face cache
   (resumable; honours `HF_TOKEN` for gated repos). Uses the host's
   `huggingface_hub` if present, otherwise the container image.
-- `start.sh` — launcher: derives the GPU budget from live memory,
-  builds the packed PLE table on first run, regenerates the patched vLLM
-  files, starts the container and `files/memwatch.sh`.
+- `start.sh` — launcher: derives the GPU budget from live memory under the
+  `HOST_RESERVE_GIB` cap, builds the packed PLE table on first run,
+  regenerates the patched vLLM files, archives the previous run's logs, starts
+  the container and `files/memwatch.sh`.
 - `stop.sh` — stops the watchdog, then the container (gracefully by default);
   reports leftover `/dev/shm` segments without deleting them.
 - `files/patch_ple_layer.py`, `files/patch_modelopt_mxfp8.py`,
@@ -474,6 +611,8 @@ buffer or missing quant scales) — see the patch notes below.
   first run. Edit the generators; edits to the generated files are overwritten.
 - `files/build_ple_packed_table.py` — one-time packed PLE table builder
   (27 GB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
+- `files/sysctl-spark3.conf` — recommended kernel VM tunables, not applied by
+  anything here; read its header first.
 
 Benchmarks are not part of this repo. The published prefill and decode numbers
 were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
