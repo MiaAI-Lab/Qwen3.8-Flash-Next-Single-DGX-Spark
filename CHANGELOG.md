@@ -254,6 +254,65 @@ as promises.
   `MemAvailable` (computed from the kernel's watermark formula), so the 6 GiB
   watchdog floor has to be re-derived against a measured run first.
 
+### Measured
+
+- **End-to-end sweep after the optimisation pass**, sparkDash against the
+  shipped profile (512k YaRN, 2,048 chunks, `MAX_NUM_SEQS=4`, MTP 3, FP8 KV,
+  `KV_TARGET_GIB=20` -> 16.18 GiB = 974,768 tokens = 3.72x a 262k request).
+  Same rope config and chunk width as the rows it replaces, so decode is a
+  matched pair; prefill differs only in `KV_TARGET_GIB` (22 -> 20), which does
+  not change the prefill rate. One run each.
+
+  | decode, prose | before | after | change |
+  |---|---|---|---|
+  | 1 stream  | 36.9 tok/s | **46.3** | **+25.5%** |
+  | 2 streams | 57.4 tok/s | **73.0** | +27.2% |
+  | 3 streams | -          | 91.9     | - |
+  | 4 streams | 85.9 tok/s | **108.1** | +25.8% |
+
+  | prefill | before | after | change |
+  |---|---|---|---|
+  | 8k   | 1,646 tok/s | **1,764** (TTFT 4.67 s)   | +7.2%  |
+  | 16k  | 2,052 tok/s | **2,265** (TTFT 7.25 s)   | +10.4% |
+  | 32k  | 2,073 tok/s | **2,265** (TTFT 14.49 s)  | +9.3%  |
+  | 64k  | 2,037 tok/s | **2,222** (TTFT 29.52 s)  | +9.1%  |
+  | 128k | 1,945 tok/s | **2,110** (TTFT 62.15 s)  | +8.5%  |
+  | 256k | 1,791 tok/s | **1,913** (TTFT 137.03 s) | +6.8%  |
+
+  The single-stream decode figure independently reproduces the in-repo
+  measurement taken with a different harness on different prompts (28.4 -> 35.7
+  tok/s, +26%): different absolute numbers, same gain.
+
+- **The prefill gain is the PLE prefetch, not the draft vocabulary**, which does
+  not touch prefill at all. This reverses the priority the two items were given
+  during the work. The PLE row gather runs per prefilled token, so a 2,048-token
+  chunk gathers 16 rows per token -- about 32,768 of them -- against the ~256 a
+  4-stream MTP-3 decode step gathers. That is the regime where batching the page
+  faults measured 13x in isolation, and it explains why the same patch was worth
+  only ~3% on decode: too few faults per step there for the fault latency to
+  matter. So the gather fix is worth roughly three times more on prefill than on
+  decode, and it was ranked last on decode evidence alone. Not isolated with an
+  A/B -- attribution is inference from the mechanism, and one launch with
+  `MTP_DRAFT_VOCAB` empty would separate the two.
+
+- **Decode is on the memory-bandwidth wall, and that is what ranks the work.**
+  Measured step time against the byte model in `docs/fable51-max.md`: 1.37x the
+  floor at one stream, 1.09x at four, 1.04x at five, and 160.8 ms against a
+  165 ms floor at eight. The consequence is that only *bytes removed* convert
+  into time at concurrency. Reduced-vocabulary drafting was predicted at -18.0%
+  and -6.2% at one and eight streams from the byte arithmetic alone and measured
+  -16.9% and -6.1%, agreeing within about a point at both ends -- so the byte
+  model can rank future work before a restart is spent on it. The two overhead
+  items returned ~3% each; the one byte item returned 17%.
+
+- **Run-to-run determinism.** Greedy decoding on this server is not
+  reproducible: two passes over the same 26 temperature-0 prompts on one
+  unchanged configuration produced 0/26 identical outputs, diverging 0.3-7% in.
+  Concurrent batch composition changes MoE/Marlin reduction order and flips
+  near-tied logits. This predates any change here and is why the draft-head
+  comparison was settled with the rejection-sampler kernel and a graded task
+  eval rather than a text diff.
+
 ## 2026-09-04
 
 ### Fixed
