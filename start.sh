@@ -102,6 +102,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
+                    CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -179,6 +180,27 @@ EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 HF_TOKEN="${HF_TOKEN:-}"
 CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
+# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
+# multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
+# <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
+# MAX_NUM_SEQS=5 that leaves keys {4,8,16}: a full 5-sequence verify batch is 20
+# tokens, matches nothing, and decodes eager. "auto" captures every
+# (1+MTP)*S for S in 1..MAX_NUM_SEQS so every batch the scheduler can build has
+# a graph; a comma list sets them explicitly; empty keeps the vLLM default.
+# Capture costs ~1 s and a few MiB per size.
+CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-}"
+# Batch-size schedule for the speculative token count, as
+# "start:end:K,start:end:K" over inclusive batch-size (num_seqs) ranges. MTP
+# multiplies tokens per step by 1+K, and every extra token in a verify batch
+# drags ~10 more of the 512 experts into the step, so past a few concurrent
+# sequences drafting costs more expert traffic than it returns. Empty keeps a
+# constant MTP_NUM_SPECULATIVE_TOKENS at every batch size.
+# Example: "1:2:3,3:6:2,7:999:0"
+MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
+# torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
+# fusion; adds minutes to the first launch and has not been validated against
+# the PLE custom op here).
+COMPILATION_MODE="${COMPILATION_MODE:-0}"
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -502,9 +524,49 @@ VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s}'" "$MTP_NUM_SPECULATIVE_TOKENS")")
+    _SPEC_SCHED=""
+    if [[ -n "$MTP_K_SCHEDULE" ]]; then
+        _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
+            printf '%s' "$MTP_K_SCHEDULE" | awk -F, '{
+                out=""
+                for (i = 1; i <= NF; i++) {
+                    split($i, r, ":")
+                    out = out (i > 1 ? "," : "") "[" r[1] "," r[2] "," r[3] "]"
+                }
+                printf "%s", out
+            }')]"
+    fi
+    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED")")
 fi
-VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":0,\"cudagraph_mode\":\"%s\"}'" "$CUDAGRAPH_MODE")")
+_CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
+if [[ "$_CG_SIZES" == "auto" ]]; then
+    # Every verify-batch width the scheduler can actually build: (1+K(S))*S for
+    # S in 1..MAX_NUM_SEQS, where K(S) follows MTP_K_SCHEDULE when one is set
+    # and is the constant MTP_NUM_SPECULATIVE_TOKENS otherwise. A width that is
+    # not in this list has no decode graph and falls back to eager.
+    _CG_SIZES=$(
+        _AUTO_MAX_SEQS="$MAX_NUM_SEQS" \
+        _AUTO_K="$MTP_NUM_SPECULATIVE_TOKENS" \
+        _AUTO_SCHED="$MTP_K_SCHEDULE" \
+        python3 -c '
+import os
+max_seqs = int(os.environ["_AUTO_MAX_SEQS"])
+k_default = int(os.environ["_AUTO_K"])
+k_of = {}
+for part in filter(None, os.environ["_AUTO_SCHED"].strip().split(",")):
+    lo, hi, k = (int(x) for x in part.split(":"))
+    for s in range(lo, min(hi, max_seqs) + 1):
+        k_of.setdefault(s, min(k, k_default))
+print(",".join(str(x) for x in sorted(
+    {(1 + k_of.get(s, k_default)) * s for s in range(1, max_seqs + 1)})))
+'
+    )
+fi
+if [[ -n "$_CG_SIZES" ]]; then
+    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\",\"cudagraph_capture_sizes\":[%s]}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
+else
+    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
+fi
 [[ -n "$EXTRA_VLLM_ARGS" ]] && VLLM_ARGS+=("$EXTRA_VLLM_ARGS")
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 
@@ -520,7 +582,7 @@ fi
 info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup cap ${CONTAINER_MEM_GIB} GiB)"
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
-info "  Graphs:     $CUDAGRAPH_MODE"
+info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT"
 info ""
 

@@ -90,6 +90,64 @@ as promises.
 
 ### Added
 
+- **Batched page prefetch before the PLE row gather** (`files/patch_ple_layer.py`,
+  `files/patch_ple_offload.py`). The offload worker gathers 16 rows per token
+  out of a 26.82 GiB mmap with `torch.index_select`, which never reaches
+  PyTorch's ~32k-element parallel grain at decode sizes, so every missing 4 KiB
+  page was faulted in one at a time on one thread while the GPU worker spun on
+  the handshake. Measured in-container against the real table, 100% cold rows:
+  a 280-row gather takes 20.12 ms (71.4 us/fault) and does not improve with
+  more torch threads (1 -> 17.39 ms, 4 -> 16.35, 8 -> 16.34), confirming the
+  serial loop. `_ple_prefetch_rows()` now maps the gather's row ids to page
+  offsets, dedups them (`torch.unique`, so the reads issue in ascending file
+  order) and names them all with `posix_fadvise(WILLNEED)` through an fd kept
+  beside the mmap, before the gather runs: the same 280-row gather drops to
+  **1.51 ms, 13x**. Advisory only and wrapped, so any failure falls back to
+  today's path. End to end the win is smaller, because only ~20% of lookups
+  miss the page cache (measured 5.51 pages/generated token at 1 stream, 3.55 at
+  5 -- the README's older 57 KiB/token figure implied ~87%): **-3.2% mean step
+  time across 1/2/4/5/6/8 streams**, every one of the six improving. The
+  page-cache confound is ruled out -- the patched run faulted *more* pages than
+  the unpatched one (6.47 vs 5.51 per token at 1 stream) and was still faster,
+  which is the prefetch signature. Note the fault arithmetic alone predicts
+  ~0.6-2%, so ~1-2% of the measured gain is unexplained.
+
+- **`CUDAGRAPH_CAPTURE_SIZES`** (`start.sh`, `.env.sample`, default `auto`).
+  vLLM builds its decode graph list as `[1,2,4]` plus multiples of 8, rounds
+  each to a multiple of `1+MTP`, then keeps only sizes `<= (1+MTP)*MAX_NUM_SEQS`.
+  At MTP 3 that leaves decode keys `{4,8,16}` whatever `MAX_NUM_SEQS` is: a
+  3-sequence batch (12 tokens) pads up to 16 and reads a fourth request's worth
+  of experts for nothing, and at `MAX_NUM_SEQS=5` a full 5-sequence batch (20
+  tokens) matches no key and decodes eager. Confirmed from the engine log
+  (`cudagraph_capture_sizes: [1,2,4,8,16,24,32,40]`, 3 graphs captured), not
+  inferred. `auto` captures every `(1+K(S))*S` the scheduler can build, honouring
+  `MTP_K_SCHEDULE` when one is set; at `MAX_NUM_SEQS=4` that is `[4,8,12,16]`
+  and 4 graphs. Worth ~4-5 ms on the 5-sequence step (the marginal cost of the
+  5th stream fell 16.1 -> 10.6 ms) and nothing at 1/2/4 streams, where the
+  graphs already existed -- an order of magnitude less than the +20-25% that had
+  been projected by attributing the whole gap to the eager fallback. Keep it
+  anyway: it is free, and it is the precondition for any `MAX_NUM_SEQS > 4`.
+
+- **`MTP_K_SCHEDULE`** (`start.sh`, `.env.sample`, default empty) — dynamic
+  speculative depth per batch size, `"start:end:K,..."`. **Measured as a
+  regression on this build; ships disabled.** Setting
+  `num_speculative_tokens_per_batch_size` makes vLLM override `cudagraph_mode`
+  from `FULL_DECODE_ONLY` to `PIECEWISE`, so the computed capture sizes are
+  never used. The byte saving is real (K=1 at 8 streams cut the step 160.8 ->
+  127.4 ms) but tokens/step fell 2.29 -> 1.68 and the graph penalty ate the
+  rest: 105 vs 114 tok/s. The single-stream control, where K is 3 either way,
+  isolates that penalty at **79.6 -> 99.0 ms, +24%** -- far more than graphs are
+  worth at 5 streams, because kernel-launch overhead hides under memory traffic
+  at concurrency and is exposed without it. It also broke the memory budget:
+  PIECEWISE graph memory drove the driver to 99.4 GiB against a 94.87 GiB
+  budget, `MemAvailable` to 9.1 GiB and `MemFree` to 1.9 GiB, and the watchdog
+  stopped the server (`MemFree under 2 GiB for 5 samples`, 7 `NV_ERR_NO_MEMORY`
+  since watchdog start). The log names an untested escape hatch,
+  `VLLM_USE_V2_MODEL_RUNNER=1`.
+
+- **`COMPILATION_MODE`** (`start.sh`, `.env.sample`, default `0`) — torch.compile
+  level, previously hard-coded. Untested above 0 here.
+
 - **`files/sysctl-spark3.conf`** — `vm.min_free_kbytes=4194304`,
   `vm.watermark_scale_factor=300`, `vm.swappiness=30`, the values a sibling
   Spark measured six crash-free bring-ups with. `start.sh` warns when the box
