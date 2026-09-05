@@ -80,6 +80,11 @@ as promises.
   watchdog logs before it relaunches. Observed: vLLM ignores SIGTERM while
   loading weights, so a stop in that phase ends in the SIGKILL fallback.
 
+- **`stop.sh` discarded the container log.** It ran `docker rm -f` with no
+  copy; a run stopped by hand had no post-mortem. It now archives `docker logs
+  --tail 3000` and the watchdog log to `logs/archive/` first, like `start.sh`
+  and `memwatch.sh`.
+
 - **Stale comment in `.env`**: `MAX_NUM_BATCHED_TOKENS=2048` was labelled
   "local override: faster prefill" from the reverted 8192 experiment.
 

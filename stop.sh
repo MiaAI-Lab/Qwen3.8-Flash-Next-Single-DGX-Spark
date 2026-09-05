@@ -9,6 +9,7 @@
 # host's /dev/shm and survives until reboot. Use --force to skip the wait.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"      # seconds before docker escalates to SIGKILL
 
@@ -31,6 +32,14 @@ fi
 if [[ -z "$(docker ps -aq -f "name=^${CONTAINER_NAME}$")" ]]; then
     echo "$CONTAINER_NAME was not running"
 else
+    # docker rm below discards the container's log; keep it for the post-mortem,
+    # next to the watchdog's, the way start.sh and memwatch.sh do.
+    ARCHIVE_DIR="$SCRIPT_DIR/logs/archive"; TS=$(date '+%Y%m%dT%H%M%S')
+    mkdir -p "$ARCHIVE_DIR"
+    docker logs --tail 3000 "$CONTAINER_NAME" > "$ARCHIVE_DIR/${CONTAINER_NAME}-${TS}-container.log" 2>&1 || true
+    [[ -s "$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log" ]] \
+        && cp -f "$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log" "$ARCHIVE_DIR/${CONTAINER_NAME}-${TS}-memwatch.log"
+    echo "archived logs to logs/archive/${CONTAINER_NAME}-${TS}-{container,memwatch}.log"
     if [[ "$FORCE" == false ]]; then
         echo "stopping $CONTAINER_NAME (SIGTERM, up to ${STOP_TIMEOUT}s)..."
         docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true

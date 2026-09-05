@@ -492,7 +492,15 @@ samples here, with excursions past 1 GiB):
   errors — and an ungated version of this trigger killed a healthy launch.
 
 Every 10 s it counts `NV_ERR_NO_MEMORY` lines in `journalctl -k` and logs any
-non-zero count; that is the earliest signal this box gives. The timeline
+non-zero count. Read it together with `MemAvailable`: a handful during
+startup, when the driver takes the weights and then the KV pool in two large
+bursts while `MemFree` is transiently ~1 GiB under the page cache from the
+checkpoint read, is the driver bouncing off free pages and retrying (measured
+2026-09-05 08:15–08:16: five of them at `MemAvailable` 17–34 GiB, launch
+succeeded; the launch seven hours earlier had none — it depends on where
+kswapd is when the burst lands). The fatal pattern is the same line with
+`MemAvailable` under ~10 GiB, when there is no cache left to reclaim. The
+timeline
 (every 5 s, every sample once within 1 GiB of a floor) carries `avail`,
 `free`, `swapfree`, the container cgroup, `cached`, `anon`, `shmem`, `mapped`,
 `sunreclaim` and the derived `driver` figure (`MemTotal − MemFree − Buffers −
