@@ -19,7 +19,8 @@
 #   weights on GPU ..........  71.75 GiB
 #   runtime overhead ........   5.6  GiB   (non-torch 3.37 + activation 1.92
 #                                          + graphs 0.12, all measured at TP1)
-#   KV cache ................  whatever GMU leaves (~7-15 GiB => 250-500k tok)
+#   KV cache ................  what the host-side cap leaves (~16 GiB at the
+#                                default HOST_RESERVE_GIB=26; FP8 => ~1M tok)
 #
 # The PLE n-gram table is served by vLLM's CPU-offload worker from a
 # MEMORY-MAPPED pre-packed file (files/build_ple_packed_table.py, built on
@@ -34,12 +35,24 @@
 # files/patch_ple_layer.py (offload rows must carry codes AND scales).
 #
 # SAFETY (no sudo needed):
+#   * The GPU budget is capped FROM THE HOST SIDE: GMU x MemTotal never exceeds
+#     MemTotal - HOST_RESERVE_GIB (default 26). vLLM treats this integrated
+#     GPU's "free memory" as MemAvailable (page cache included) and fills the
+#     GPU side to exactly the budget, so a KV_TARGET_GIB wish that is not
+#     capped comes straight out of the PLE page cache and the free pages the
+#     NVIDIA driver needs. That is what killed three servers on 2026-09-04
+#     (docs/memory-incident-2026-09-04.md section 7). The reserve covers, in
+#     order: other containers and sessions (~7 GiB measured here), vLLM's own
+#     host-side processes (~6), PLE page cache (>=6), the driver's free-page
+#     reserve (>=3), and 2-3 GiB of per-request growth that is never returned.
 #   * The container runs under a hard cgroup memory cap. Measured: GPU
 #     parameter allocations are NOT charged to it on GB10, so the cap bounds
 #     the host-side footprint (Python procs, pinned buffers, page cache) while
-#     vLLM's own --gpu-memory-utilization budget bounds the GPU side.
-#   * A background watchdog (files/memwatch.sh) kills the container if host
-#     MemAvailable drops below MEMWATCH_MIN_GIB.
+#     vLLM's own --gpu-memory-utilization budget bounds the GPU side. It does
+#     not protect the host from the GPU side; HOST_RESERVE_GIB does.
+#   * A background watchdog (files/memwatch.sh) stops the container if host
+#     MemAvailable stays below MEMWATCH_MIN_GIB or MemFree stays below
+#     MEMWATCH_MIN_FREE_GIB, archiving the container log first.
 #   * comfy-h3.service is a bash loop that launches ComfyUI (a GPU co-tenant)
 #     the moment *anything* answers on port 8888. The launcher refuses 8888
 #     while that service is active (disable it: sudo systemctl disable --now
@@ -57,6 +70,7 @@
 #   MTP_NUM_SPECULATIVE_TOKENS=3 ./start.sh   # re-enable MTP (1.5 GiB)
 #   YARN=1 ./start.sh                         # YARN_MAX_MODEL_LEN (512k) via YaRN
 #   GPU_MEMORY_UTILIZATION=0.75 ./start.sh    # pin the budget yourself
+#   HOST_RESERVE_GIB=28 ./start.sh            # more host margin, less KV
 # ============================================================================
 set -euo pipefail
 
@@ -85,9 +99,12 @@ _CLI_KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 # Knobs that are NOT read through an explicit _CLI_ variable above still have
 # to honour "environment > .env": sourcing .env would otherwise overwrite them.
 # Snapshot anything set in the environment, then restore it after the source.
-_ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_SLACK_GIB OS_RESERVE_GIB MEMWATCH_MIN_GIB
+_ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
+                    MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
+                    CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
+                    MTP_DRAFT_VOCAB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -135,14 +152,29 @@ KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-}"          # optional hard pin, bytes
 # Runtime overhead on top of weights, GiB (measured at TP1: 3.37+1.92+0.12).
 OVERHEAD_GIB="${OVERHEAD_GIB:-5.6}"
 # KV the derived budget targets when GMU is not pinned. More KV = more UVM.
+# Capped from the host side by HOST_RESERVE_GIB below; the cap wins.
 KV_TARGET_GIB="${KV_TARGET_GIB:-8.0}"
+# Memory the GPU budget may never take: the GPU side is capped at
+# MemTotal - HOST_RESERVE_GIB whatever KV_TARGET_GIB asks for. See SAFETY above
+# for what the 26 GiB covers. Raise it by 2 GiB steps if the watchdog log shows
+# MemAvailable idling under ~9 GiB; do not lower it to buy KV.
+HOST_RESERVE_GIB="${HOST_RESERVE_GIB:-26}"
 # Host-side memory the container needs beyond the GPU budget: three Python
 # processes, pinned staging buffers, CPU-side torch, page cache slack.
 HOST_SLACK_GIB="${HOST_SLACK_GIB:-10.0}"
 # Never let the container cgroup cap come within this much of the pool.
 OS_RESERVE_GIB="${OS_RESERVE_GIB:-16.0}"
-# Watchdog: kill the container if host MemAvailable drops below this.
+# Watchdog: stop the container if host MemAvailable stays below this (GiB) ...
 MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-6}"
+# ... or MemFree stays below this. The NVIDIA driver refuses allocations
+# (NV_ERR_NO_MEMORY) at MemFree ~3 GiB while MemAvailable still reads 6+.
+MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
+# The MemFree floor only counts while MemAvailable is under this: with stock
+# kernel watermarks MemFree sits near zero whenever the page cache is full of
+# reclaimable data (measured: 0.9 GiB free, 32 GiB available, during load).
+MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
+# Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
+MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
 PLE_GIB="${PLE_GIB:-26.82}"
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
@@ -151,6 +183,36 @@ EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 HF_TOKEN="${HF_TOKEN:-}"
 CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
+# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
+# multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
+# <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
+# MAX_NUM_SEQS=5 that leaves keys {4,8,16}: a full 5-sequence verify batch is 20
+# tokens, matches nothing, and decodes eager. "auto" captures every
+# (1+MTP)*S for S in 1..MAX_NUM_SEQS so every batch the scheduler can build has
+# a graph; a comma list sets them explicitly; empty keeps the vLLM default.
+# Capture costs ~1 s and a few MiB per size.
+CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-}"
+# Batch-size schedule for the speculative token count, as
+# "start:end:K,start:end:K" over inclusive batch-size (num_seqs) ranges. MTP
+# multiplies tokens per step by 1+K, and every extra token in a verify batch
+# drags ~10 more of the 512 experts into the step, so past a few concurrent
+# sequences drafting costs more expert traffic than it returns. Empty keeps a
+# constant MTP_NUM_SPECULATIVE_TOKENS at every batch size.
+# Example: "1:2:3,3:6:2,7:999:0"
+MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
+# Reduced-vocabulary drafting (FR-Spec). Path on the host to a file of token
+# ids, one per line, built by files/build_draft_vocab.py from a corpus of the
+# model's own output. The MTP drafter reads a 1.27 GB BF16 lm_head over the
+# full 248,320-token vocabulary once per draft step, three of the four
+# lm_head reads in an MTP-3 engine step; a 32k-row slice is 0.16 GB. Drafts
+# for tokens outside the subset are simply rejected at verification, so this
+# trades acceptance for bandwidth and cannot change what the server emits.
+# Empty disables it and the drafter keeps the full head.
+MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
+# torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
+# fusion; adds minutes to the first launch and has not been validated against
+# the PLE custom op here).
+COMPILATION_MODE="${COMPILATION_MODE:-0}"
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -271,9 +333,11 @@ info "=== Step 2: Memory budget ==="
 KV_BYTES_PER_TOKEN=29482          # measured: 28.8 KiB/token, bf16 KV, this arch
 WEIGHT_BYTES=$(du -sb "$MODEL_PATH/$SNAPSHOT_REL/" -L | cut -f1)
 
-read -r MEM_TOTAL_GIB MEM_AVAIL_GIB <<<"$(python3 -c "
+read -r MEM_TOTAL_GIB MEM_AVAIL_GIB MEM_USED_GIB SWAP_USED_GIB <<<"$(python3 -c "
 m={l.split(':')[0]:int(l.split()[1]) for l in open('/proc/meminfo') if ':' in l}
-print(m['MemTotal']/1048576, m['MemAvailable']/1048576)")"
+g=1048576
+print(m['MemTotal']/g, m['MemAvailable']/g,
+      f\"{(m['MemTotal']-m['MemAvailable'])/g:.1f}\", f\"{(m['SwapTotal']-m['SwapFree'])/g:.1f}\")")"
 
 MTP_GIB=0
 [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]] && MTP_GIB=1.49
@@ -282,13 +346,25 @@ KV_MULT=1.0
 # side/compressor caches stay BF16, so the real saving is ~1.7x, not 2x.
 [[ "$KV_CACHE_DTYPE" == fp8* ]] && KV_MULT=0.58
 
-read -r WEIGHTS_GPU_GIB KV_NEED_GIB BUDGET_GIB DERIVED_GMU KV_EXPECT_GIB KV_EXPECT_TOK <<<"$(python3 -c "
+# The GPU side is budgeted from the host side. vLLM on this integrated GPU
+# treats MemAvailable as free memory and fills the GPU side to exactly
+# GMU x MemTotal, so the budget is
+#   min(weights + overhead + MTP + max(kv_need, KV_TARGET_GIB),
+#       MemTotal - HOST_RESERVE_GIB)
+# and the KV figure is whatever the capped budget leaves. GMU is floored to
+# the 3 decimals vLLM is given, so the figures below are what vLLM will do.
+read -r WEIGHTS_GPU_GIB KV_NEED_GIB BUDGET_GIB DERIVED_GMU KV_EXPECT_GIB KV_EXPECT_TOK BUDGET_CAP_GIB CAP_BINDS <<<"$(python3 -c "
+import math
 w=$WEIGHT_BYTES/2**30-$PLE_GIB
+fixed=w+$OVERHEAD_GIB+$MTP_GIB
 kv_need=$MAX_MODEL_LEN*$KV_BYTES_PER_TOKEN*$KV_MULT/2**30
-budget=w+$OVERHEAD_GIB+$MTP_GIB+max(kv_need,$KV_TARGET_GIB)
-gmu=budget/$MEM_TOTAL_GIB
-kv_exp=budget-w-$OVERHEAD_GIB-$MTP_GIB
-print(f'{w:.2f} {kv_need:.2f} {budget:.2f} {gmu:.3f} {kv_exp:.2f} {int(kv_exp*2**30/($KV_BYTES_PER_TOKEN*$KV_MULT))}')")"
+wish=fixed+max(kv_need,$KV_TARGET_GIB)
+cap=$MEM_TOTAL_GIB-$HOST_RESERVE_GIB
+budget=min(wish,cap)
+gmu=math.floor(budget/$MEM_TOTAL_GIB*1000)/1000
+budget=gmu*$MEM_TOTAL_GIB
+kv_exp=budget-fixed
+print(f'{w:.2f} {kv_need:.2f} {budget:.2f} {gmu:.3f} {kv_exp:.2f} {int(max(kv_exp,0)*2**30/($KV_BYTES_PER_TOKEN*$KV_MULT))} {cap:.2f} {int(wish>cap)}')")"
 
 if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
     warn "  caller-pinned GMU=$GPU_MEMORY_UTILIZATION (derived would be $DERIVED_GMU)"
@@ -296,6 +372,12 @@ if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
 b=$GPU_MEMORY_UTILIZATION*$MEM_TOTAL_GIB
 kv=b-$WEIGHTS_GPU_GIB-$OVERHEAD_GIB-$MTP_GIB
 print(f'{b:.2f} {kv:.2f} {int(max(kv,0)*2**30/($KV_BYTES_PER_TOKEN*$KV_MULT))}')")"
+    CAP_BINDS=0
+    if python3 -c "import sys; sys.exit(0 if $BUDGET_GIB > $BUDGET_CAP_GIB else 1)"; then
+        warn "  pinned budget ${BUDGET_GIB} GiB is ABOVE the host-side cap ${BUDGET_CAP_GIB} GiB"
+        warn "  (MemTotal - HOST_RESERVE_GIB=${HOST_RESERVE_GIB}). This is the configuration that"
+        warn "  killed three servers on 2026-09-04. You asked for it; the watchdog will end it."
+    fi
 else
     GPU_MEMORY_UTILIZATION="$DERIVED_GMU"
 fi
@@ -308,12 +390,33 @@ info "  PLE table ................ ${PLE_GIB} GiB  memory-mapped in the CPU offl
 info "  runtime overhead ......... ${OVERHEAD_GIB} GiB"
 [[ "$MTP_GIB" != 0 ]] && info "  MTP draft model .......... ${MTP_GIB} GiB"
 info "  KV needed for ${MAX_MODEL_LEN} ...... ${KV_NEED_GIB} GiB  (kv dtype ${KV_CACHE_DTYPE})"
+info "  host reserve ............. ${HOST_RESERVE_GIB} GiB  (HOST_RESERVE_GIB) => GPU budget cap ${BUDGET_CAP_GIB} GiB"
+if [[ "$CAP_BINDS" == 1 ]]; then
+    warn "  KV target ${KV_TARGET_GIB} reduced to ${KV_EXPECT_GIB} by HOST_RESERVE_GIB=${HOST_RESERVE_GIB}"
+fi
 info "  GPU budget (GMU ${GPU_MEMORY_UTILIZATION}) ... ${BUDGET_GIB} GiB  => ~${KV_EXPECT_GIB} GiB KV (~${KV_EXPECT_TOK} tokens)"
-info "  container cgroup cap ..... ${CONTAINER_MEM_GIB} GiB  (hard ceiling ${MAX_CONTAINER_GIB})"
+info "  container cgroup cap ..... ${CONTAINER_MEM_GIB} GiB  (hard ceiling ${MAX_CONTAINER_GIB}; bounds host-side memory only)"
+# What the reserve already has to carry before vLLM starts: everything else on
+# the box, measured as MemTotal - MemAvailable. ~7 GiB is normal here.
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}\$"; then
+    info "  host footprint now ....... ${MEM_USED_GIB} GiB used + ${SWAP_USED_GIB} GiB swapped, INCLUDING the running ${CONTAINER_NAME} (not a co-tenant figure)"
+else
+    info "  host footprint now ....... ${MEM_USED_GIB} GiB used by everything else (MemTotal - MemAvailable) + ${SWAP_USED_GIB} GiB swapped"
+    if python3 -c "import sys; sys.exit(0 if $MEM_USED_GIB > 9 else 1)"; then
+        warn "  co-tenants already spend ${MEM_USED_GIB} GiB of the ${HOST_RESERVE_GIB} GiB host reserve (~7 is normal here)."
+        warn "  Find them: docker stats --no-stream; ps -eo rss,cmd --sort=-rss | head. Or raise HOST_RESERVE_GIB."
+    fi
+fi
 
 if python3 -c "import sys; sys.exit(0 if $KV_EXPECT_GIB < $KV_NEED_GIB else 1)"; then
+    if [[ "$CAP_BINDS" == 1 ]]; then
+        err "HOST_RESERVE_GIB=${HOST_RESERVE_GIB} caps the GPU budget at ${BUDGET_CAP_GIB} GiB, which leaves
+       ${KV_EXPECT_GIB} GiB for KV, but ${MAX_MODEL_LEN} tokens need ${KV_NEED_GIB} GiB.
+       Lower MAX_MODEL_LEN or use KV_CACHE_DTYPE=fp8. Lowering HOST_RESERVE_GIB trades
+       host safety for context; the incident doc explains what that bought last time."
+    fi
     err "Budget leaves ${KV_EXPECT_GIB} GiB for KV but ${MAX_MODEL_LEN} tokens need ${KV_NEED_GIB} GiB.
-       Lower MAX_MODEL_LEN or raise GPU_MEMORY_UTILIZATION (FP8 KV is unsupported by this model)."
+       Lower MAX_MODEL_LEN or raise GPU_MEMORY_UTILIZATION."
 fi
 if [[ "$CONTAINER_MEM_GIB" -gt "$MAX_CONTAINER_GIB" ]]; then
     err "Container cap ${CONTAINER_MEM_GIB} GiB exceeds the hard ceiling ${MAX_CONTAINER_GIB} GiB
@@ -325,6 +428,16 @@ if $DO_LAUNCH && python3 -c "import sys; sys.exit(0 if $MEM_AVAIL_GIB < $CONTAIN
        Something else is holding memory (docker ps; ps --sort=-rss)."
 fi
 ok "  budget fits."
+
+# Kernel VM tunables. The stock values give the NVIDIA driver no free-page
+# reserve (min_free_kbytes ~44 MB on a 121 GiB box) and start reclaim at 0.1%.
+# files/sysctl-spark3.conf holds the values spark1 measured six crash-free runs
+# with; read its header before applying (they shift MemAvailable accounting).
+VM_MIN_FREE_KB=$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null || echo 0)
+VM_WSF=$(cat /proc/sys/vm/watermark_scale_factor 2>/dev/null || echo 0)
+if (( VM_MIN_FREE_KB < 1048576 || VM_WSF < 100 )); then
+    warn "  kernel VM tunables at defaults (vm.min_free_kbytes=${VM_MIN_FREE_KB}, vm.watermark_scale_factor=${VM_WSF}): no free-page reserve for the NVIDIA driver. Not applied by this script (sudo). See files/sysctl-spark3.conf, then: sudo sysctl -p files/sysctl-spark3.conf"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. GPU preflight
@@ -348,6 +461,7 @@ PLE_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ple_layer.py"
 MODELOPT_PKG="$VLLM_PKG/model_executor/layers/quantization/modelopt.py"
 QSA_OPS_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
 QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
+MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
 
 info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -381,6 +495,13 @@ extract "$QSA_OPS_PKG"    "$PATCHED_QSA_OPS.orig"
 extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
+
+# Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
+# is set in the container, so it is applied unconditionally.
+PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
+extract "$MTP_PKG" "$PATCHED_MTP.orig"
+python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
+[[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -433,9 +554,53 @@ VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s}'" "$MTP_NUM_SPECULATIVE_TOKENS")")
+    _SPEC_ARGMAX=""
+    # get_top_tokens() is the only path that reads the reduced head; the
+    # speculator calls it only under use_local_argmax_reduction.
+    [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
+    _SPEC_SCHED=""
+    if [[ -n "$MTP_K_SCHEDULE" ]]; then
+        _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
+            printf '%s' "$MTP_K_SCHEDULE" | awk -F, '{
+                out=""
+                for (i = 1; i <= NF; i++) {
+                    split($i, r, ":")
+                    out = out (i > 1 ? "," : "") "[" r[1] "," r[2] "," r[3] "]"
+                }
+                printf "%s", out
+            }')]"
+    fi
+    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
 fi
-VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":0,\"cudagraph_mode\":\"%s\"}'" "$CUDAGRAPH_MODE")")
+_CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
+if [[ "$_CG_SIZES" == "auto" ]]; then
+    # Every verify-batch width the scheduler can actually build: (1+K(S))*S for
+    # S in 1..MAX_NUM_SEQS, where K(S) follows MTP_K_SCHEDULE when one is set
+    # and is the constant MTP_NUM_SPECULATIVE_TOKENS otherwise. A width that is
+    # not in this list has no decode graph and falls back to eager.
+    _CG_SIZES=$(
+        _AUTO_MAX_SEQS="$MAX_NUM_SEQS" \
+        _AUTO_K="$MTP_NUM_SPECULATIVE_TOKENS" \
+        _AUTO_SCHED="$MTP_K_SCHEDULE" \
+        python3 -c '
+import os
+max_seqs = int(os.environ["_AUTO_MAX_SEQS"])
+k_default = int(os.environ["_AUTO_K"])
+k_of = {}
+for part in filter(None, os.environ["_AUTO_SCHED"].strip().split(",")):
+    lo, hi, k = (int(x) for x in part.split(":"))
+    for s in range(lo, min(hi, max_seqs) + 1):
+        k_of.setdefault(s, min(k, k_default))
+print(",".join(str(x) for x in sorted(
+    {(1 + k_of.get(s, k_default)) * s for s in range(1, max_seqs + 1)})))
+'
+    )
+fi
+if [[ -n "$_CG_SIZES" ]]; then
+    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\",\"cudagraph_capture_sizes\":[%s]}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
+else
+    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
+fi
 [[ -n "$EXTRA_VLLM_ARGS" ]] && VLLM_ARGS+=("$EXTRA_VLLM_ARGS")
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 
@@ -451,7 +616,9 @@ fi
 info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup cap ${CONTAINER_MEM_GIB} GiB)"
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
-info "  Graphs:     $CUDAGRAPH_MODE"
+info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
+info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
+info "  Port:       $PORT"
 info "  Endpoint:   $DISPLAY_ENDPOINT"
 info ""
 
@@ -471,12 +638,15 @@ docker run \\
     -e VLLM_PLE_CPU_OFFLOAD=1 \\
     -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
     -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
+    ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
     -e HF_HOME=/root/.cache/huggingface \\
     ${HF_TOKEN:+-e HF_TOKEN=$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
+    -v $PATCHED_MTP:$MTP_PKG:ro \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
@@ -504,18 +674,32 @@ fi
 # 6. Launch + watchdog
 # ---------------------------------------------------------------------------
 info "=== Step 6: Launch ==="
+mkdir -p "$SCRIPT_DIR/logs/archive"
+ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
+if docker inspect "$CONTAINER_NAME" &>/dev/null; then
+    # The old container is removed below; keep its log for the post-mortem first.
+    docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
+    info "Previous container log archived: logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log"
+fi
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 mkdir -p "$HOME/.cache/vllm"
 bash "$LAUNCH_SCRIPT"
 rm -f "$LAUNCH_SCRIPT"
 ok "Container $CONTAINER_NAME started."
 
-# Kill the previous watchdog (if any) and start a fresh one.
+# Kill the previous watchdog (if any), archive its log (the redirect below
+# would overwrite it), and start a fresh one.
 pkill -f "memwatch.sh $CONTAINER_NAME" 2>/dev/null || true
-mkdir -p "$SCRIPT_DIR/logs"
-nohup bash "$SCRIPT_DIR/files/memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB" \
-    > "$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log" 2>&1 &
-ok "Watchdog running (kills container if MemAvailable < ${MEMWATCH_MIN_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
+MEMWATCH_LOG="$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log"
+if [[ -s "$MEMWATCH_LOG" ]]; then
+    mv "$MEMWATCH_LOG" "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-memwatch.log"
+    info "Previous watchdog log archived: logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-memwatch.log"
+fi
+MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
+    MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
+    nohup bash "$SCRIPT_DIR/files/memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB" \
+    > "$MEMWATCH_LOG" 2>&1 &
+ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
