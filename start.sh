@@ -103,6 +103,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
+                    MTP_DRAFT_VOCAB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -197,6 +198,15 @@ CUDAGRAPH_CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES:-}"
 # constant MTP_NUM_SPECULATIVE_TOKENS at every batch size.
 # Example: "1:2:3,3:6:2,7:999:0"
 MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
+# Reduced-vocabulary drafting (FR-Spec). Path on the host to a file of token
+# ids, one per line, built by files/build_draft_vocab.py from a corpus of the
+# model's own output. The MTP drafter reads a 1.27 GB BF16 lm_head over the
+# full 248,320-token vocabulary once per draft step, three of the four
+# lm_head reads in an MTP-3 engine step; a 32k-row slice is 0.16 GB. Drafts
+# for tokens outside the subset are simply rejected at verification, so this
+# trades acceptance for bandwidth and cannot change what the server emits.
+# Empty disables it and the drafter keeps the full head.
+MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
 # torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
 # fusion; adds minutes to the first launch and has not been validated against
 # the PLE custom op here).
@@ -439,6 +449,7 @@ PLE_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ple_layer.py"
 MODELOPT_PKG="$VLLM_PKG/model_executor/layers/quantization/modelopt.py"
 QSA_OPS_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
 QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
+MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
 
 info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -472,6 +483,13 @@ extract "$QSA_OPS_PKG"    "$PATCHED_QSA_OPS.orig"
 extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
+
+# Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
+# is set in the container, so it is applied unconditionally.
+PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
+extract "$MTP_PKG" "$PATCHED_MTP.orig"
+python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
+[[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -524,6 +542,10 @@ VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    _SPEC_ARGMAX=""
+    # get_top_tokens() is the only path that reads the reduced head; the
+    # speculator calls it only under use_local_argmax_reduction.
+    [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -536,7 +558,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
                 printf "%s", out
             }')]"
     fi
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED")")
+    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
 fi
 _CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
 if [[ "$_CG_SIZES" == "auto" ]]; then
@@ -582,6 +604,7 @@ fi
 info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup cap ${CONTAINER_MEM_GIB} GiB)"
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
+info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT"
 info ""
@@ -599,12 +622,15 @@ docker run \\
     -e VLLM_PLE_CPU_OFFLOAD=1 \\
     -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
     -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
+    ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
     -e HF_HOME=/root/.cache/huggingface \\
     ${HF_TOKEN:+-e HF_TOKEN=$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
+    -v $PATCHED_MTP:$MTP_PKG:ro \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\

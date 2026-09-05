@@ -32,6 +32,10 @@
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
 !/files/patch_qsa_fp8_kv.py
+!/files/patch_mtp_draft_vocab.py
+# builds the reduced draft vocabulary the MTP patch reads. Its output is a
+# generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
+!/files/build_draft_vocab.py
 # recommended kernel VM tunables (not applied by anything here)
 !/files/sysctl-spark3.conf
 
@@ -45,4 +49,5 @@
 #   files/*.orig,             upstream vLLM sources; start.sh extracts them
 #   files/ple_offload/orig/     from the image on first run
 #   files/ple_layer_patched.py, files/modelopt_patched.py,
+#   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch

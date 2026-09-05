@@ -90,6 +90,103 @@ as promises.
 
 ### Added
 
+- **Reduced-vocabulary drafting for the MTP head** (`files/patch_mtp_draft_vocab.py`,
+  `files/build_draft_vocab.py`, `MTP_DRAFT_VOCAB`). **The largest measured win
+  on this host: -16.9% single-stream step time, and the only change so far that
+  moves single stream at all.**
+
+  The drafter carries its own BF16 `ParallelLMHead` over the whole 248,320-token
+  vocabulary, 1.18 GiB, read once per draft step. At MTP 3 that is three of the
+  four `lm_head` reads in an engine step -- about a third of every byte a
+  single-stream step moves -- to produce one argmax. Draft sampling is greedy
+  (`draft_sample_method` defaults to `"greedy"`, and the speculator only builds
+  `draft_logits` for `"probabilistic"`, so *every* draft goes through
+  `get_top_tokens` regardless of request temperature), so the drafter needs the
+  arg max and nothing else, and ~74% of the vocabulary never wins it.
+
+  The patch adds `get_top_tokens()` to `Qwen3_8FlashNextMTP`, reading a sliced
+  BF16 head selected by token id, and leaves `compute_logits` on the full head
+  so every other path keeps full-vocabulary behaviour. It engages only when
+  `MTP_DRAFT_VOCAB` names a file, and `start.sh` then also passes
+  `"use_local_argmax_reduction":true`, which is what routes the speculator
+  through `get_top_tokens`. TP=1 only; it refuses to engage otherwise.
+
+  At 65,536 rows the draft head is 0.31 GiB, saving **2.61 GiB per engine step**.
+  Measured step time against the same server with the full head:
+
+  | streams | full head | reduced head | delta |
+  |---|---|---|---|
+  | 1 | 76.9 ms  | 63.9 ms  | **-16.9%** |
+  | 2 | 93.0 ms  | 79.0 ms  | -15.1% |
+  | 4 | 117.3 ms | 101.6 ms | -13.4% |
+  | 5 | 127.4 ms | 115.7 ms | -9.2%  |
+  | 8 | 155.7 ms | 146.2 ms | -6.1%  |
+
+  Three repeats each; the byte model predicts -18.0% at one stream and -6.2% at
+  eight, so prediction and measurement agree within about a point at both ends.
+  The saving is a fixed 2.61 GiB while the step grows with concurrency (each
+  extra token pulls in ~10 more of the 512 MoE experts), which is why the gain
+  shrinks as streams rise. Decode-phase throughput: 28.4 -> ~35 tok/s at one
+  stream, 84.7 -> 101.3 at five.
+
+  **Accuracy is unaffected, and that is structural rather than lucky.** The
+  rejection sampler's greedy branch is
+  `accepted = target_argmax == draft_sampled`, storing
+  `draft_sampled if accepted else target_argmax`: a draft is kept only when it
+  equals the target model's own choice, and otherwise the target's token is
+  emitted. The patch changes only what is *proposed*; the verification path is
+  untouched, so a reduced-vocabulary drafter is indistinguishable from a less
+  accurate one, which is the condition rejection sampling exists to handle.
+  Confirmed on MGSM (the same 250 grade-school problems in each language, exact
+  numeric match, 8 concurrent, temperature 0):
+
+  | | reduced 65k | full 248k | delta |
+  |---|---|---|---|
+  | en accuracy | 237/250 = 94.8% | 234/250 = 93.6% | +1.2 pts (0.57 sigma) |
+  | zh accuracy | 216/250 = 86.4% | 216/250 = 86.4% | 0.0 pts (0.00 sigma) |
+  | en throughput | 95.2 tok/s | 83.9 tok/s | **+13.4%** |
+  | zh throughput | 84.4 tok/s | 82.4 tok/s | +2.4% |
+
+  Chinese is the stress case: the shipped vocabulary covers 50.6% of the tokens
+  the model emits in Chinese against 98.9% in English, and Chinese accuracy is
+  *identical* to the problem, 216 of 250 either way. What coverage buys is
+  speed, never correctness -- English gains 13%, Chinese gains nothing
+  measurable because the unconditional byte saving and the acceptance the poor
+  coverage costs cancel out. Out-of-vocabulary traffic comes out break-even, not
+  slower, so the reduced head is safe for mixed traffic.
+
+  Exact-text A/B is not available on this server: two passes over the same 26
+  temperature-0 prompts on one unchanged config produced 0/26 identical outputs.
+  Concurrent batch composition changes MoE/Marlin reduction order and flips
+  near-tied logits. That nondeterminism predates this change; it is why the
+  kernel and a graded task eval are the evidence here rather than a diff.
+
+  Building the vocabulary needs a real corpus, and this is the part that nearly
+  sank the item. A vocabulary fitted to the model's own generated output does
+  not work: 52 generations gave 4,250 distinct tokens, so every size from 8k to
+  65k was the same set at 76% held-out coverage, and generating enough would
+  take a day of the server doing nothing else. Qwen's BPE id order is also a
+  poor frequency proxy -- "keep every id below 32,768" covers only 80.9% of
+  occurrences. What worked was 513 MiB of wikitext-103 plus 47 MiB of real
+  Python source (x3) plus the model's own output (x20): 160M token occurrences,
+  104,522 distinct ids.
+
+      python3 files/build_draft_vocab.py english.txt code.txt:3 model_out.jsonl:20 \
+          --size 65536 --out ~/.cache/vllm/draft_vocab/qwen38fn_en_code_65k.txt
+
+  Corpus coverage by size: 8k 87.1%, 16k 93.2%, 32k 97.8%, 65k 99.84%. On the
+  model's own English+code output, 32k covers 93.7% and 65k covers 97.3%. 65k
+  ships because the crossover where the acceptance loss eats the byte saving is
+  around 88-90% coverage, and 65k costs only 3 points of byte saving (18.0% vs
+  21.2% of a single-stream step) to buy 3.6 points of coverage. The vocabulary
+  is a generated artifact and is not tracked here; `MTP_DRAFT_VOCAB` empty
+  restores full-vocabulary drafting.
+
+  Not free in memory: the full 1.18 GiB head stays resident and the 0.31 GiB
+  slice is added on top, so this spends ~0.31 GiB of GPU memory to save
+  bandwidth. Under greedy draft sampling `compute_logits` is dead on the draft
+  path, so the full head could be released later for another 1.18 GiB.
+
 - **Batched page prefetch before the PLE row gather** (`files/patch_ple_layer.py`,
   `files/patch_ple_offload.py`). The offload worker gathers 16 rows per token
   out of a 26.82 GiB mmap with `torch.index_select`, which never reaches
