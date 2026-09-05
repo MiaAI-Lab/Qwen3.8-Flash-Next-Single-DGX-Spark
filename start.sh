@@ -93,6 +93,7 @@ _CLI_MTP="${MTP_NUM_SPECULATIVE_TOKENS:-}"
 _CLI_REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-}"
 _CLI_PLE_OFFLOAD="${PLE_OFFLOAD:-}"
 _CLI_PORT="${PORT:-}"
+_CLI_BIND="${BIND:-}"
 _CLI_KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 
 # Knobs that are NOT read through an explicit _CLI_ variable above still have
@@ -127,6 +128,7 @@ done
 MODEL_ID="${TP1_MODEL_ID:-Mia-AiLab/Qwen3.8-Flash-Next-NVFP4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 PORT="${_CLI_PORT:-${PORT:-8888}}"            # 8888 is safe only while comfy-h3.service is disabled (it watches this port)
+BIND="${_CLI_BIND:-${BIND:-127.0.0.1}}"       # loopback by default; opt in explicitly for remote access
 IMAGE="${IMAGE:?IMAGE not set in .env}"
 
 MAX_MODEL_LEN="${_CLI_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-65536}}"
@@ -225,6 +227,16 @@ if ! [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]]; then
     err "MAX_MODEL_LEN must be a positive integer (got: '$MAX_MODEL_LEN')"
 fi
 [[ "$YARN" == "0" || "$YARN" == "1" ]] || err "YARN must be 0 or 1 (got: '$YARN')"
+case "$BIND" in
+    127.0.0.1|localhost|::1) ;;
+    *) warn "BIND=$BIND exposes the unauthenticated vLLM API beyond loopback."
+       warn "     Use BIND=127.0.0.1 unless remote access is intentional and protected." ;;
+esac
+if [[ "$BIND" == *:* ]]; then
+    DISPLAY_ENDPOINT="[$BIND]:$PORT"
+else
+    DISPLAY_ENDPOINT="$BIND:$PORT"
+fi
 
 case "$KV_CACHE_DTYPE" in
     auto|bfloat16) ;;
@@ -607,8 +619,12 @@ info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKE
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT"
+info "  Endpoint:   $DISPLAY_ENDPOINT"
 info ""
 
+# This value is expanded into the generated Bash launch script. Quote it as one
+# shell word so a bind supplied through the environment cannot alter the command.
+BIND_Q=$(printf '%q' "$BIND")
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
@@ -641,7 +657,7 @@ docker run \\
     $IMAGE \\
     $MODEL_ID \\
     $VLLM_ARGS_STR \\
-    --host 0.0.0.0 \\
+    --host $BIND_Q \\
     --port $PORT
 LAUNCH_EOF
 chmod +x "$LAUNCH_SCRIPT"
@@ -706,7 +722,7 @@ while true; do
     if [[ "$CODE" == "200" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""
-        ok "vLLM ready on port $PORT (TP=1, single Spark)."
+        ok "vLLM ready on $DISPLAY_ENDPOINT (TP=1, single Spark)."
         docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "GPU KV cache size|Available KV cache|Maximum concurrency" | tail -3 || true
         info ""
         info "Stop:  ./stop.sh   (graceful; --force to skip the SIGTERM wait)"
