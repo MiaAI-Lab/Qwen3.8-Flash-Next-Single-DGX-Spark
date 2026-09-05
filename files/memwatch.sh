@@ -24,8 +24,10 @@
 #     32 GiB, zero NVRM errors. Free pages backed by reclaimable cache are not
 #     what the driver runs out of; free pages with no cache left to reclaim are.
 #
-# Every 10 s it also counts NV_ERR_NO_MEMORY lines in the kernel log; that is
-# the earliest signal this box gives and is logged whenever it is non-zero.
+# Every 10 s it also counts NV_ERR_NO_MEMORY lines the kernel log gained since
+# the previous check; that is the earliest signal this box gives and is logged
+# whenever it is non-zero. (A fixed 12 s window every 10 s double-counted lines
+# in the 2 s overlap: 6 counted for 5 logged on 2026-09-05 09:00.)
 #
 # Timeline every 5 s (every sample once within 1 GiB of either floor) with the
 # /proc/meminfo fields needed to tell page cache from anon from driver memory:
@@ -85,6 +87,7 @@ tick=0
 below_avail=0
 below_free=0
 nvrm_total=0
+nvrm_since=$(date '+%Y-%m-%d %H:%M:%S')
 cg_path=""
 while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     eval "$(awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapFree|AnonPages|Shmem|Mapped|Slab|SUnreclaim|PageTables|KernelStack):/ {
@@ -114,10 +117,14 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     fi
 
     if (( tick % 10 == 0 )); then
-        nvrm=$(journalctl -k --since "-12s" -q 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true)
+        # journalctl --since is inclusive at second granularity, so exclude the
+        # boundary second on the next pass by advancing it past this check.
+        nvrm_now=$(date '+%Y-%m-%d %H:%M:%S')
+        nvrm=$(journalctl -k --since "$nvrm_since" --until "$nvrm_now" -q 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true)
+        nvrm_since="$nvrm_now"
         if (( nvrm > 0 )); then
             nvrm_total=$(( nvrm_total + nvrm ))
-            echo "$(date '+%F %T') NVRM: ${nvrm} NV_ERR_NO_MEMORY in the last 12 s (total ${nvrm_total}); MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB"
+            echo "$(date '+%F %T') NVRM: ${nvrm} NV_ERR_NO_MEMORY since last check (total ${nvrm_total}); MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB"
         fi
     fi
 
