@@ -158,6 +158,29 @@ def main() -> None:
             "        _attach_draft_vocab(self)\n"
             "        return loaded\n",
         ),
+        # One INFO line the first time the speculator reaches the indexer.
+        # index_share_for_mtp_iteration is an hf-overrides flag with no log of
+        # its own: the V2 speculator only calls set_skip_topk when the draft
+        # hf_config carries it AND this class exposes both methods
+        # (v1/worker/gpu/spec_decode/mtp/speculator.py:30-33), so this line
+        # firing is the runtime proof that the flag arrived. Nothing prints it
+        # when the flag is off, which is the shipped default.
+        (
+            "    def set_skip_topk(self, skip: bool) -> None:\n"
+            '        """Select on MTP step 0 and reuse its QSA indices on later steps."""\n'
+            "\n"
+            "        for attention in self._iter_qsa_attentions():\n",
+            "    def set_skip_topk(self, skip: bool) -> None:\n"
+            '        """Select on MTP step 0 and reuse its QSA indices on later steps."""\n'
+            "\n"
+            '        if not getattr(self, "_mtp_index_share_logged", False):\n'
+            "            self._mtp_index_share_logged = True\n"
+            "            logger.info(\n"
+            '                "MTP index share: index_share_for_mtp_iteration ACTIVE "\n'
+            '                "(set_skip_topk reached the draft QSA indexer)"\n'
+            "            )\n"
+            "        for attention in self._iter_qsa_attentions():\n",
+        ),
     ])
     print("ok")
 
