@@ -5,6 +5,169 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-06
+
+Overnight measurement pass through `docs/synthesis-astra-fable-2026-09-05.md`
+section 6: ten launches, one configuration each, every number from
+`bench/sweep.py` driving sparkDash one concurrency level at a time and reading
+the vLLM counters around it. Full write-up and every table in
+`docs/overnight-2026-09-05.md`; raw rows in `logs/overnight-2026-09-05.jsonl`.
+
+### Added
+
+- **BF16 GDN recurrent state** (`MAMBA_SSM_CACHE_DTYPE`, `start.sh`).
+  **+8.5% aggregate decode at 8 streams, with long-context retrieval
+  unchanged.** The checkpoint sets `mamba_ssm_dtype = float32`, but the fused
+  GDN kernel accepts bfloat16 as well (`FUSED_GDN_STATE_DTYPES` in
+  `qwen_gdn_linear_attn.py`), and the state is pure per-step traffic: ~0.23 GB
+  per sequence read and written every engine step. Halving it also halves the
+  mamba page, which drops the attention block from 3,200 to 1,664 tokens.
+
+  Measured on this host, `MAX_NUM_SEQS=8`, MTP 3, FP8 KV, 512k YaRN, prose,
+  600 tokens, three repeats each:
+
+  | streams | float32 state | bfloat16 state | delta |
+  |---|---|---|---|
+  | 1 | 44.6 tok/s | 47.6 tok/s | +6.8% |
+  | 2 | 68.9 tok/s | 73.3 tok/s | +6.4% |
+  | 4 | 107.8 tok/s | 111.1 tok/s | +3.1% |
+  | 8 | **151.6 tok/s** | **164.5 tok/s** | **+8.5%** |
+
+  Only the 8-stream row clears this host's decision bar (more than 5% in the
+  same direction in all three repeats: +10.6%, +7.4%, +7.6%); the rest are
+  positive but inside the ±5% noise floor. The gain is in the step, not in
+  drafting: 141.4 → 130.4 ms at 8 streams with tokens per step unchanged at
+  2.80 and per-position acceptance unchanged within rounding (0.80/0.59/0.41
+  against 0.79/0.58/0.42). The KV pool is
+  marginally larger for marginally less memory (17.3 GiB / 1,161,935 tokens →
+  16.64 GiB / 1,180,814), which is the smaller mamba page showing up.
+
+  **Quality is unchanged, and it was checked because this is a precision
+  change.** `bench/longctx.py` at 32k, five runs: 15/15 needles found, 5/5
+  PASS, at 5%, 50% and 95% depth — exactly the float32 pass count on the same
+  five runs. A 4-turn continuation, which is what would expose a recurrence
+  degrading across turns, ends on a summary that recalls every element of the
+  conversation in both configurations. Three fixed sanity prompts agree.
+  Caveat: that is one night's evidence at 32k, on the same bar the FP8 KV
+  default was held to, not a graded task eval. `MAMBA_SSM_CACHE_DTYPE` empty
+  restores the checkpoint's float32.
+
+  Confirmed independently on a second launch (the final one, which then soaked
+  45 minutes): 48.7 / 74.6 / 113.7 / 162.9 tok/s at 1/2/4/8 streams, +7.4% at
+  8 streams against the float32 baseline in all three repeats.
+
+- **`VLLM_USE_V2_MODEL_RUNNER=1` in `.env.sample`'s `EXTRA_DOCKER_ARGS`.** This
+  architecture already selects the V2 model runner for the target, but the
+  speculative draft config copy (`Qwen3_8FlashNextMTP`) is not in the V2
+  default set, falls back to V1, and mutates the `compilation_config` object it
+  shares with the target. That is the mechanism behind the 2026-09-05
+  dynamic-K failure, where `cudagraph_mode` silently became PIECEWISE. Pinned
+  on all ten launches here: none logged `Overriding cudagraph_mode`, and every
+  launch that reached `/health` captured the FULL decode graph list `start.sh`
+  asked for.
+
+- **`bench/sweep.py` and `bench/mixed.py`.** Verified against the 2026-09-05
+  sparkDash anchors before use: 47.8/71.2/106.7 tok/s at S=1/2/4 against
+  46.1/70.3/107.0, and 63.0 ms per step at S=1 against the reduced-head
+  63.9 ms. See their own entry below.
+
+- **An INFO line in the MTP patch when index sharing engages**
+  (`files/patch_mtp_draft_vocab.py`). See "Tried and rejected".
+
+### Measured
+
+- **Static K sweep, 0/1/2/3, at 1/2/4/8 streams, with FULL decode graphs
+  throughout — the open question from the synthesis document, settled.**
+  `CUDAGRAPH_CAPTURE_SIZES=auto` recomputes the widths per K, so every launch
+  had a FULL graph for every verify batch its scheduler could build. Aggregate
+  decode tok/s, prose, three repeats, mean:
+
+  | streams | K=0 | K=1 | K=2 | K=3 |
+  |---|---|---|---|---|
+  | 1 | 24.3 | 38.2 | 44.3 | **44.6** |
+  | 2 | 41.9 | 61.8 | **69.4** | 68.9 |
+  | 4 | 68.5 | 95.0 | 103.9 | **107.8** |
+  | 8 | 103.3 | 138.7 | 150.1 | **151.6** |
+
+  **K=3 is optimal at every concurrency, K=2 is statistically tied to it, and
+  there is no crossover.** The question was whether K=1 wins at 8 streams; it
+  loses 8.5% there. The single historical data point that suggested otherwise
+  (step 160.8 → 127.4 ms at S=8) was taken under PIECEWISE graphs, where the
+  K=3 side was paying a graph penalty it does not pay now.
+
+  Engine step (ms) / tokens per step behind those numbers:
+
+  | streams | K=0 | K=1 | K=2 | K=3 |
+  |---|---|---|---|---|
+  | 1 | 41.1 / 1.00 | 48.7 / 1.86 | 55.9 / 2.46 | 62.9 / 2.83 |
+  | 8 | 76.4 / 1.00 | 102.2 / 1.84 | 124.7 / 2.42 | 141.4 / 2.80 |
+
+  Each draft position costs a near-constant slice of step time (~7 ms at 1
+  stream, ~22 ms at 8, flat across positions) and returns its own acceptance in
+  tokens. Positions 1 and 2 return 0.80 and 0.60, well above break-even;
+  position 3 returns 0.41, which is close enough to break-even that K=2 and
+  K=3 tie. Acceptance on the earlier positions *rises* as the draft shortens
+  (p1 = 0.79 / 0.82 / 0.86 at K=3/2/1, one stream) — the positions are not
+  independent — but not by enough to change the ranking. Disabling MTP costs
+  32–46%, and returns 1.49 GiB: the KV pool goes from 17.3 GiB / 1,161,935
+  tokens to 17.9 GiB / 1,389,215.
+
+- **8-stream decode is 151.6 tok/s, not 114.** The 114 figure in the
+  2026-09-05 entry was measured before `CUDAGRAPH_CAPTURE_SIZES=auto` covered
+  all eight verify widths; with a FULL graph at every width from 4 to 32 the
+  8-stream step is 141.4 ms rather than 146.2. `MAX_NUM_SEQS` still ships at 4:
+  all of tonight's sweeps were short-context, and 8 concurrent full-length
+  requests do not fit the KV pool.
+
+- **What a long prefill does to streams that are already decoding**, on the
+  shipped 2,048-token chunk: two decoders at 76 ms inter-token latency, one
+  64k prompt injected, and for the 34.5 s that prompt takes to prefill the
+  decoders' ITL p50 is 1,057 ms, p95 1,111 ms, p99 1,400 ms, with aggregate
+  decode across both streams falling to 2.14 tok/s. The p50 is the mechanism
+  in one number: a 2,048-token chunk at this host's ~2,100 tok/s is 0.97 s of
+  GPU time, and chunked prefill puts one chunk in the same engine step as every
+  co-scheduled decode. The decoders do not get slower steps, they get one step
+  per chunk.
+
+- **Restart-to-restart KV variation is ~10% on this host.** Two launches with
+  identical memory settings resolved to 17.3 GiB / 1,161,935 tokens and
+  15.59 GiB / 1,045,742. Worth knowing before reading a small KV difference as
+  a result.
+
+### Tried and rejected
+
+- **MTP sparse-index reuse (`index_share_for_mtp_iteration`)** — not
+  measurable from the CLI on this build. `--hf-overrides` puts the flag on the
+  target's `text_config`; the drafter reads it from the *draft* config, and
+  `SpeculativeConfig.compose_draft_hf_overrides` states that "Dict overrides
+  are target-specific key patches and are not applied to the draft". The added
+  INFO line never fired on a launch whose command line did carry the flag. No
+  knob shipped: a switch that silently does nothing is worse than no switch.
+- **`flashinfer_b12x` MoE backend** — selects for both processes
+  (`Using 'FLASHINFER_B12X' NvFp4 MoE backend`), then kills the engine during
+  `profile_run` with `CUDA error: an illegal memory access was encountered`,
+  before the KV pool is sized. The exclusion of this backend from `auto` in
+  `oracle/nvfp4.py` is load-bearing on SM121, not stale. No host risk: 0
+  `NV_ERR_NO_MEMORY`, no watchdog event, driver memory returned in full.
+- **`MTP_NUM_SPECULATIVE_TOKENS` 2, 1 and 0** — −0.8%, −14.4% and −45.5% at one
+  stream against K=3. K=3 stays the default.
+- **Dynamic K (`MTP_K_SCHEDULE`)** — not run. It was conditional on the static
+  sweep finding a per-S optimum other than K=3, and the optimum is K=3 at every
+  S. There is nothing to schedule.
+- **`COMPILATION_MODE=3`** with `CUDAGRAPH_MODE=FULL_AND_PIECEWISE` — +0.3% at
+  one stream and +1.0% at four, both inside noise. It is safe (loads, compiles
+  in 13 s, keeps FULL decode graphs, does not disturb the PLE custom op) and
+  buys nothing: decode here is bandwidth-bound and fusion only helps the part
+  of the step that is not.
+- **`MAX_NUM_BATCHED_TOKENS=1024`** — a near miss, kept as an opt-in rather
+  than promoted. Under the mixed-traffic test it takes the decoders' ITL p95
+  during a 64k prefill from 1,111 ms to 666 ms (1.67x) and p99 from 1,400 ms
+  to 674 ms (2.08x), and raises aggregate decode during the prefill window from
+  2.14 to 3.45 tok/s, for 5.5% of prefill at 64k and 17% of the prompt's TTFT.
+  The bar for changing the shipped default was 2x on **p95**, and p95 is 1.67x.
+  For prefill-dominated agent traffic this is very likely the better setting;
+  make the case on p99 and re-measure on your own traffic.
+
 ## 2026-09-05
 
 ### Fixed

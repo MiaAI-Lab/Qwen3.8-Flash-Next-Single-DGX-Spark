@@ -33,13 +33,14 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `HOST_RESERVE_GIB=26`,
-`KV_TARGET_GIB=16`, `KV_CACHE_DTYPE=fp8`, `MAX_NUM_SEQS=4`,
-`MAX_NUM_BATCHED_TOKENS=2048`**.
+`KV_TARGET_GIB=16`, `KV_CACHE_DTYPE=fp8`, `MAMBA_SSM_CACHE_DTYPE=bfloat16`,
+`MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**, with the V2 model runner
+pinned through `EXTRA_DOCKER_ARGS`.
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
 Decode numbers are not in this table: they predate the 2026-09-05 optimisation
 pass and are superseded by the [sparkDash sweep](#prefill-and-decode-measured-with-sparkdash)
-below (46.3 tok/s single-stream prose).
+below (48.7 tok/s single-stream prose, 162.9 aggregate at 8 streams).
 
 | Configuration | KV pool | Prefill @400k | Needles 5/50/95% |
 |---|---|---|---|
@@ -85,10 +86,51 @@ alone; a pinned `GPU_MEMORY_UTILIZATION` still gets you there, with a warning.
 
 Both sweeps below were measured with
 [sparkDash](https://github.com/MiaAI-Lab/sparkDash) against this server.
-Benchmark scripts are not shipped in this repo; use sparkDash to reproduce
-them. The two prefill columns are **not** a clean A/B — they differ in rope
-config and KV target as well as chunk width — so each is labelled with what it
-was measured at.
+`bench/sweep.py` drives it one concurrency level at a time and reads vLLM's
+own counters around each level, which is what makes the ms-per-step and
+tokens-per-step columns below comparable across launches; `bench/mixed.py`
+covers the decode-under-prefill case sparkDash has no mode for. The two
+prefill columns are **not** a clean A/B — they differ in rope config and KV
+target as well as chunk width — so each is labelled with what it was measured
+at.
+
+#### 2026-09-06: BF16 recurrent state and every verify width on a graph
+
+Measured on 512k YaRN, MTP 3, FP8 KV, 2,048 chunks, `CUDAGRAPH_CAPTURE_SIZES=auto`,
+`MAMBA_SSM_CACHE_DTYPE=bfloat16`, the V2 model runner pinned, and
+**`MAX_NUM_SEQS=8`** — which is the one part of this row that `.env.sample`
+does not ship, because every sweep here was short-context. Prose, 600 tokens,
+three repeats per level, `bench/sweep.py`:
+
+| streams | ms/engine step | tokens/step | aggregate | per stream |
+|---|---|---|---|---|
+| 1 | 61.5 | 3.00 | **48.7 tok/s** | 48.7 tok/s |
+| 2 | 74.3 | 2.83 | **74.6 tok/s** | 37.3 tok/s |
+| 4 | 96.2 | 2.84 | **113.7 tok/s** | 28.4 tok/s |
+| 8 | 131.0 | 2.81 | **162.9 tok/s** | 20.4 tok/s |
+
+Two changes separate this from the 2026-09-05 row. `MAX_NUM_SEQS=8` with a FULL
+decode graph at all eight verify widths (4 through 32) is what makes the
+8-stream column reachable at all. BF16 recurrent state is worth **+8.5% at 8
+streams** on its own, in a matched pair on the same launch config: 151.6 →
+164.5 tok/s, step 141.4 → 130.4 ms, with per-position draft acceptance
+unchanged within rounding (0.80/0.59/0.41 against 0.79/0.58/0.42) and needle
+retrieval unchanged at 15/15.
+
+**Speculative depth was swept properly here for the first time** (K=0/1/2/3 at
+every stream count, FULL graphs throughout). K=3 wins at every concurrency,
+K=2 ties it, K=1 loses 8–14% and K=0 loses 32–46%. There is no crossover, so
+`MTP_K_SCHEDULE` has nothing to schedule. The full table is in the CHANGELOG.
+
+**Decode under a concurrent prefill** is the one place the shipped chunk width
+hurts. With two streams decoding at 76 ms per token and one 64k prompt
+arriving, the decoders' inter-token latency for the 34.5 s of that prefill is
+p50 1,057 ms / p95 1,111 ms / p99 1,400 ms, and the two streams together manage
+2.14 tok/s. That is one engine step per 2,048-token chunk, by construction.
+Halving the chunk to 1,024 takes p95 to 666 ms and p99 to 674 ms and raises
+in-window decode to 3.45 tok/s, for 5.5% of prefill throughput at 64k. It is
+not the shipped default (see the CHANGELOG for why the bar was not met), but if
+your traffic is long prompts arriving against live streams, measure it.
 
 #### 2026-09-05: after the decode optimisation pass
 
@@ -449,6 +491,49 @@ changed that — its one-BF16-ULP bound is a numerical result, not a quality
 one. Treat FP8 as a capacity trade for workloads you have validated
 yourself.
 
+### BF16 recurrent state (default)
+
+`MAMBA_SSM_CACHE_DTYPE=bfloat16` overrides the checkpoint's
+`mamba_ssm_dtype = float32` for the GDN recurrent state. The fused kernel
+accepts it (`FUSED_GDN_STATE_DTYPES = (float32, bfloat16)`), and vLLM says so
+at startup:
+
+```
+config.py:799 WARNING  Qwen3.5 model specifies mamba_ssm_dtype='float32' in its config,
+              but --mamba-ssm-cache-dtype='bfloat16' was passed. Using the user-specified value.
+interface.py:915  Setting attention block size to 1664 tokens   (3200 at float32)
+```
+
+The state is pure per-step traffic — roughly 0.23 GB per sequence read and
+written every engine step — so halving it converts almost directly into step
+time on a machine this close to the bandwidth wall. Halving the mamba page also
+lets vLLM pick a 1,664-token attention block instead of 3,200, which doubles
+prefix-cache granularity for multi-turn traffic.
+
+Measured 2026-09-06 (512k YaRN, MTP 3, FP8 KV, `MAX_NUM_SEQS=8`, prose, three
+repeats):
+
+| | float32 (checkpoint) | bfloat16 | Δ |
+|---|---|---|---|
+| decode @ 1 stream | 44.6 tok/s | 47.6 tok/s | +6.8% |
+| decode @ 8 streams | 151.6 tok/s | **164.5 tok/s** | **+8.5%** |
+| engine step @ 8 streams | 141.4 ms | 130.4 ms | −7.8% |
+| tokens per step @ 8 streams | 2.80 | 2.80 | unchanged |
+| attention block | 3,200 tok | 1,664 tok | halved |
+| needles @32k, 5 runs | 15/15 | **15/15** | unchanged |
+
+Only the 8-stream row clears the ±5%-in-all-three-repeats bar this host uses;
+the others are positive but inside the noise floor.
+
+**This is a precision change, so read the quality evidence before trusting it.**
+Needle retrieval at 32k is identical to float32 across five runs at 5%, 50% and
+95% depth, and a 4-turn continuation — the case that would expose a recurrence
+degrading as it is carried forward — produces a final summary that recalls every
+element of the conversation in both dtypes. That is the same bar the FP8 KV
+default was held to, and it is one night's evidence rather than a graded task
+eval. Set `MAMBA_SSM_CACHE_DTYPE=` empty to go back to the checkpoint's
+float32.
+
 ### PLE mmap access pattern
 
 The packed PLE table is advised `MADV_RANDOM` (in `patch_ple_offload.py`).
@@ -613,8 +698,18 @@ buffer or missing quant scales) — see the patch notes below.
 - `files/sysctl-spark3.conf` — recommended kernel VM tunables, not applied by
   anything here; read its header first.
 
-Benchmarks are not part of this repo. The published prefill and decode numbers
-were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash).
+- `bench/sweep.py` — decode sweep. Submits one
+  [sparkDash](https://github.com/MiaAI-Lab/sparkDash) job per concurrency level
+  and snapshots `/metrics` around each, so every level also yields ms per
+  engine step, tokens per step and per-position draft acceptance, plus host
+  memory minima and the `NV_ERR_NO_MEMORY` count for that level.
+- `bench/mixed.py` — decode under a concurrent prefill: two streams decoding
+  when a ~64k prompt arrives, reporting their p95/p99 inter-token latency
+  inside the prefill window. sparkDash has no mode for this shape.
+
+The published prefill and decode numbers were measured with sparkDash, driven
+by those two scripts. Both need an idle server: the counter deltas and
+sparkDash's own figures include any other traffic on the port.
 
 ## What is patched and why
 

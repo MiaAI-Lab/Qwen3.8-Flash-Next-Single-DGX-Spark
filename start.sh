@@ -101,6 +101,7 @@ _CLI_KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
+                    MAMBA_SSM_CACHE_DTYPE
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
                     MTP_DRAFT_VOCAB
@@ -147,6 +148,12 @@ MAX_NUM_BATCHED_TOKENS="${_CLI_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:
 MTP_NUM_SPECULATIVE_TOKENS="${_CLI_MTP:-${MTP_NUM_SPECULATIVE_TOKENS:-0}}"
 KV_CACHE_DTYPE="${_CLI_KV_CACHE_DTYPE:-${KV_CACHE_DTYPE:-auto}}"
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-}"          # optional hard pin, bytes
+# dtype of the GDN recurrent (SSM) state. The checkpoint asks for float32; the
+# fused GDN kernel also accepts bfloat16 (FUSED_GDN_STATE_DTYPES in
+# qwen_gdn_linear_attn.py). BF16 halves the ~0.23 GB per sequence the state
+# costs to read and write every step, and halves the mamba page, which lets
+# vLLM pick a smaller attention block. Empty keeps the checkpoint's float32.
+MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 # Runtime overhead on top of weights, GiB (measured at TP1: 3.37+1.92+0.12).
 OVERHEAD_GIB="${OVERHEAD_GIB:-5.6}"
 # KV the derived budget targets when GMU is not pinned. More KV = more UVM.
@@ -526,6 +533,7 @@ VLLM_ARGS+=("--max-num-seqs" "$MAX_NUM_SEQS")
 VLLM_ARGS+=("--max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS")
 VLLM_ARGS+=("--max-model-len" "$MAX_MODEL_LEN")
 VLLM_ARGS+=("--kv-cache-dtype" "$KV_CACHE_DTYPE")
+[[ -n "$MAMBA_SSM_CACHE_DTYPE" ]] && VLLM_ARGS+=("--mamba-ssm-cache-dtype" "$MAMBA_SSM_CACHE_DTYPE")
 if [[ -n "$YARN_FACTOR" ]]; then
     # Deep-merged into text_config.rope_parameters, which is what this model
     # reads (nvidia/qsa.py) and what vLLM's max-len check scales by. The
@@ -603,6 +611,7 @@ info "  Context:    $MAX_MODEL_LEN tokens (native rope, no YaRN)"
 fi
 info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup cap ${CONTAINER_MEM_GIB} GiB)"
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
+info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
