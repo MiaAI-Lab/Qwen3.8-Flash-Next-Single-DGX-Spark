@@ -636,6 +636,26 @@ default was held to, and it is one night's evidence rather than a graded task
 eval. Set `MAMBA_SSM_CACHE_DTYPE=` empty to go back to the checkpoint's
 float32.
 
+### Optional SM121 prefill and draft-head kernels
+
+Two independent opt-ins; defaults preserve the existing paths:
+
+```sh
+GDN_PREFILL_BACKEND=auto   # flashinfer: source-checked GB10 prefill backend
+MTP_DRAFT_HEAD_FP8=0       # 1: experimental FP8 reduced MTP head; requires MTP_DRAFT_VOCAB
+```
+
+On a separate single-Spark coding A/B (native 262k, MTP3, 65k draft vocabulary,
+32-GiB host reserve), both enabled gave **53.81→56.76 solo decode tok/s
+(+5.5%)** and about **6% faster cold code prefill**. Four-stream batch
+throughput was effectively flat; faster tokens did not consistently shorten
+completed-task latency. Functional scores varied (42/44 baseline, 40/44 both),
+so FP8 stays experimental rather than default-on. It adds 0.1565 GiB at 65k
+vocabulary; neither switch lowers the host reserve. See the
+[four-way comparison and caveats](docs/sm121-code-benchmarks.md),
+[GDN details](docs/sm121-gdn-prefill.md), and
+[FP8 details](docs/sm121-mtp-fp8-head.md) before enabling them.
+
 ### PLE mmap access pattern
 
 The packed PLE table is advised `MADV_RANDOM` (in `patch_ple_offload.py`).
@@ -851,6 +871,10 @@ sparkDash's own figures include any other traffic on the port.
 
 ## Credits
 
+- **[Gabriel Olympie (@gabrielolympie)](https://github.com/gabrielolympie/sglang-flashnext-sm120)**
+  — the original SM120 optimization work that inspired the GDN investigation
+  and supplied the Apache-2.0 kernel adapted for the optional GB10 FP8 draft
+  head. See [source attribution and modifications](THIRD_PARTY_NOTICES.md).
 - **Qwen / Alibaba** — [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
   the base model everything here derives from.
 - **MiaAI Lab** — the single-DGX-Spark NVFP4 recipe and
@@ -870,8 +894,9 @@ sparkDash's own figures include any other traffic on the port.
 Copyright (C) 2026 MiaAI Lab (https://x.com/MiaAI_lab)
 
 Licensed under the **GNU Affero General Public License v3.0 or later**
-(AGPL-3.0-or-later). See `LICENSE`. Every source file carries an
-`SPDX-License-Identifier: AGPL-3.0-or-later` header.
+(AGPL-3.0-or-later). See `LICENSE`. Source files identify their license with
+SPDX headers. The optional SM121 helpers/tests marked Apache-2.0 retain that
+license; see `LICENSES/Apache-2.0.txt` and `THIRD_PARTY_NOTICES.md`.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free

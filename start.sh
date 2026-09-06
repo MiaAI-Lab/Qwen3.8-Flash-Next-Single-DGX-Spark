@@ -112,7 +112,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MAMBA_SSM_CACHE_DTYPE GDN_PREFILL_BACKEND
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
-                    MTP_DRAFT_VOCAB
+                    MTP_DRAFT_VOCAB MTP_DRAFT_HEAD_FP8
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -245,6 +245,15 @@ MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
 # trades acceptance for bandwidth and cannot change what the server emits.
 # Empty disables it and the drafter keeps the full head.
 MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
+# Optional W8A16 copy of the reduced draft head only. Full target weights and
+# acceptance are untouched. Original BF16 buffers remain for large-M fallback.
+MTP_DRAFT_HEAD_FP8="${MTP_DRAFT_HEAD_FP8:-0}"
+[[ "$MTP_DRAFT_HEAD_FP8" == 0 || "$MTP_DRAFT_HEAD_FP8" == 1 ]] \
+    || err "MTP_DRAFT_HEAD_FP8 must be 0 or 1"
+if [[ "$MTP_DRAFT_HEAD_FP8" == 1 ]]; then
+    [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && -n "$MTP_DRAFT_VOCAB" ]] \
+        || err "MTP_DRAFT_HEAD_FP8 requires MTP and MTP_DRAFT_VOCAB"
+fi
 # torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
 # fusion; adds minutes to the first launch and has not been validated against
 # the PLE custom op here).
@@ -587,6 +596,16 @@ extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 
+MTP_FP8_MOUNTS=""
+if [[ "$MTP_DRAFT_HEAD_FP8" == 1 ]]; then
+    MTP_FP8_DIR="$SCRIPT_DIR/files/mtp_fp8_generated"
+    mkdir -p "$MTP_FP8_DIR"
+    python3 "$SCRIPT_DIR/files/patch_mtp_fp8_head.py" \
+        --source "$PATCHED_MTP" --output "$MTP_FP8_DIR/mtp.py"
+    PATCHED_MTP="$MTP_FP8_DIR/mtp.py"
+    MTP_FP8_MOUNTS="-v $SCRIPT_DIR/files/spark_mtp_fp8_head.py:$VLLM_PKG/models/qwen3_8_flash_next/nvidia/spark_mtp_fp8_head.py:ro -e VLLM_MTP_DRAFT_HEAD_FP8=1"
+fi
+
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
 extract "$VLLM_PKG/model_executor/layers/ple_offload_layer.py" "$OFFLOAD_DIR/orig/ple_offload_layer.py"
@@ -739,6 +758,7 @@ info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  GDN prefill: $GDN_PREFILL_BACKEND"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
+info "  Draft-head FP8: $MTP_DRAFT_HEAD_FP8 (target head unchanged)"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT"
 info ""
@@ -772,6 +792,7 @@ docker run \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $GDN_PREFILL_MOUNTS \\
+    $MTP_FP8_MOUNTS \\
     $EXTRA_DOCKER_ARGS \\
     $IMAGE \\
     $MODEL_ID \\
