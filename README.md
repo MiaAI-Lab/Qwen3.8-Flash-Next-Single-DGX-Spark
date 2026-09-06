@@ -33,7 +33,7 @@ the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 ## Measured profile
 
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `HOST_RESERVE_GIB=26`,
-`KV_TARGET_GIB=16`, `KV_CACHE_DTYPE=fp8`, `MAMBA_SSM_CACHE_DTYPE=bfloat16`,
+`KV_TARGET_GIB=20`, `KV_CACHE_DTYPE=fp8`, `MAMBA_SSM_CACHE_DTYPE=bfloat16`,
 `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**, with the V2 model runner
 pinned through `EXTRA_DOCKER_ARGS`.
 Everything below was measured on this host on 2026-09-04; each row names the
@@ -49,8 +49,9 @@ below (48.7 tok/s single-stream prose, 162.9 aggregate at 8 streams).
 | 512k YaRN, `KV_TARGET_GIB=22`, BF16 | 796,196 tok (1.52x a 512k req) | 1,883 tok/s @32k | 12/14 (see FP8 section) |
 | 512k YaRN, `KV_TARGET_GIB=22`, FP8 | 22.2 GiB = 1,431,164 tok (2.73x a 512k req) | 1,495 tok/s (TTFT 267.7 s); 1,769 tok/s @32k | 15/20 (see FP8 section) |
 
-The shipped profile itself (262k, `HOST_RESERVE_GIB=26`, `KV_TARGET_GIB=16`,
-FP8, `MAX_NUM_SEQS=5`) was measured on 2026-09-05:
+The same profile at `KV_TARGET_GIB=16` and `MAX_NUM_SEQS=5` (262k,
+`HOST_RESERVE_GIB=26`, FP8) was measured on 2026-09-05. The shipped wish is now
+20, which this host clips to 16.67 GiB — see [Configuration](#configuration):
 
 | | |
 |---|---|
@@ -64,23 +65,28 @@ FP8, `MAX_NUM_SEQS=5`) was measured on 2026-09-05:
 | 2.5 h under the qwen-code harness (~38 requests, 19 of them 50–100k tokens, up to 3 concurrent) | 14.2–14.9 GiB between turns, min 12.8 GiB at 3 concurrent; driver 96.6 → 97.5 GiB in one step |
 | `NV_ERR_NO_MEMORY` in `journalctl -k` | 0 across launch and all of the above |
 
-The idle figure used to be quoted here as ~12.9 GiB; that came from a run at
-`KV_TARGET_GIB=20` before the day's co-tenants were on the box. See the safety
+The idle figure used to be quoted here as ~12.9 GiB; that came from a
+2026-09-04 run — before the host-side cap existed, so `KV_TARGET_GIB=20` then
+meant 20 GiB of KV rather than today's clipped 16.67 — and before the day's
+co-tenants were on the box. See the safety
 rules for why the number matters.
 
-One honest gap: the **shipped default itself** (262k, `KV_TARGET_GIB=20`,
-FP8) has not been benchmarked end to end — the 262k row above is at a lower KV
-target and BF16, and predates the `MADV_RANDOM` mmap change. Short-context
-(32k) prefill is now measured for both dtypes; see the FP8 section.
+One honest gap: `KV_TARGET_GIB=20` is now measured end to end — ten launches,
+the 1/2/4/8-stream decode sweep, needles 15/15 at 32k and a 45-minute soak on
+2026-09-06 — but every one of those ran at **512k YaRN**, not at the shipped
+262k native rope. The 262k row above is at BF16 and predates the `MADV_RANDOM`
+mmap change. Short-context (32k) prefill is measured for both dtypes; see the
+FP8 section.
 
 `KV_TARGET_GIB` shipped as 22, then 20, until 2026-09-05. Both lost servers:
 three on 2026-09-04. The rows above at 22 are real measurements, but the host
 they were taken on had 6.9–8.8 GiB of `MemAvailable` left, against a 6 GiB
 watchdog floor and a GPU driver that refuses allocations before that. The
 budget is now capped from the host side (`HOST_RESERVE_GIB`, see
-[Safety rules](#safety-rules)); the KV pool is whatever the cap leaves, and 16
-sits just under it. 20 and 22 are no longer reachable through `KV_TARGET_GIB`
-alone; a pinned `GPU_MEMORY_UTILIZATION` still gets you there, with a warning.
+[Safety rules](#safety-rules)); the KV pool is whatever the cap leaves. The
+shipped wish is 20 and this host clips it to 16.67 GiB, so 20 and 22 of actual
+KV are no longer reachable through `KV_TARGET_GIB` alone; a pinned
+`GPU_MEMORY_UTILIZATION` still gets you there, with a warning.
 
 ### Prefill and decode, measured with sparkDash
 
@@ -123,14 +129,46 @@ K=2 ties it, K=1 loses 8–14% and K=0 loses 32–46%. There is no crossover, so
 `MTP_K_SCHEDULE` has nothing to schedule. The full table is in the CHANGELOG.
 
 **Decode under a concurrent prefill** is the one place the shipped chunk width
-hurts. With two streams decoding at 76 ms per token and one 64k prompt
-arriving, the decoders' inter-token latency for the 34.5 s of that prefill is
-p50 1,057 ms / p95 1,111 ms / p99 1,400 ms, and the two streams together manage
-2.14 tok/s. That is one engine step per 2,048-token chunk, by construction.
-Halving the chunk to 1,024 takes p95 to 666 ms and p99 to 674 ms and raises
-in-window decode to 3.45 tok/s, for 5.5% of prefill throughput at 64k. It is
+hurts. With two streams decoding and one 64k prompt arriving, the gap between
+their streamed chunks for the 34.5 s of that prefill is p50 1,057 ms /
+p95 1,111 ms / p99 1,400 ms, against 78 ms on the quiet server. **Those are per
+engine step, not per token**: vLLM emits one streamed chunk per step carrying
+that step's accepted tokens (~2.7 here, measured), so per-token latency is
+roughly a third of the figures above. The two streams together delivered 74
+steps' worth of output inside the window — ~5.8 tok/s if acceptance holds at
+its quiet-server value. That is one engine step per 2,048-token chunk, by
+construction. Halving the chunk to 1,024 takes p95 to 666 ms and p99 to 674 ms
+and raises in-window delivery to 139 steps (~9.3 tok/s), for 5.5% of prefill
+throughput at 64k. It is
 not the shipped default (see the CHANGELOG for why the bar was not met), but if
 your traffic is long prompts arriving against live streams, measure it.
+
+**Prefill on this configuration**, three sparkDash ladders on 2026-09-06 (one
+at 256k), server warm:
+
+| context | TTFT | prefill | 2026-09-05 | change |
+|---|---|---|---|---|
+| 8k | 3.74 s | **2,200 tok/s** (2,155–2,238) | 1,764 | +24.7% |
+| 16k | 7.13 s | **2,304 tok/s** (2,293–2,311) | 2,265 | +1.7% |
+| 32k | 14.18 s | **2,314 tok/s** (2,305–2,324) | 2,265 | +2.2% |
+| 64k | 29.05 s | **2,257 tok/s** (2,257–2,258) | 2,222 | +1.6% |
+| 128k | 61.09 s | **2,146 tok/s** (2,144–2,148) | 2,110 | +1.7% |
+| 256k | 134.89 s | **1,944 tok/s** | 1,913 | +1.6% |
+
+**Prefill did not change; only the 8k row looks like it did.** Fit
+`TTFT = tokens / rate + overhead` across 16k–128k and the per-token rate is
+2,125 tok/s here against 2,089 on 2026-09-05 — **+1.7%**, with the same
+−0.60 s intercept in both. Every row above 8k agrees with that. The 8k point
+sits above the fit in *both* ladders, by 1.34 s in the 2026-09-05 run and
+0.47 s here, because 8k runs first and pays the PLE page-cache warm-up; a
+server that has been up for hours has mostly already paid it. Read the 8k row
+as a statement about cache state, not about kernels.
+
+BF16 recurrent state is the only serving change since 2026-09-05, and prefill
+is within ~2% either way, so its effect here is not separable from run-to-run
+variation — unlike decode, where it is worth +8.5% at 8 streams. Note the
+64k and 128k rows reproduce to ±0.05% across the three ladders, so that ±2% is
+a between-launch figure, not measurement noise.
 
 #### 2026-09-05: after the decode optimisation pass
 
@@ -237,11 +275,18 @@ as deltas against them:
 | 4 | 550 ms | 85.9 tok/s | 23.4 tok/s |
 
 Decode speed on this model is **strongly content-dependent**, because MTP
-speculative decoding accepts more drafts on predictable text. Measured on this
-server: mean acceptance length 2.1 of a possible 4, per-position acceptance
-0.65 / 0.33 / 0.14, average draft acceptance 37-41%. Highly predictable output
-(quoting text back out of the context) reaches ~41 tok/s; dense technical prose
-sits lower. Treat single-stream decode as a range rather than one number.
+speculative decoding accepts more drafts on predictable text. Measured
+2026-09-06 on sparkDash prose: **2.80 tokens of a possible 4 per engine step**,
+per-position acceptance **0.80 / 0.59 / 0.41** — 60% of drafted tokens
+accepted. Quoting text back out of the context goes higher still; dense
+technical prose sits lower. Treat single-stream decode as a range rather than
+one number.
+
+The figures quoted here until 2026-09-06 — acceptance length 2.1 of 4, per
+position 0.65 / 0.33 / 0.14, and "~41 tok/s" as the *best* case — were taken
+under PIECEWISE CUDA graphs with the full 248,320-token draft vocabulary. They
+are superseded in both directions: acceptance is much higher, and ordinary
+prose now measures 48.7 tok/s single-stream.
 
 
 ## Multimodal (images and video)
@@ -277,9 +322,10 @@ Three things to know before leaning on it:
   target model sees the image — but decode runs closer to the non-speculative
   speed. Text-only requests are unaffected.
 - **Video is token-hungry.** Frame count and resolution drive prompt length
-  fast. At `YARN=1` you have only 1.34x a full-length request in KV across
-  `MAX_NUM_SEQS=4`, so concurrent video work contends; the 262k profile
-  (2.81x) has far more headroom for it.
+  fast. At `YARN=1` with the shipped FP8 KV you have **2.16x** a full-length
+  request in KV (measured 2026-09-06 on the running server), so two concurrent
+  long video requests already contend; the 262k profile has far more headroom.
+  The 1.34x quoted here before was a BF16-KV measurement.
 - **Long video at 512k is untested here.** The tests above were long-text *or*
   short-multimodal, never both at once.
 
@@ -295,7 +341,8 @@ MAX_MODEL_LEN=65536 MTP_NUM_SPECULATIVE_TOKENS=0 ./start.sh
 The safety-relevant knob is `HOST_RESERVE_GIB` (default 26): the GPU budget
 is capped at `MemTotal − HOST_RESERVE_GIB` no matter what `KV_TARGET_GIB`
 asks for, and `start.sh` prints "KV target X reduced to Y" when the cap binds.
-`KV_TARGET_GIB` is a wish under that cap (16 gives ~1M FP8 tokens here).
+`KV_TARGET_GIB` is a wish under that cap: the shipped 20 is clipped to
+16.67 GiB here, ~1.13M FP8 tokens.
 `HOST_SLACK_GIB` sizes the container cgroup cap (GPU budget + this); it bounds
 host-side memory only and does not protect the host from the GPU side.
 
@@ -334,7 +381,8 @@ cgroup cap are unchanged from 262k. Measured at `YARN=1`, BF16,
 | Output | coherent; MTP 3 and YaRN run together without incident |
 
 At `KV_TARGET_GIB=22` with FP8 the same context gets 2.73x headroom instead of
-1.34x — see [FP8 KV cache](#fp8-kv-cache-default).
+1.34x — see [FP8 KV cache](#fp8-kv-cache-default). That 22 predates the
+host-side cap; the shipped profile measures **2.16x** at 524k today.
 
 400k prefill stress test (salted to defeat prefix caching, needles planted at
 5% / 50% / 95% depth):
@@ -359,8 +407,10 @@ of the context — MTP's best case, not typical decode speed.
 | 1M even with the ceiling raised | refused by the Step 2 budget check (cap 112 GiB vs 105 GiB ceiling) |
 
 YaRN trades some short-context accuracy for the longer window, so leave it off
-unless you need more than 262k. The 512k path serves correctly but its decode
-and prefill speeds have not yet been benchmarked.
+unless you need more than 262k. The 512k path is what every sparkDash sweep
+above was measured on — decode, prefill and the 45-minute soak all ran at
+`YARN=1`. It is the shipped **262k native-rope** profile that has not been
+benchmarked end to end.
 
 ### Reasoning is on by default
 
@@ -704,8 +754,8 @@ buffer or missing quant scales) — see the patch notes below.
   engine step, tokens per step and per-position draft acceptance, plus host
   memory minima and the `NV_ERR_NO_MEMORY` count for that level.
 - `bench/mixed.py` — decode under a concurrent prefill: two streams decoding
-  when a ~64k prompt arrives, reporting their p95/p99 inter-token latency
-  inside the prefill window. sparkDash has no mode for this shape.
+  when a ~64k prompt arrives, reporting the p95/p99 gap between their streamed
+  chunks (one per engine step, ~2.7 tokens each) inside the prefill window. sparkDash has no mode for this shape.
 
 The published prefill and decode numbers were measured with sparkDash, driven
 by those two scripts. Both need an idle server: the counter deltas and
@@ -735,9 +785,10 @@ sparkDash's own figures include any other traffic on the port.
   scales once to the score and the normalised output, plumbs `k_scale`/
   `v_scale` into the kernels, and relaxes the four BF16-only guards and the
   inherited FlashAttention rejection. Avoiding an FP32 dequantisation tile lets
-  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to ~1.26M tokens
-  at the shipped `KV_TARGET_GIB=20` (~1.38M at 22), which is what makes a 1M context
-  arithmetically possible on one Spark. **On by default** and still a real
+  FP8 keep the BF16 `block_n`. Raises the KV pool from ~800k to **1,132,586
+  tokens** on the shipped profile (measured 2026-09-06; 1.43-1.50M at the
+  pre-cap `KV_TARGET_GIB=22`), which is what makes a 1M context arithmetically
+  possible on one Spark. **On by default** and still a real
   quality trade — see the warning `start.sh` prints.
   The FP8-KV approach is credited to
   [lancelind/qwen3.8-Flash-DGX](https://github.com/lancelind/qwen3.8-Flash-DGX)

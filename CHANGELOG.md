@@ -74,6 +74,21 @@ the vLLM counters around it. Full write-up and every table in
 - **An INFO line in the MTP patch when index sharing engages**
   (`files/patch_mtp_draft_vocab.py`). See "Tried and rejected".
 
+### Changed
+
+- **`KV_TARGET_GIB` 16 -> 20 in `.env.sample`**, so the shipped wish matches the
+  value every measurement in this entry was taken at. It is a wish, not a
+  grant: with `HOST_RESERVE_GIB=26` this host clips it on every launch
+  (`KV target 20 reduced to 16.67 by HOST_RESERVE_GIB=26`, and to 18.16 on the
+  K=0 launch, where the draft weights are not resident). What survives vLLM's
+  own profiling is 15.98 GiB = 1,132,586 FP8 tokens on the final launch. The
+  host margin is unchanged because the cap, not this knob, bounds the budget:
+  ten launches and a 45-minute soak at 20, `MemAvailable` 15.52-16.42 GiB
+  through the soak and never below 13.0 GiB under the sweeps, 0
+  `NV_ERR_NO_MEMORY` after `/health`. On a host with more memory the cap is
+  looser and 20 may be granted in full. `README.md` updated in the five places
+  that named 16 as the shipped value.
+
 ### Measured
 
 - **Static K sweep, 0/1/2/3, at 1/2/4/8 streams, with FULL decode graphs
@@ -128,6 +143,17 @@ the vLLM counters around it. Full write-up and every table in
   GPU time, and chunked prefill puts one chunk in the same engine step as every
   co-scheduled decode. The decoders do not get slower steps, they get one step
   per chunk.
+
+- **Prefill is unchanged by anything in this entry.** Three sparkDash ladders
+  on the final configuration: 2,304 / 2,314 / 2,257 / 2,146 / 1,944 tok/s at
+  16k / 32k / 64k / 128k / 256k, within 2.2% of the 2026-09-05 pass at every
+  context, and reproducing to +/-0.05% between ladders at 64k and 128k. The 8k
+  row reads +24.7% (1,764 -> 2,200) but is a cache artifact: fitting
+  `TTFT = tokens / rate + overhead` over 16k-128k gives 2,125 tok/s now against
+  2,089 then, +1.7%, with the same -0.60 s intercept, and the 8k point sits
+  above the fit in both ladders (+1.34 s in 2026-09-05, +0.47 s here) because
+  it runs first and pays the PLE page-cache warm-up. BF16 recurrent state moves
+  decode, not prefill.
 
 - **Restart-to-restart KV variation is ~10% on this host.** Two launches with
   identical memory settings resolved to 17.3 GiB / 1,161,935 tokens and
