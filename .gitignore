@@ -33,6 +33,7 @@
 !/files/patch_ple_offload.py
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_mtp_draft_vocab.py
+!/files/patch_safetensors_clone.py
 # builds the reduced draft vocabulary the MTP patch reads. Its output is a
 # generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
 !/files/build_draft_vocab.py

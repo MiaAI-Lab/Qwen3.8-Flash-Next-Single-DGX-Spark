@@ -156,14 +156,14 @@ KV_TARGET_GIB="${KV_TARGET_GIB:-8.0}"
 # MemTotal - HOST_RESERVE_GIB whatever KV_TARGET_GIB asks for. See SAFETY above
 # for what the 26 GiB covers. Raise it by 2 GiB steps if the watchdog log shows
 # MemAvailable idling under ~9 GiB; do not lower it to buy KV.
-HOST_RESERVE_GIB="${HOST_RESERVE_GIB:-26}"
+HOST_RESERVE_GIB="${HOST_RESERVE_GIB:-28}"
 # Host-side memory the container needs beyond the GPU budget: three Python
 # processes, pinned staging buffers, CPU-side torch, page cache slack.
 HOST_SLACK_GIB="${HOST_SLACK_GIB:-10.0}"
 # Never let the container cgroup cap come within this much of the pool.
 OS_RESERVE_GIB="${OS_RESERVE_GIB:-16.0}"
 # Watchdog: stop the container if host MemAvailable stays below this (GiB) ...
-MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-6}"
+MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-4}"
 # ... or MemFree stays below this. The NVIDIA driver refuses allocations
 # (NV_ERR_NO_MEMORY) at MemFree ~3 GiB while MemAvailable still reads 6+.
 MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
@@ -447,6 +447,7 @@ fi
 VLLM_PKG=/usr/local/lib/python3.12/dist-packages/vllm
 PLE_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ple_layer.py"
 MODELOPT_PKG="$VLLM_PKG/model_executor/layers/quantization/modelopt.py"
+WEIGHT_UTILS_PKG="$VLLM_PKG/model_executor/model_loader/weight_utils.py"
 QSA_OPS_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
 QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
 MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
@@ -469,6 +470,11 @@ PATCHED_PLE="$SCRIPT_DIR/files/ple_layer_patched.py"
 extract "$PLE_PKG" "$SCRIPT_DIR/files/ple_layer_patched.py.orig"
 python3 "$SCRIPT_DIR/files/patch_ple_layer.py"
 [[ -f "$PATCHED_PLE" ]] || err "PLE patch missing after patch_ple_layer.py"
+
+PATCHED_WEIGHT_UTILS="$SCRIPT_DIR/files/weight_utils_patched.py"
+extract "$WEIGHT_UTILS_PKG" "$SCRIPT_DIR/files/weight_utils_patched.py.orig"
+python3 "$SCRIPT_DIR/files/patch_safetensors_clone.py"
+[[ -f "$PATCHED_WEIGHT_UTILS" ]] || err "weight_utils patch missing after patch_safetensors_clone.py"
 
 PATCHED_MODELOPT="$SCRIPT_DIR/files/modelopt_patched.py"
 extract "$MODELOPT_PKG" "$SCRIPT_DIR/files/modelopt_patched.py.orig"
@@ -628,6 +634,7 @@ docker run \\
     ${HF_TOKEN:+-e HF_TOKEN=$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
+    -v $PATCHED_WEIGHT_UTILS:$WEIGHT_UTILS_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
