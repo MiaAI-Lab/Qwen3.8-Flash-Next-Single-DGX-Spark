@@ -27,6 +27,10 @@
 
 # --- launcher support and patch generators -----------------------------
 !/files/memwatch.sh
+!/files/patch_gdn_sm121.py
+!/files/test_gdn_sm121.py
+!/bench/gdn_sm121_preflight.py
+!/docs/sm121-gdn-prefill.md
 !/files/build_ple_packed_table.py
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
