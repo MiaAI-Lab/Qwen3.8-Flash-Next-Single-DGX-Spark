@@ -24,7 +24,12 @@ the vLLM counters around it. Full write-up and every table in
   `HF_TOKEN`. It is the same size as stock to the byte (9 of 37 shards differ
   in content, none in length). The packed PLE table is reused from stock, but
   only after `ABLIT_META.json` is confirmed to report `edit_ple: false`.
-  `TP1_MODEL_ID` still overrides checkpoint selection.
+  `TP1_MODEL_ID` still overrides checkpoint selection. `README.md` summarises
+  the gate's terms (18+, stated intended use, prohibited uses, Qwen Community
+  License) rather than just telling you to accept them, adds the ablit
+  checkpoint to what the AGPL does *not* cover, and gains a **Credits**
+  section crediting Qwen/Alibaba, MiaAI Lab, local-inference-lab and Keys
+  (drowzeys) for the splice, mirroring the checkpoint's own `CREDITS.md`.
 
 - **BF16 GDN recurrent state** (`MAMBA_SSM_CACHE_DTYPE`, `start.sh`).
   **+8.5% aggregate decode at 8 streams, with long-context retrieval
