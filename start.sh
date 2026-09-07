@@ -5,7 +5,11 @@
 # tp1/start.sh — Single-node, single-GPU (TP=1) vLLM launch on ONE DGX Spark.
 #
 # Serves the Mia-AiLab NVFP4 checkpoint — MXFP8 attention + a 4-bit NVFP4 PLE
-# table. The memory figures below were measured on the equivalent
+# table. ABLIT=1 in .env switches to the gated Keys checkpoint
+# (drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only): same Mia
+# 34-shard layout, QSA self_attn.o_proj replaced at L15/19/23/27/31/35/39/43/47.
+# That repo is gated — accept the Hugging Face terms, then ABLIT=1 ./download.sh.
+# The memory figures below were measured on the equivalent
 # local-inference-lab build (98.6 GiB on disk); re-check them if this
 # checkpoint's on-disk size differs. The RadixArk build (125.9 GiB) cannot fit
 # one Spark and is not offered here.
@@ -61,6 +65,8 @@
 # Context above the native 262144 needs YaRN. MAX_MODEL_LEN is the YARN=0
 # length; YARN_MAX_MODEL_LEN (default 524288) is served instead when YARN=1.
 # Both live in .env, so the 0/1 flag alone switches between them. 1M does not fit.
+# ABLIT=0/1 likewise switches the checkpoint: 0 is stock Mia NVFP4, 1 is the
+# gated Keys ablit snapshot (accept Hugging Face terms, then ./download.sh).
 # ---------------------------------------------------------------------------
 #
 # Usage:
@@ -69,6 +75,7 @@
 #   MAX_MODEL_LEN=262144 ./start.sh
 #   MTP_NUM_SPECULATIVE_TOKENS=3 ./start.sh   # re-enable MTP (1.5 GiB)
 #   YARN=1 ./start.sh                         # YARN_MAX_MODEL_LEN (512k) via YaRN
+#   ABLIT=1 ./start.sh                        # gated ablit checkpoint (download first)
 #   GPU_MEMORY_UTILIZATION=0.75 ./start.sh    # pin the budget yourself
 #   HOST_RESERVE_GIB=28 ./start.sh            # more host margin, less KV
 # ============================================================================
@@ -85,6 +92,7 @@ err()   { echo -e "\033[1;31m[ERR ]\033[0m  $*"; exit 1; }
 # Precedence: environment override > tp1/.env > built-in default.
 _CLI_MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 _CLI_YARN="${YARN:-}"
+_CLI_ABLIT="${ABLIT:-}"
 _CLI_YARN_MAX_MODEL_LEN="${YARN_MAX_MODEL_LEN:-}"
 _CLI_GMU="${GPU_MEMORY_UTILIZATION:-}"
 _CLI_MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
@@ -125,7 +133,23 @@ done
 # ---------------------------------------------------------------------------
 # Defaults (see tp1/.env.sample for the known-good profile).
 # ---------------------------------------------------------------------------
-MODEL_ID="${TP1_MODEL_ID:-Mia-AiLab/Qwen3.8-Flash-Next-NVFP4}"
+STOCK_MODEL_ID="Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"
+ABLIT_MODEL_ID="drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only"
+# Abliterated weights: 0 = stock Mia NVFP4, 1 = gated Keys checkpoint
+# (QSA o_proj L15/19/23/27/31/35/39/43/47). Same 0/1 pattern as YARN.
+# TP1_MODEL_ID, if set, still wins and ABLIT is ignored for selection.
+ABLIT="${_CLI_ABLIT:-${ABLIT:-0}}"
+[[ "$ABLIT" == "0" || "$ABLIT" == "1" ]] || err "ABLIT must be 0 or 1 (got: '$ABLIT')"
+if [[ -n "${TP1_MODEL_ID:-}" ]]; then
+    MODEL_ID="$TP1_MODEL_ID"
+    if [[ "$ABLIT" == "1" && "$MODEL_ID" != "$ABLIT_MODEL_ID" ]]; then
+        warn "ABLIT=1 ignored for checkpoint selection: TP1_MODEL_ID=$MODEL_ID"
+    fi
+elif [[ "$ABLIT" == "1" ]]; then
+    MODEL_ID="$ABLIT_MODEL_ID"
+else
+    MODEL_ID="$STOCK_MODEL_ID"
+fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 PORT="${_CLI_PORT:-${PORT:-8888}}"            # 8888 is safe only while comfy-h3.service is disabled (it watches this port)
 IMAGE="${IMAGE:?IMAGE not set in .env}"
@@ -223,7 +247,7 @@ DO_LAUNCH=true
 for arg in "$@"; do
     case "$arg" in
         --no-launch) DO_LAUNCH=false ;;
-        -h|--help)   sed -n '1,60p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '1,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
         *)           err "Unknown argument: $arg (try --help)" ;;
     esac
 done
@@ -232,6 +256,11 @@ if ! [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]]; then
     err "MAX_MODEL_LEN must be a positive integer (got: '$MAX_MODEL_LEN')"
 fi
 [[ "$YARN" == "0" || "$YARN" == "1" ]] || err "YARN must be 0 or 1 (got: '$YARN')"
+if [[ "$ABLIT" == "1" ]]; then
+    warn "ABLIT=1: serving gated Keys checkpoint ($ABLIT_MODEL_ID)."
+    warn "     Safety refusals are removed. MTP, PLE, experts and the chat template stay stock."
+    warn "     Compatible ONLY with the Mia single-Spark NVFP4 layout (this recipe)."
+fi
 
 case "$KV_CACHE_DTYPE" in
     auto|bfloat16) ;;
@@ -286,8 +315,18 @@ info "=== Step 1: Resolve checkpoint ==="
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 ORG="${MODEL_ID%%/*}"; NAME="${MODEL_ID##*/}"
 MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
-[[ -d "$MODEL_PATH" ]] || err "Checkpoint not in cache: $MODEL_PATH
+if [[ "$ABLIT" == "1" ]]; then
+    [[ -d "$MODEL_PATH" ]] || err "Checkpoint not in cache: $MODEL_PATH
+       Fetch it first (HF_TOKEN required):
+         1. Set HF_TOKEN in .env (or: export HF_TOKEN=hf_...)
+         2. Open https://huggingface.co/$ABLIT_MODEL_ID
+         3. Accept the terms on that page
+         4. ABLIT=1 ./download.sh"
+else
+    [[ -d "$MODEL_PATH" ]] || err "Checkpoint not in cache: $MODEL_PATH
        Fetch it first:  ./download.sh $MODEL_ID"
+fi
+
 # Prints a snapshot hash. Exit 0 = complete, 1 = incomplete, 2 = none.
 # Prefers refs/main when that snapshot is complete, else the newest complete
 # snapshot (so a leftover partial dir cannot win over a finished one).
@@ -334,7 +373,18 @@ SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
 [[ -n "$SNAP" ]] || err "No snapshot under $MODEL_PATH/snapshots"
 SNAPSHOT_REL="snapshots/$SNAP"
 [[ -f "$MODEL_PATH/$SNAPSHOT_REL/config.json" ]] || err "No snapshot under $MODEL_PATH/snapshots"
-[[ "$SNAP_RC" -eq 0 ]] || err "Checkpoint snapshot is incomplete. Resume it with: ./download.sh $MODEL_ID"
+if [[ "$SNAP_RC" -ne 0 ]]; then
+    if [[ "$ABLIT" == "1" ]]; then
+        err "Checkpoint snapshot is incomplete. Resume with:  ABLIT=1 ./download.sh"
+    else
+        err "Checkpoint snapshot is incomplete. Resume it with: ./download.sh $MODEL_ID"
+    fi
+fi
+if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
+    [[ -f "$MODEL_PATH/$SNAPSHOT_REL/ABLIT_META.json" ]] || err "ABLIT=1 but $MODEL_PATH/$SNAPSHOT_REL has no ABLIT_META.json.
+       Fetch the gated checkpoint first (HF_TOKEN required; accept the terms on that page):
+         ABLIT=1 ./download.sh"
+fi
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 
 # ---------------------------------------------------------------------------
@@ -542,15 +592,31 @@ for f in ple_offload_layer connector worker protocol; do
 done
 ok "Patches ready."
 
-PLE_CACHE_HOST="$HOME/.cache/vllm/ple_cache/${ORG}--${NAME}"
-PLE_CACHE_CTR="/root/.cache/vllm/ple_cache/${ORG}--${NAME}"
+# The Keys splice leaves the PLE n-gram shards stock, so the packed table is
+# shared with the Mia checkpoint instead of rebuilt (~27 GiB). Read that from the
+# checkpoint's own metadata rather than assuming it: if a future ablit ever
+# touches PLE, build a separate table instead of poisoning the stock cache.
+PLE_CACHE_ID="$MODEL_ID"
+if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
+    if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["recipe"]["edit_ple"] is False else 1)' \
+            "$MODEL_PATH/$SNAPSHOT_REL/ABLIT_META.json" 2>/dev/null; then
+        PLE_CACHE_ID="$STOCK_MODEL_ID"
+        info "ABLIT=1: ABLIT_META.json reports edit_ple=false; reusing packed PLE cache for $STOCK_MODEL_ID"
+    else
+        warn "ABLIT=1: ABLIT_META.json does not report edit_ple=false."
+        warn "     Building a separate packed PLE table for $MODEL_ID (~27 GiB)."
+    fi
+fi
+PLE_ORG="${PLE_CACHE_ID%%/*}"; PLE_NAME="${PLE_CACHE_ID##*/}"
+PLE_CACHE_HOST="$HOME/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
+PLE_CACHE_CTR="/root/.cache/vllm/ple_cache/${PLE_ORG}--${PLE_NAME}"
 if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
     info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
     mkdir -p "$PLE_CACHE_HOST"
     docker run --rm --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
         -v "$MODEL_PATH:/m:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
         -v "$SCRIPT_DIR/files/build_ple_packed_table.py:/b.py:ro" \
-        --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${ORG}--${NAME}"
+        --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
 fi
 ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$PLE_CACHE_HOST" | cut -f1))"
 
@@ -635,6 +701,7 @@ VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 info ""
 info "Config (single Spark, TP=1):"
 info "  Model:      $MODEL_ID"
+info "  Ablit:      $ABLIT$( [[ "$ABLIT" == "1" ]] && echo ' (gated Keys o_proj L15-47)' )"
 info "  Image:      $IMAGE"
 if [[ -n "$YARN_FACTOR" ]]; then
 info "  Context:    $MAX_MODEL_LEN tokens (YaRN factor $YARN_FACTOR over native $NATIVE_MAX_MODEL_LEN)"

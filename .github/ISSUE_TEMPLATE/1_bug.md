@@ -28,7 +28,7 @@ assignees: ""
 - Image / vLLM version: <!-- `docker images | grep vllm`; `docker exec vllm-fn-tp1 python3 -c "import vllm;print(vllm.__version__)"` -->
 - Model (`TP1_MODEL_ID`): <!-- default Mia-AiLab/Qwen3.8-Flash-Next-NVFP4 -->
 - `start.sh` invocation: <!-- e.g. `./start.sh`, or `YARN=1 ./start.sh` -->
-- Relevant `.env` values: <!-- YARN, MAX_MODEL_LEN, YARN_MAX_MODEL_LEN, KV_TARGET_GIB, KV_CACHE_DTYPE, MTP_NUM_SPECULATIVE_TOKENS, MAX_NUM_SEQS, HOST_SLACK_GIB, PLE_OFFLOAD -->
+- Relevant `.env` values: <!-- YARN, ABLIT, MAX_MODEL_LEN, YARN_MAX_MODEL_LEN, KV_TARGET_GIB, KV_CACHE_DTYPE, MTP_NUM_SPECULATIVE_TOKENS, MAX_NUM_SEQS, HOST_SLACK_GIB, PLE_OFFLOAD -->
 - Output of `./start.sh --no-launch`: <!-- the derived budget block is usually the fastest way to diagnose a memory problem -->
 
 ---
