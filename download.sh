@@ -45,19 +45,44 @@ HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 ORG="${MODEL_ID%%/*}"; NAME="${MODEL_ID##*/}"
 MODEL_PATH="$HF_CACHE_DIR/hub/models--${ORG}--${NAME}"
 
-snapshot_complete() {  # <snapshot-dir>
+# Prints a snapshot hash. Exit 0 = complete, 1 = incomplete, 2 = none.
+# Prefers refs/main when that snapshot is complete, else the newest complete
+# snapshot, else refs/main even if incomplete (so a partial tree can resume).
+resolve_snapshot() {  # <model-path>
     python3 - "$1" <<'PY'
-import json
-import pathlib
-import sys
+import json, pathlib, sys
 
-snapshot = pathlib.Path(sys.argv[1])
-index = snapshot / "model.safetensors.index.json"
-if not index.is_file():
+def complete(snapshot: pathlib.Path) -> bool:
+    index = snapshot / "model.safetensors.index.json"
+    if not index.is_file():
+        return False
+    weight_map = json.loads(index.read_text()).get("weight_map", {})
+    return bool(weight_map) and all((snapshot / name).is_file()
+                                    for name in set(weight_map.values()))
+
+repo = pathlib.Path(sys.argv[1])
+snap_root = repo / "snapshots"
+main = (repo / "refs" / "main").read_text().strip() if (repo / "refs" / "main").is_file() else ""
+if main and complete(snap_root / main):
+    print(main)
+    raise SystemExit(0)
+complete_snaps = []
+if snap_root.is_dir():
+    complete_snaps = [p for p in snap_root.iterdir() if p.is_dir() and complete(p)]
+if complete_snaps:
+    complete_snaps.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    print(complete_snaps[0].name)
+    raise SystemExit(0)
+if main and (snap_root / main).is_dir():
+    print(main)
     raise SystemExit(1)
-weight_map = json.loads(index.read_text()).get("weight_map", {})
-raise SystemExit(0 if weight_map and all((snapshot / name).is_file()
-                                         for name in set(weight_map.values())) else 1)
+if snap_root.is_dir():
+    cands = sorted((p for p in snap_root.iterdir() if p.is_dir()),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if cands:
+        print(cands[0].name)
+        raise SystemExit(1)
+raise SystemExit(2)
 PY
 }
 
@@ -67,13 +92,17 @@ info "Cache:  $HF_CACHE_DIR"
 # Already complete? Require every shard named by the safetensors index. A
 # config.json appears early in a partial download and is not sufficient.
 if [[ -d "$MODEL_PATH" ]]; then
-    SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
-    if [[ -n "$SNAP" ]] && snapshot_complete "$MODEL_PATH/snapshots/$SNAP"; then
+    SNAP=""
+    SNAP_RC=0
+    SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
+    if [[ "$SNAP_RC" -eq 0 && -n "$SNAP" ]]; then
         ok "Already in cache: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
         info "Nothing to do. Run ./start.sh next."
         exit 0
     fi
-    warn "Partial download found; resuming."
+    if [[ -n "$SNAP" ]]; then
+        warn "Partial download found (snapshot $SNAP); resuming."
+    fi
 fi
 
 # ~99 GB plus room for the packed PLE table built on first launch (~27 GB).
@@ -111,9 +140,11 @@ fi
 
 # Verify exactly what start.sh will look for, so a broken download fails here.
 [[ -d "$MODEL_PATH" ]] || err "Download finished but $MODEL_PATH is missing."
-SNAP="$(ls "$MODEL_PATH/snapshots" 2>/dev/null | head -1 || true)"
+SNAP=""
+SNAP_RC=0
+SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
 [[ -n "$SNAP" ]] || err "No snapshot directory under $MODEL_PATH/snapshots"
-snapshot_complete "$MODEL_PATH/snapshots/$SNAP" || err "Snapshot is missing one or more indexed weight shards — the download is incomplete. Rerun this script."
+[[ "$SNAP_RC" -eq 0 ]] || err "Snapshot is missing one or more indexed weight shards — the download is incomplete. Rerun this script."
 
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 info "Next:  ./start.sh"

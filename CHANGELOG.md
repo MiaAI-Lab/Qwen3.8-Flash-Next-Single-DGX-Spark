@@ -89,6 +89,18 @@ the vLLM counters around it. Full write-up and every table in
   looser and 20 may be granted in full. `README.md` updated in the five places
   that named 16 as the shipped value.
 
+### Fixed
+
+- **Snapshot resolution picked the wrong directory** (`start.sh`,
+  `download.sh`). Both scripts took `ls "$MODEL_PATH/snapshots" | head -1`,
+  which is alphabetical by commit hash, not by state. With more than one
+  snapshot in the cache — a revision bump, or an aborted download left beside a
+  finished one — that could resolve to an incomplete tree, so `start.sh` failed
+  the shard check on a checkpoint that was actually present. Both now share a
+  `resolve_snapshot` helper that prefers `refs/main` when complete, then the
+  newest complete snapshot, and falls back to an incomplete one only so
+  `download.sh` can resume it.
+
 ### Measured
 
 - **Static K sweep, 0/1/2/3, at 1/2/4/8 streams, with FULL decode graphs
