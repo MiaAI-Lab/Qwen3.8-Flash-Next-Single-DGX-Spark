@@ -17,6 +17,8 @@
 # --- top level ---------------------------------------------------------
 !/.gitignore
 !/LICENSE
+!/LICENSES/Apache-2.0.txt
+!/THIRD_PARTY_NOTICES.md
 !/README.md
 !/CHANGELOG.md
 # the serving profile. /.env itself stays ignored: it may hold HF_TOKEN.
@@ -27,6 +29,16 @@
 
 # --- launcher support and patch generators -----------------------------
 !/files/memwatch.sh
+!/files/patch_gdn_sm121.py
+!/files/test_gdn_sm121.py
+!/bench/gdn_sm121_preflight.py
+!/docs/sm121-gdn-prefill.md
+!/files/patch_mtp_fp8_head.py
+!/files/spark_mtp_fp8_head.py
+!/files/test_mtp_fp8_head.py
+!/bench/mtp_fp8_head_preflight.py
+!/docs/sm121-mtp-fp8-head.md
+!/docs/sm121-code-benchmarks.md
 !/files/build_ple_packed_table.py
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
