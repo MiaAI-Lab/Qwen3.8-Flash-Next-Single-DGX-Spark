@@ -5,6 +5,19 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-08
+
+### Fixed
+
+- **`download.sh` exited before downloading anything** (`download.sh`). The 403
+  branch built its retry hint with a single-quoted Python default inside the
+  single-quoted `$DL_PY` shell string, which closed that string early; bash
+  re-parsed the remainder and tried to run `./download.sh}", …` as a command.
+  Every invocation — gated or not, `ABLIT=0` or `ABLIT=1` — exited with
+  `line 214: … No such file or directory` before contacting Hugging Face, so
+  the message that branch exists to print was never reachable. The default now
+  lives in a `hint` local, leaving the embedded program with double quotes only.
+
 ## 2026-09-06
 
 Overnight measurement pass through `docs/synthesis-astra-fable-2026-09-05.md`
