@@ -102,6 +102,8 @@ _CLI_REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-}"
 _CLI_PLE_OFFLOAD="${PLE_OFFLOAD:-}"
 _CLI_PORT="${PORT:-}"
 _CLI_KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+_CLI_BIND="${BIND:-}"
+_CLI_READY_TIMEOUT_S="${READY_TIMEOUT_S:-}"
 
 # Knobs that are NOT read through an explicit _CLI_ variable above still have
 # to honour "environment > .env": sourcing .env would otherwise overwrite them.
@@ -114,7 +116,9 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
                     MTP_DRAFT_VOCAB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
-                    YARN_CEILING_MODEL_LEN)
+                    YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S
+                    VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
+                    MTP_DISABLE_BLOCK_DROP)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -153,6 +157,23 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 PORT="${_CLI_PORT:-${PORT:-8888}}"            # 8888 is safe only while comfy-h3.service is disabled (it watches this port)
 IMAGE="${IMAGE:?IMAGE not set in .env}"
+# Interface the API binds to. Default is loopback: remote clients get
+# connection refused until they set BIND=0.0.0.0 (with an API key) or use an
+# ssh tunnel. See the README migration note.
+BIND="${_CLI_BIND:-${BIND:-127.0.0.1}}"
+# BIND flows raw into the generated launch script --host argument. An
+# attacker-writable .env could turn it into a shell injection; reject the
+# shell-metacharacter surface — including newline/control bytes, which would
+# otherwise split the heredoc into new shell statements.
+for _ch in '"' "'" ';' '$' '`' '\' '|' '<' '>' '&' '(' ')' '{' '}' ' ' '*' $'\n' $'\t' $'\r'; do
+    if [[ "$BIND" == *"$_ch"* ]]; then
+        err "BIND='$BIND' contains a shell metacharacter; refusing to use it."
+    fi
+done
+# Cold start is ~11 min; the first boot additionally builds the ~27 GB packed
+# PLE table. Give the readiness loop this long before it archives + removes
+# the wedged container and exits non-zero for the supervisor to retry.
+READY_TIMEOUT_S="${_CLI_READY_TIMEOUT_S:-${READY_TIMEOUT_S:-1800}}"
 
 MAX_MODEL_LEN="${_CLI_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-65536}}"
 # YaRN rope scaling: 0 = off (MAX_MODEL_LEN applies, capped at native),
@@ -205,14 +226,19 @@ MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 # Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
-PLE_GIB="${PLE_GIB:-26.82}"
+# PLE_GIB is derived from the checkpoint's own PLE shard sizes, not from a
+# constant: it subtracts the PLE shards from the on-disk checkpoint size to
+# get GPU-resident weights (start.sh:448). The shipped stock and ablit
+# snapshots are both 26.82 today; the derivation keeps a future checkpoint
+# change from silently mis-sizing the budget. An explicit PLE_GIB override
+# still wins.
+PLE_GIB="${PLE_GIB:-}"
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 REQUIRE_IDLE_GPU="${_CLI_REQUIRE_IDLE_GPU:-${REQUIRE_IDLE_GPU:-true}}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 HF_TOKEN="${HF_TOKEN:-}"
-CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
-# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
 # multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
 # <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
 # MAX_NUM_SEQS=5 that leaves keys {4,8,16}: a full 5-sequence verify batch is 20
@@ -255,6 +281,22 @@ fi
 # fusion; adds minutes to the first launch and has not been validated against
 # the PLE custom op here).
 COMPILATION_MODE="${COMPILATION_MODE:-0}"
+# Determinism env pass-through (review §5.15 / §6.2): VLLM_QSA_DET_TOPK needs
+# a compiled kernel .so and VLLM_MOE_DET_FINALIZE needs the FlashInfer
+# autotune cache-key backport — neither can ship as an env var alone. This is
+# plumbing only: default unset, and the day the image carries the kernels the
+# flags work. Unknown env vars are ignored harmlessly by older vLLM.
+VLLM_QSA_DET_TOPK="${VLLM_QSA_DET_TOPK:-}"
+VLLM_MOE_DET_FINALIZE="${VLLM_MOE_DET_FINALIZE:-}"
+# GDN decode kernel (review §5.16): the default CUDA kernel deterministically
+# hangs the engine at c≈32 with FP8 GDN projections. Shipped default is UNSET
+# for one release (so the knob exists and README documents the stall); flip to
+# triton in a later release only after a soak, so there is a bisectable state.
+GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
+# disable_eagle_block_drop (plan 2.4 / review §6.1): speculative-config lever
+# that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
+# > 0 and this knob = merge into the speculative-config JSON.
+MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -422,6 +464,32 @@ fi
 info "=== Step 2: Memory budget ==="
 KV_BYTES_PER_TOKEN=29482          # measured: 28.8 KiB/token, bf16 KV, this arch
 WEIGHT_BYTES=$(du -sb "$MODEL_PATH/$SNAPSHOT_REL/" -L | cut -f1)
+
+# PLE_GIB from the snapshot's actual PLE shard files (index.json weight_map
+# keys matching model-ple*), not from the packed table's du. An override wins.
+if [[ -z "$PLE_GIB" ]]; then
+    PLE_GIB=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY'
+import json, pathlib, sys
+snap = pathlib.Path(sys.argv[1])
+idx = snap / "model.safetensors.index.json"
+try:
+    wm = json.loads(idx.read_text())["weight_map"]
+except Exception:
+    wm = {}
+gib = 0.0
+for name in set(wm.values()):
+    if "model-ple" in name:
+        f = snap / name
+        if f.is_file():
+            gib += f.stat().st_size
+print(f"{gib/2**30:.2f}")
+PY
+)
+    PLE_GIB="${PLE_GIB:-26.82}"
+    if [[ "$PLE_GIB" != "26.82" ]]; then
+        info "  PLE_GIB derived from checkpoint PLE shards: ${PLE_GIB} GiB (not the stock 26.82)."
+    fi
+fi
 
 read -r MEM_TOTAL_GIB MEM_AVAIL_GIB MEM_USED_GIB SWAP_USED_GIB <<<"$(python3 -c "
 m={l.split(':')[0]:int(l.split()[1]) for l in open('/proc/meminfo') if ':' in l}
@@ -605,6 +673,94 @@ for f in ple_offload_layer connector worker protocol; do
 done
 ok "Patches ready."
 
+# ---------------------------------------------------------------------------
+# Quant_algo dispatch pre-flight (review §5.6 / jschmied A2b). The runtime
+# reads the embedded quantization_config inside config.json, not the sidecar
+# hf_quant_config.json. If the checkpoint declares a quant_algo the image's
+# ModelOptMixedPrecisionConfig does not dispatch, MLMP falls through to
+# UnquantizedLinearMethod and serves packed FP8 bytes as BF16 — fluent garbage
+# with zero errors. Refuse to launch instead. This launches a throwaway
+# container (~30 s, no GPU work); acceptable per launch.
+# ---------------------------------------------------------------------------
+_QUANT_PREFLIGHT_DISABLED="${QUANT_PREFLIGHT_DISABLED:-0}"
+if [[ "$DO_LAUNCH" == "true" && "$_QUANT_PREFLIGHT_DISABLED" != "1" ]]; then
+    _QALGO=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+q = None
+try:
+    q = json.loads((d / "config.json").read_text()).get("quantization_config")
+except Exception:
+    pass
+side = d / "hf_quant_config.json"
+if q is None and side.is_file():
+    try:
+        q = json.loads(side.read_text())
+    except Exception:
+        q = None
+if not q:
+    raise SystemExit(1)
+algos = q.get("quant_algo") or q.get("quant_method") or ""
+if isinstance(algos, str):
+    algos = [algos]
+print(" ".join(str(a) for a in algos if a))
+PY
+)
+    if [[ -n "$_QALGO" ]]; then
+        _DISPATCH=$(docker run --rm --entrypoint python3 \
+            -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" "$IMAGE" -c '
+import json, pathlib, sys
+cfg = json.loads(pathlib.Path("/m/config.json").read_text())
+qc = cfg.get("quantization_config")
+if not qc and pathlib.Path("/m/hf_quant_config.json").is_file():
+    qc = json.loads(pathlib.Path("/m/hf_quant_config.json").read_text())
+if not qc:
+    print(json.dumps({"declared": []})); sys.exit(0)
+algos = qc.get("quant_algo") or []
+lst = [algos] if isinstance(algos, str) else algos
+declared = sorted({str(x).upper() for x in lst})
+# The engine needs a non-empty quantized_layers mapping for MIXED_PRECISION.
+ql = (qc.get("quantization") or qc).get("quantized_layers", {})
+present = sorted({v.get("quant_algo", "").upper() for v in ql.values() if v.get("quant_algo")})
+try:
+    from vllm.model_executor.layers.quantization import get_quantization_config
+    clz = get_quantization_config("modelopt_mixed")
+    inst = clz.from_config(qc)
+    # The runtime dispatches exactly the algos found in quantized_layers;
+    # get_quant_method() returns UnquantizedLinearMethod for anything else.
+    supported = present
+    print(json.dumps({"declared": declared, "supported": supported, "in_layers": present}))
+except Exception as e:
+    print(json.dumps({"declared": declared, "error": str(e)[:200]}, default=str))
+    sys.exit(3)
+' 2>/dev/null || echo "")
+        if [[ -z "$_DISPATCH" ]]; then
+            warn "quant_algo pre-flight: image introspection failed (offline / older image); skipping."
+            warn "     Checkpoint declares quant_algo: $_QALGO"
+        else
+            _SUPPORTED=$(echo "$_DISPATCH" | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("supported", [])))' 2>/dev/null || echo "")
+            _ERROR=$(echo "$_DISPATCH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error", ""))' 2>/dev/null || echo "")
+            if [[ -n "$_ERROR" ]]; then
+                warn "quant_algo pre-flight: image rejected the checkpoint config ($_ERROR); skipping."
+            elif [[ -n "$_SUPPORTED" ]]; then
+                _MISSING=""
+                for _a in $_QALGO; do
+                    _up=$(echo "$_a" | tr '[:lower:]' '[:upper:]')
+                    if ! grep -q "$_up" <<<"$_SUPPORTED"; then
+                        _MISSING="$_MISSING $_a"
+                    fi
+                done
+                if [[ -n "$_MISSING" ]]; then
+                    err "quant_algo $_MISSING declared by the checkpoint is not dispatched by this image."
+                    err "     The image's ModelOptMixedPrecisionConfig falls back to UnquantizedLinearMethod for unrecognized algos — silent garbage. Checkpoint/image mismatch."
+                else
+                    info "quant_algo pre-flight: checkpoint algos ($_QALGO) dispatched by this image."
+                fi
+            fi
+        fi
+    fi
+fi
+
 # The Keys splice leaves the PLE n-gram shards stock, so the packed table is
 # shared with the Mia checkpoint instead of rebuilt (~27 GiB). Read that from the
 # checkpoint's own metadata rather than assuming it: if a future ablit ever
@@ -615,6 +771,14 @@ if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
             "$MODEL_PATH/$SNAPSHOT_REL/ABLIT_META.json" 2>/dev/null; then
         PLE_CACHE_ID="$STOCK_MODEL_ID"
         info "ABLIT=1: ABLIT_META.json reports edit_ple=false; reusing packed PLE cache for $STOCK_MODEL_ID"
+        # INTERIM, plan 2.1: the edit_ple flag does NOT prove PLE identity — the
+        # review found 17/34 PLE shards genuinely differ between the stock and
+        # ablit snapshots, so reuse can serve wrong weights today. Cut to the
+        # real identity check (download.sh 0.9 sha256 state, else sampled
+        # checksum) before trusting ABLIT=1 long-term.
+        warn "ABLIT=1: PLE reuse is keyed on edit_ple=false ONLY (interim). The review"
+        warn "     found 17/34 PLE shards genuinely differ from stock — verify shard"
+        warn "     identity before trusting ABLIT=1 (plan 2.1 replaces this check)."
     else
         warn "ABLIT=1: ABLIT_META.json does not report edit_ple=false."
         warn "     Building a separate packed PLE table for $MODEL_ID (~27 GiB)."
@@ -660,11 +824,92 @@ VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
+# MTP legality guard (review §5.3 / §6.1): legal k set derives from the
+# checkpoint's attention block size and the QSA ring compress ratio —
+#   capacity = compress_ratio * ceil((compress_ratio + k) / compress_ratio)
+#   must divide block_size.
+# Source of truth for block_size is the ENGINE's derivation, not our guess:
+# introspect it with a throwaway container that imports the model module and
+# prints the derived block size, cached keyed on the snapshot hash. If the
+# introspection cannot run (offline / old image), fall back to the known-good
+# table {0,2,3,4,9..12} for block 848 with a WARN. k=1 is rejected separately:
+# it is strictly dominated (same fixed cache-block cost as k=2, half the gain).
+_MTP_CACHE_DIR="$HOME/.cache/vllm/ple_cache"
+if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    _MTP_BLOCK=""; _MTP_CR=""; _MTP_INTRO_SRC="fallback"
+    _MTP_INTRO_FILE="$_MTP_CACHE_DIR/mtp-ring-$(printf '%s' "$SNAP" | cut -c1-16)"
+    if [[ -r "$_MTP_INTRO_FILE" ]]; then
+        read -r _MTP_BLOCK _MTP_CR < "$_MTP_INTRO_FILE" && _MTP_INTRO_SRC="cache"
+    fi
+    if [[ -z "$_MTP_BLOCK" ]]; then
+        # Best-effort; any failure falls through to the known-good table.
+        _MTP_INTRO=$(docker run --rm -v "$MODEL_PATH/$SNAPSHOT_REL:/m:ro" \
+            --entrypoint python3 "$IMAGE" -c '
+import json, importlib, math, pathlib, sys
+cfg = json.loads(pathlib.Path("/m/config.json").read_text())
+tc = cfg.get("text_config", cfg)
+cr = int(tc.get("qsa_compress_ratio", tc.get("compress_ratio", 4)))
+bs = None
+for mod in ("vllm.models.qwen3_8_flash_next.nvidia.qsa",
+            "vllm.models.qwen3_8_flash_next.nvidia.attention",
+            "vllm.models.qwen3_8_flash_next.nvidia.ops.qsa"):
+    try:
+        m = importlib.import_module(mod)
+    except Exception:
+        continue
+    for attr in ("QSA_ATTENTION_BLOCK_SIZE", "QSA_BLOCK_SIZE", "ATTENTION_BLOCK_SIZE"):
+        if getattr(m, attr, None):
+            bs = getattr(m, attr); break
+    qsa_cr = getattr(m, "QSA_RING_COMPRESS_RATIO", None)
+    if qsa_cr: cr = int(qsa_cr)
+    if bs: break
+if bs is None:
+    bs = 0
+print(f"{int(bs)} {cr}")
+' 2>/dev/null || true)
+        if [[ -n "$_MTP_INTRO" ]]; then
+            read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_INTRO"
+            [[ -n "$_MTP_BLOCK" && -n "$_MTP_CR" ]] && _MTP_INTRO_SRC="introspect" \
+                || { _MTP_BLOCK=""; _MTP_CR=""; }
+        fi
+    fi
+    if [[ -z "$_MTP_BLOCK" || -z "$_MTP_CR" || "$_MTP_BLOCK" == "0" ]]; then
+        _MTP_BLOCK=848; _MTP_CR=4; _MTP_INTRO_SRC="fallback"
+        warn "MTP legality: engine introspection unavailable; using the known-good table"
+        warn "     for block 848, compress ratio 4: legal k = {0,2,3,4,9..12}."
+    elif [[ "$_MTP_INTRO_SRC" == "introspect" ]]; then
+        mkdir -p "$_MTP_CACHE_DIR"
+        printf '%s %s\n' "$_MTP_BLOCK" "$_MTP_CR" > "$_MTP_INTRO_FILE" 2>/dev/null || true
+    fi
+    # Legal iff the ring capacity for THIS k divides block_size:
+    #   capacity = compress_ratio * ceil((compress_ratio + k) / compress_ratio)
+    # The single computation covers any k (no capped enumeration).
+    _K="$MTP_NUM_SPECULATIVE_TOKENS"
+    _CAP=$(( _MTP_CR * ((_MTP_CR + _K + _MTP_CR - 1) / _MTP_CR) ))
+    _MTP_LEGAL=1
+    (( _MTP_BLOCK % _CAP == 0 )) && _MTP_LEGAL=0
+    if [[ "$_MTP_LEGAL" == "1" ]]; then
+        err "MTP_NUM_SPECULATIVE_TOKENS=$_K is illegal for block ${_MTP_BLOCK}, compress ratio ${_MTP_CR} ($_MTP_INTRO_SRC): illegal k hard-fails the engine at config validation. Use a legal k (shipped default 3)."
+    fi
+    if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 1 ]]; then
+        err "MTP_NUM_SPECULATIVE_TOKENS=1 is strictly dominated: same fixed cache-block cost as k=2, half the decode gain. Use 2, 3 or 4."
+    fi
+    # --async-scheduling with MTP > 0 silently corrupts n-grams (jschmied:
+    # "no benchmark reveals it"). Match the bare flag after the 0.2 word-split
+    # and any "--async-scheduling=..." value.
+    if [[ "$EXTRA_VLLM_ARGS" == *"--async-scheduling"* ]]; then
+        err "EXTRA_VLLM_ARGS contains --async-scheduling while MTP is on: silent n-gram corruption (jschmied). Remove --async-scheduling."
+    fi
+fi
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _SPEC_ARGMAX=""
     # get_top_tokens() is the only path that reads the reduced head; the
     # speculator calls it only under use_local_argmax_reduction.
     [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
+    # disable_eagle_block_drop (vllm#53388, plan 2.4): removes MTP's fixed
+    # prefix-cache-block back-off per turn. Merged the same way as the other
+    # scalars; a vLLM that does not know the key ignores it harmlessly.
+    [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -708,8 +953,22 @@ if [[ -n "$_CG_SIZES" ]]; then
 else
     VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
 fi
-[[ -n "$EXTRA_VLLM_ARGS" ]] && VLLM_ARGS+=("$EXTRA_VLLM_ARGS")
+# EXTRA_VLLM_ARGS is word-split with shell-word semantics, so quoting inside
+# the value is not supported (same contract as EXTRA_DOCKER_ARGS).
+[[ -n "$EXTRA_VLLM_ARGS" ]] && { read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"; VLLM_ARGS+=("${_EXTRA_VLLM[@]}"); }
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
+
+# Non-loopback bind with no api key = the whole network the box is on can
+# reach an unauthenticated unfiltered model. Warn, do not refuse (this is
+# exactly the override users opt into).
+if [[ "$BIND" != "127.0.0.1" && "$BIND" != "::1" && "$BIND" != "localhost" ]]; then
+    if ! [[ "$EXTRA_VLLM_ARGS" == *"--api-key"* ]]; then
+        warn "BIND=$BIND is not loopback and no --api-key appears in EXTRA_VLLM_ARGS:"
+        warn "     the API is reachable on every interface this box has:"
+        warn "     $(hostname -I)"
+        warn "     Serve with --api-key set, or use an ssh tunnel."
+    fi
+fi
 
 info ""
 info "Config (single Spark, TP=1):"
@@ -727,7 +986,7 @@ info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
-info "  Port:       $PORT"
+info "  Port:       $PORT  (bind $BIND)"
 info ""
 
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
@@ -738,15 +997,21 @@ docker run \\
     --gpus all --network host --ipc host \\
     --cap-add SYS_NICE --cap-add SYS_PTRACE --ulimit memlock=-1 --ulimit stack=67108864 \\
     --memory ${CONTAINER_MEM_GIB}g --memory-swap ${CONTAINER_MEM_GIB}g \\
+    --log-opt max-size=50m --log-opt max-file=3 \\
     -e HF_HUB_OFFLINE=1 \\
     -e TRANSFORMERS_OFFLINE=1 \\
     -e VLLM_PLE_CPU_OFFLOAD=1 \\
     -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
     -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    -e MAX_JOBS=2 \\
+    -e FLASHINFER_NVCC_THREADS=1 \\
+    ${VLLM_QSA_DET_TOPK:+-e VLLM_QSA_DET_TOPK=$VLLM_QSA_DET_TOPK} \\
+    ${VLLM_MOE_DET_FINALIZE:+-e VLLM_MOE_DET_FINALIZE=$VLLM_MOE_DET_FINALIZE} \\
+    ${GDN_DECODE_KERNEL:+-e VLLM_GDN_DECODE_KERNEL=$GDN_DECODE_KERNEL} \\
     ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
     ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
     -e HF_HOME=/root/.cache/huggingface \\
-    ${HF_TOKEN:+-e HF_TOKEN=$HF_TOKEN} \\
+    ${HF_TOKEN:+-e HF_TOKEN=\$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
@@ -762,11 +1027,14 @@ docker run \\
     $IMAGE \\
     $MODEL_ID \\
     $VLLM_ARGS_STR \\
-    --host 0.0.0.0 \\
+    --host $BIND \\
     --port $PORT
 LAUNCH_EOF
 chmod +x "$LAUNCH_SCRIPT"
 cp "$LAUNCH_SCRIPT" "$SCRIPT_DIR/.last_launch.sh"
+# The copy must not be world-readable: it can still carry config data even
+# though the HF_TOKEN value itself is resolved at exec time above.
+chmod 600 "$SCRIPT_DIR/.last_launch.sh"
 
 if ! $DO_LAUNCH; then
     info "--no-launch: command written to .last_launch.sh"
@@ -781,6 +1049,15 @@ fi
 info "=== Step 6: Launch ==="
 mkdir -p "$SCRIPT_DIR/logs/archive"
 ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
+# Keep the newest 20 sets in logs/archive/, then drop the oldest. A set is a
+# timestamp prefix with -container.log / -memwatch.log / (possibly
+# -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
+# without a prune the archive grows forever and threatens the checkpoint
+# disk cache.
+ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+    _set="${f%-container.log}"
+    rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" 2>/dev/null || true
+done
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
     docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
@@ -792,9 +1069,9 @@ bash "$LAUNCH_SCRIPT"
 rm -f "$LAUNCH_SCRIPT"
 ok "Container $CONTAINER_NAME started."
 
-# Kill the previous watchdog (if any), archive its log (the redirect below
-# would overwrite it), and start a fresh one.
-pkill -f "memwatch.sh $CONTAINER_NAME" 2>/dev/null || true
+# Start the watchdog via the shared helper start.sh and supervise.sh both
+# call, so the invocation cannot drift. It kills the previous memwatch, runs
+# memwatch in the background, and echoes the log path.
 MEMWATCH_LOG="$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log"
 if [[ -s "$MEMWATCH_LOG" ]]; then
     mv "$MEMWATCH_LOG" "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-memwatch.log"
@@ -802,15 +1079,30 @@ if [[ -s "$MEMWATCH_LOG" ]]; then
 fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
     MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
-    nohup bash "$SCRIPT_DIR/files/memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB" \
-    > "$MEMWATCH_LOG" 2>&1 &
+    bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
 ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
 LOGPID=$!
+WAIT_START=$(date +%s)
 while true; do
     sleep 10
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - WAIT_START))
+    if [[ "$ELAPSED" -gt "$READY_TIMEOUT_S" ]]; then
+        kill $LOGPID 2>/dev/null || true
+        echo ""
+        err "Readiness timed out after ${ELAPSED}s (>READY_TIMEOUT_S=${READY_TIMEOUT_S})."
+        err "Container was wedged before /health; archiving, removing, and exiting non-zero."
+        docker logs --tail 100 "$CONTAINER_NAME" 2>&1 || true
+        # Archive + remove the wedged container. A timed-out container left
+        # Restarting in systemd's eyes would be relaunched by the supervisor
+        # while the wedged one still holds the GPU/port name.
+        docker logs "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-timeout.log" 2>&1 || true
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        exit 1
+    fi
     if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}\$"; then
         kill $LOGPID 2>/dev/null || true
         echo ""
@@ -827,10 +1119,13 @@ while true; do
     if [[ "$CODE" == "200" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""
-        ok "vLLM ready on port $PORT (TP=1, single Spark)."
+        ok "vLLM ready on port $PORT (TP=1, single Spark) after ${ELAPSED}s."
         docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "GPU KV cache size|Available KV cache|Maximum concurrency" | tail -3 || true
         info ""
         info "Stop:  ./stop.sh   (graceful; --force to skip the SIGTERM wait)"
         break
+    fi
+    if (( ELAPSED % 60 < 10 )); then
+        echo "  ...waiting for readiness: ${ELAPSED}s elapsed, last /health code $CODE"
     fi
 done
