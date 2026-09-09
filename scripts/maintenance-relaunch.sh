@@ -39,7 +39,7 @@ log "maintenance window opened (touched $STOPPING_FLAG)"
 _drained=0
 _drain_start=$(date +%s)
 while true; do
-    _r=$(curl -s -m 5 "$BASE/metrics" 2>/dev/null | grep -oE '^vllm:num_requests_running [0-9]+' | tail -1 | awk '{print $2}' || echo 0)
+    _r=$(curl -s -m 5 "$BASE/metrics" 2>/dev/null | grep -oE '^vllm:num_requests_running(\{[^}]*\})? [0-9]+' | grep -oE '[0-9]+$' || echo 0)
     _r="${_r:-0}"
     if [[ -z "$_r" || "$_r" == "0" ]]; then
         _drained=1

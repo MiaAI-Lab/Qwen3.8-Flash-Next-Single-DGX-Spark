@@ -80,10 +80,11 @@ stop_container() {  # <reason>
         || docker kill "$CONTAINER" >/dev/null 2>&1
     echo "$(date '+%F %T') stopped (NV_ERR_NO_MEMORY seen since watchdog start: $nvrm_total)"
     # The marker line is how the supervisor tells an emergency stop from a
-    # clean stop.sh: only the emergency path emits it (review §4.1).
+    # clean stop.sh: only the emergency path emits it (review §4.1). It goes
+    # into the live log BEFORE the final archive copy so both carry it.
     echo "WATCHDOG EMERGENCY STOP $1" >> "$OWN_LOG"
-    # Alert after stop_container so the reason carries the final state; a
-    # failure here must not change control flow (review §4.6).
+    # Alert after the stop so the reason carries the final state; a failure
+    # here must not change control flow (review §4.6).
     if [[ -x "$REPO_DIR/scripts/alert.sh" ]]; then
         "$REPO_DIR/scripts/alert.sh" "memwatch emergency stop: $1" || true
     fi

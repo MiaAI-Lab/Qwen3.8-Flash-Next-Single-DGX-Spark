@@ -83,7 +83,10 @@ log()   { echo "$(date '+%F %T') [supervise] $*"; }
 
 state_get() {  # <key> <default>
     local k="$1" d="${2:-}"
-    grep -E "^${k}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || echo "$d"
+    local v
+    v=$(grep -E "^${k}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+    [[ -n "$v" ]] || v="$d"
+    printf '%s' "$v"
 }
 state_set() {  # <key> <value>
     local k="$1" v="$2"
@@ -229,11 +232,9 @@ emergency_stop() {
     rm -f "$STOPPING_FLAG" 2>/dev/null || true
     # Roll the window BEFORE counting so a stale-window boundary cannot reset
     # the increment that just happened on the same tick.
-    if [[ -n "$(state_get window_start)" ]]; then
-        local ws=$(state_get window_start)
-        if (( $(date +%s) - ws > BREAKER_WINDOW_S )); then
-            state_set window_start ""
-        fi
+    local ws; ws=$(state_get window_start "")
+    if [[ -n "$ws" ]] && (( $(date +%s) - ws > BREAKER_WINDOW_S )); then
+        state_set window_start ""
     fi
     if [[ -z "$(state_get window_start)" ]]; then
         state_set window_start "$(date +%s)"
