@@ -15,7 +15,7 @@ model: text, images and video all work out of the box (see below). Nothing here 
 
 ```
 cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
-./download.sh              # fetch the ~99 GiB checkpoint (resumable)
+./download.sh              # fetch the ~99 GiB checkpoint (resumable, sha256-verified)
 ./start.sh                 # ~10-12 min to /health; serves on :8888
 ./stop.sh                  # container + watchdog, graceful
 ```
@@ -29,6 +29,13 @@ command without running anything. `./stop.sh` sends SIGTERM and waits up to
 `STOP_TIMEOUT` (default 30 s) so vLLM can unlink its POSIX shared memory —
 the container runs with `--ipc host`, so segments it leaves behind leak onto
 the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
+
+**Migration — the API now binds to loopback.** The API previously listened on
+every interface (`--host 0.0.0.0`); it now binds `127.0.0.1` by default
+(`BIND`). Remote clients get connection refused until you either set
+`BIND=0.0.0.0` in `.env` — and serve with an `--api-key` in `EXTRA_VLLM_ARGS`,
+or `start.sh` prints a WARN with the exposed interfaces — or reach the box
+through an ssh tunnel.
 
 ## Measured profile
 
@@ -469,8 +476,10 @@ access — this paragraph is a summary, and the repo's own terms are what bind.
 
 Safety refusals are removed in this checkpoint, which moves the guardrails onto
 you: filtering, human review and access control are yours to supply. That
-matters more here than on stock, because `start.sh` binds the server to
-`0.0.0.0` — anything that can reach the port can reach an unfiltered model.
+matters more here than on stock, because if you serve it to the network
+(`BIND=0.0.0.0` without an `--api-key`, which `start.sh` warns about), anything
+that can reach the port can reach an unfiltered model. The shipped default
+binds loopback only.
 
 The abliteration splice is by **Keys (drowzeys)**, built on MiaAI Lab's
 single-Spark NVFP4 recipe over Qwen/Alibaba's Qwen3.8-Flash-Next. See the
@@ -664,6 +673,117 @@ bound (1.4 MiB/token at ~26 tok/s, the rate at the time, is only ~36 MB/s). The 
 ~2 GiB of unified memory no longer wasted on readahead that is thrown away,
 which is what funds the KV pool `KV_TARGET_GIB` asks for.
 
+## Unattended operation
+
+The repo ships a supervisor that closes the detect → stop → recover loop the
+base launcher leaves open: the container has **no docker `--restart`**
+(deliberately — a docker-restarted container comes back *unwatched*, with
+memwatch dead and stale shm). `scripts/supervise.sh` is the single state
+machine: it keeps the container up, keeps memwatch up, health-probes once a
+minute (5 consecutive failures → emergency stop → relaunch with backoff), and
+holds a circuit breaker (3 emergencies in 2 h → OPEN, alert-only until a human
+re-arms). Its state survives in `logs/supervisor.state`; the breaker resets on
+host reboot.
+
+Install (all USER units, exact commands):
+
+```
+mkdir -p ~/.config/systemd/user
+cp systemd/qwen38-flash-supervisor.service \
+   systemd/qwen38-flash-maintenance.service \
+   systemd/qwen38-flash-maintenance.timer \
+   systemd/qwen38-flash-heartbeat.timer \
+   "systemd/qwen38-flash-supervisor-failure@.service" \
+   ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now qwen38-flash-supervisor
+systemctl --user enable --now qwen38-flash-maintenance.timer
+systemctl --user enable --now qwen38-flash-heartbeat.timer
+loginctl enable-linger "$USER"     # user units start at boot without a login
+```
+
+The units assume the checkout lives at `~/qwen38-flash-next` (the `%h`
+expansion). If it does not, adjust the `WorkingDirectory=` and `ExecStart=`
+paths in the copied files to your checkout. `systemd-analyze verify` reports
+"not executable / No such file or directory" solely because of that path
+mismatch before editing; the unit files themselves are valid.
+
+What you get:
+
+- **`qwen38-flash-supervisor.service`** — the loop, `Restart=on-failure` (safe:
+  the breaker state lives in the state file, not in systemd). `OnFailure=`
+  fires `alert.sh`.
+- **`qwen38-flash-maintenance.timer`** — weekly graceful relaunch (Sun 04:00):
+  drains in-flight requests via `vllm:num_requests_running` (up to
+  `MAINT_DRAIN_S`, default 600 s), restarts, `smoke-test.sh`, then releases the
+  `logs/stopping` handshake flag. The slow per-request memory growth (2–3 GiB,
+  never returned) is the reason: it converts a known maintenance item into an
+  unscheduled outage otherwise.
+- **`qwen38-flash-heartbeat.timer`** — daily unconditional heartbeat: uptime,
+  restart count, `MemAvailable`, disk free. Unconditional on purpose: silence
+  reads as "running".
+- **`alert.sh`** — generic webhook (`ALERT_WEBHOOK` in `.env`; payload
+  `{hostname,timestamp,message,container,mem_available}`; identical messages
+  collapse to one per 15 min). Example URLs: ntfy (`https://ntfy.sh/<topic>`)
+  or a telegram-bridge webhook. No-op with a WARN when unset — out-of-the-box
+  stays silent-safe. A deliberately failing alert proves the path works:
+  `ALERT_WEBHOOK=http://127.0.0.1:1 ./scripts/alert.sh test`.
+- The supervisor warns at most once/hour if `comfy-h3.service` is active
+  (it steals the API port), cleans leaked `/dev/shm` segments between cycles
+  (only when no vLLM/sglang container runs), and rotates the memwatch log
+  (copy-truncate at 10 MB) plus prunes `logs/archive/` to the newest 20 sets.
+
+Host steps (documented, not automated — no sudo in-repo):
+
+- `loginctl enable-linger <user>` (above).
+- Verify docker is enabled: `systemctl is-enabled docker`.
+- `sudo systemctl disable --now comfy-h3.service` — a reboot with it enabled
+  means the server cannot take its port.
+- Disable unattended-upgrades' automatic reboot: remove
+  `Unattended-Upgrade::Automatic-Reboot` from `/etc/apt/apt.conf.d/50unattended-upgrades`
+  (an auto-reboot at 02:00 with no linger = down until morning). Pin the NVIDIA
+  driver so a bump under a running server is not a forced outage.
+- NTP on: `timedatectl set-ntp true` (log correlation across
+  memwatch/journal/archives is worthless without synced clocks).
+
+**Maintenance / stop handshake:** `stop.sh` and the maintenance wrapper signal
+the supervisor through a flag file (`logs/stopping`). While that file exists
+the supervisor waits instead of relaunching (a crash between stop and healthy
+leaves the flag in place — correct: the human gets the alert, and the next
+supervisor tick adopts whatever is running). The flag does not pin the box
+down forever: a reboot clears it, and the supervisor reclaims a flag older
+than `STOPPING_MAX_AGE_S` (default 2 h, far longer than any maintenance
+window) with an alert, so an abandoned maintenance cannot turn into a
+permanent outage. Manual stops for real maintenance: `./stop.sh` then `touch
+logs/stopping` (or run `maintenance-relaunch.sh` directly, which does the
+whole window).
+
+**Important:** the supervisor treats a >2 h old flag (or any flag after a
+reboot) as abandoned and **auto-relaunches**. For planned downtime approaching
+2 h, or any maintenance that includes a reboot, stop the supervisor unit
+itself so it cannot act on your behalf:
+
+```
+systemctl --user stop qwen38-flash-supervisor
+# … maintenance …
+systemctl --user start qwen38-flash-supervisor
+```
+
+(The maintenance and heartbeat timers are harmless while the supervisor is
+stopped — the maintenance wrapper would fail its smoke test into an alert, so
+stop `qwen38-flash-maintenance.timer` too if the machine will be off across a
+Sunday 04:00.)
+
+**Re-arming the breaker:** the circuit breaker is file-backed
+(`logs/supervisor.state`). To re-arm after a genuine human fix:
+`rm -f logs/stopping logs/supervisor.state` — or reboot the host
+(`BREAKER_RESET_ON_BOOT=1` default: a reboot is a human's hand on the box, and
+it also clears a stale `logs/stopping`).
+
+**Alert negative-test:** set `ALERT_WEBHOOK` to an unroutable URL once and
+confirm the failure is visible in `logs/alert.log` — that is the intended way
+to prove the path works.
+
 ## Safety rules
 
 Each of these cost a hard host hang or a dead server during bring-up.
@@ -772,6 +892,24 @@ with `--ipc host`. vLLM does not honour SIGTERM while still loading weights;
 a stop in that phase ends in the SIGKILL. `start.sh` archives the previous
 container and watchdog logs the same way before it relaunches.
 
+Two 2026-09-09 additions tie the watchdog into the supervisor loop:
+
+- **Emergency marker + alert.** The emergency stop path now writes
+  `WATCHDOG EMERGENCY STOP <reason>` as its last log line and calls
+  `scripts/alert.sh` (a no-op when `ALERT_WEBHOOK` is unset). Clean
+  `stop.sh` paths produce neither, so the supervisor can tell an emergency
+  from a human stop. Memwatch never restarts the container — the supervisor
+  owns relaunches.
+- **`LEAK TREND` line.** Over the first 10 minutes it records the `driver`
+  figure as a baseline; once the run's `driver` has grown 4 GiB above it
+  (`MEMWATCH_TREND_GIB`), it logs a `LEAK TREND` line once per day. This is
+  the documented 2–3 GiB per-request growth the CUDA caching allocator never
+  returns showing up as a trend; the response is the scheduled maintenance
+  relaunch, not a new alarm.
+- Memwatch log rotation is copy-truncate (safe with the fd memwatch keeps
+  open): `scripts/memwatch-rotate.sh` copies past-10 MB and truncates, and
+  prunes `logs/archive/` to the newest 20 sets.
+
 ## Sanity test
 
 ```
@@ -794,15 +932,31 @@ buffer or missing quant scales) — see the patch notes below.
 ## Layout
 
 - `download.sh` — fetches the checkpoint into the Hugging Face cache
-  (resumable; honours `HF_TOKEN` for gated repos). `ABLIT=1` downloads the
-  full Keys ablit snapshot after you accept the Hugging Face terms. Uses the
-  host's `huggingface_hub` if present, otherwise the container image.
+  (resumable; honours `HF_TOKEN` for gated repos; sha256-verifies every LFS
+  blob against the paginated HF tree manifest unless `VERIFY_SHA256=0`).
+  `ABLIT=1` downloads the full Keys ablit snapshot after you accept the Hugging
+  Face terms. Uses the host's `huggingface_hub` if present, otherwise the
+  container image.
 - `start.sh` — launcher: derives the GPU budget from live memory under the
   `HOST_RESERVE_GIB` cap, builds the packed PLE table on first run,
   regenerates the patched vLLM files, archives the previous run's logs, starts
-  the container and `files/memwatch.sh`.
+  the container and `files/memwatch.sh`, waits for `/health` with a heartbeat
+  and a `READY_TIMEOUT_S` deadline.
 - `stop.sh` — stops the watchdog, then the container (gracefully by default);
   reports leftover `/dev/shm` segments without deleting them.
+- `scripts/smoke-test.sh` — per-launch verification: health, model metadata,
+  coherent generation, temperature-0 determinism (WARN-only), decode speed
+  (≥15 tok/s), a tool-call round-trip (settles `qwen3_coder` vs `qwen3_xml`),
+  and `/metrics`.
+- `scripts/supervise.sh` + `systemd/qwen38-flash-*.service/timer` — the 24/7
+  supervisor, weekly maintenance relaunch, daily heartbeat, and `OnFailure=`
+  alert target (see [Unattended operation](#unattended-operation)).
+- `scripts/health-probe.sh` — stateless single-shot probe (health +
+  generation, `completion_tokens > 0`) used by the supervisor.
+- `scripts/alert.sh` — generic webhook POST (`ALERT_WEBHOOK`), rate-limited,
+  never changes control flow on failure.
+- `scripts/memwatch-rotate.sh` — copy-truncates the memwatch log at 10 MB and
+  prunes `logs/archive/` to the newest 20 sets.
 - `files/patch_ple_layer.py`, `files/patch_modelopt_mxfp8.py`,
   `files/patch_ple_offload.py` — generators that rewrite the patched vLLM
   files from pristine `*.orig` / `orig/` copies on **every** launch. Those
