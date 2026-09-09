@@ -31,16 +31,35 @@ as promises.
   (`spec_decode_num_accepted_tokens_per_pos_total`) and rebuild from your own
   output if it drops under ~88% coverage.
 
-  Measured live on this host 2026-09-09, same image/checkpoint/settings
-  (262k native, MTP 3, FP8 KV, BF16 SSM, 2,048 chunks, `MAX_NUM_SEQS=4`),
-  code prompt, thinking off, temperature 0, 200-token cap, non-streaming,
-  one launch per arm: full head 32.0/41.0/44.5 tok/s (median 41.0, warm 42.8)
-  vs shipped 47k vocab 53.9/53.4/51.8 (median **53.4**, after one 37.7 warmup)
-  — **+30% median (+25% warm-to-warm)**, matching the 65k publication (+25.5%)
-  and the byte model. Server log confirms the mechanism (47,149/248,320 rows,
-  head 1.18 -> 0.22 GiB, 2.88 GiB saved per step); KV pool 1,154,019 -> 
-  1,079,330 tokens (within restart variation). Spot-check: tuned answer is a
-  correct `deep_merge` that parses as Python, thinking off.
+  Measured live on this host 2026-09-09 with `bench/sweep.py` driving
+  sparkDash (prose and code, 600 tokens, S=1/2/4/8, three repeats each,
+  alternating order), one launch per arm at `MAX_NUM_SEQS=8` with everything
+  else identical (262k native, MTP 3, FP8 KV, BF16 SSM, 2,048 chunks, FULL
+  decode graphs). Aggregate decode tok/s, means of three:
+
+  | | baseline (full head) | tuned (47k vocab) | change |
+  |---|---|---|---|
+  | code, 1 stream | 50.6 | **61.5** | **+21.5%** |
+  | code, 2 streams | 89.5 | **102.2** | +14.2% |
+  | code, 4 streams | 144.5 | **158.9** | +10.0% |
+  | code, 8 streams | 231.7 | **252.6** | +9.0% |
+  | prose, 1 stream | 40.9 | **46.8** | +14.4% |
+  | prose, 2 streams | 65.6 | **74.0** | +12.8% |
+  | prose, 4 streams | 98.0 | **112.2** | +14.5% |
+  | prose, 8 streams | 149.4 | **162.0** | +8.4% |
+
+  **+13.1% mean across the eight cells.** Every tuned cell's worst repeat beats
+  the baseline's best (S=4 is the noisiest: tuned code 150.7–165.8, prose
+  106.2–118.0). The gain is all step time — code 75.8→62.5 ms at one stream,
+  prose 72.8→60.6 — with tokens per step unchanged (code 3.86, prose ~2.8):
+  the byte saving with acceptance preserved, exactly the mechanism the 65k
+  work predicted. Peak single reps: 62.3 tok/s code single-stream, 261.9
+  aggregate at 8 streams. An earlier direct-curl check agreed (+30% median on
+  a 200-token code prompt). Server log confirms 47,149/248,320 rows and
+  2.88 GiB saved per step; KV pool 1,164,270 → 1,177,451 tokens (restart
+  variation); `MemAvailable` min 12.2 GiB, 0 `NV_ERR_NO_MEMORY`, no watchdog
+  event on either arm. Raw rows: `logs/sweep-pr39-{baseline,tuned}.jsonl`
+  (local, same convention as the overnight file).
 
 ### Fixed
 

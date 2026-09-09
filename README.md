@@ -205,6 +205,9 @@ restore full-vocabulary drafting. One honest caveat: the shipped file was built
 from host code and docs, not from the model's own output, so non-code traffic
 (especially Chinese, where the measured 65k vocab covered only 50.6%) may draft
 worse than the numbers above; correctness is unaffected, only speed.
+Live A/B of the shipped file against the full head (sparkDash prose+code
+sweep, S=1/2/4/8, three repeats) measured +13.1% mean across eight cells with
+acceptance unchanged — full table in the CHANGELOG 2026-09-09 entry.
 
 **Prefill**, same chunk width as the shipped column below:
 
