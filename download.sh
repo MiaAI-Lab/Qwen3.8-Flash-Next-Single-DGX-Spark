@@ -292,7 +292,7 @@ PY
                     | sed -nE 's/.*<([^>]*)>; rel="next".*/\1/p' || true)
                 rm -f "$headers"
             fi
-            [[ -n "$url" ]] && url=$(echo "$url")  # strip any accidental whitespace
+            [[ -n "$url" ]] && url=$(printf '%s' "$url" | tr -d '[:space:]')
         done
         [[ -s "$cache" ]] || return 1
         echo "$total"
