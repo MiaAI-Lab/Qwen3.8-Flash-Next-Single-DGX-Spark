@@ -238,7 +238,8 @@ REQUIRE_IDLE_GPU="${_CLI_REQUIRE_IDLE_GPU:-${REQUIRE_IDLE_GPU:-true}}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 HF_TOKEN="${HF_TOKEN:-}"
-CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"   # NONE for eager debug
+# CUDA graph capture sizes for decode. vLLM's default list is [1,2,4] plus
 # multiples of 8, each rounded up to a multiple of (1+MTP) and then filtered to
 # <= (1+MTP)*MAX_NUM_SEQS before it becomes a decode key. At MTP=3,
 # MAX_NUM_SEQS=5 that leaves keys {4,8,16}: a full 5-sequence verify batch is 20
@@ -700,10 +701,23 @@ if q is None and side.is_file():
         q = None
 if not q:
     raise SystemExit(1)
-algos = q.get("quant_algo") or q.get("quant_method") or ""
-if isinstance(algos, str):
-    algos = [algos]
-print(" ".join(str(a) for a in algos if a))
+# Per-layer algos are what the image dispatches (get_quant_method); the
+# top-level quant_algo/quant_method (e.g. MIXED_PRECISION) names the config
+# class, not a dispatchable algo, so only when no quantized_layers exist is
+# the top-level value checked.
+ql = (q.get("quantization") or q).get("quantized_layers", {})
+algos = set()
+for v in ql.values():
+    a = v.get("quant_algo") if isinstance(v, dict) else None
+    if a:
+        algos.add(str(a).upper())
+if not algos:
+    top = q.get("quant_algo") or q.get("quant_method") or ""
+    if isinstance(top, str):
+        algos.add(top.upper())
+    elif isinstance(top, list):
+        algos |= {str(a).upper() for a in top}
+print(" ".join(sorted(algos)))
 PY
 )
     if [[ -n "$_QALGO" ]]; then
@@ -746,9 +760,11 @@ except Exception as e:
                 _MISSING=""
                 for _a in $_QALGO; do
                     _up=$(echo "$_a" | tr '[:lower:]' '[:upper:]')
-                    if ! grep -q "$_up" <<<"$_SUPPORTED"; then
-                        _MISSING="$_MISSING $_a"
-                    fi
+                    _found=0
+                    for _s in $_SUPPORTED; do
+                        [[ "$_s" == "$_up" ]] && _found=1
+                    done
+                    (( _found == 0 )) && _MISSING="$_MISSING $_a"
                 done
                 if [[ -n "$_MISSING" ]]; then
                     err "quant_algo $_MISSING declared by the checkpoint is not dispatched by this image."
@@ -1043,6 +1059,10 @@ if ! $DO_LAUNCH; then
     exit 0
 fi
 
+# The generated launch script resolves $HF_TOKEN from ITS environment at exec
+# time (0.3 hygiene), so the token must actually be exported here.
+export HF_TOKEN
+
 # ---------------------------------------------------------------------------
 # 6. Launch + watchdog
 # ---------------------------------------------------------------------------
@@ -1056,7 +1076,7 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # disk cache.
 ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
-    rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" 2>/dev/null || true
+    rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
 done
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
@@ -1086,6 +1106,7 @@ info "Loading weights (~3-4 min). Following logs until ready..."
 docker logs -f "$CONTAINER_NAME" &
 LOGPID=$!
 WAIT_START=$(date +%s)
+_last_hb=0
 while true; do
     sleep 10
     NOW=$(date +%s)
@@ -1125,7 +1146,8 @@ while true; do
         info "Stop:  ./stop.sh   (graceful; --force to skip the SIGTERM wait)"
         break
     fi
-    if (( ELAPSED % 60 < 10 )); then
+    if (( NOW - _last_hb >= 60 )); then
+        _last_hb=$NOW
         echo "  ...waiting for readiness: ${ELAPSED}s elapsed, last /health code $CODE"
     fi
 done
