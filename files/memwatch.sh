@@ -79,6 +79,14 @@ stop_container() {  # <reason>
     docker stop -t "$GRACE" "$CONTAINER" >/dev/null 2>&1 \
         || docker kill "$CONTAINER" >/dev/null 2>&1
     echo "$(date '+%F %T') stopped (NV_ERR_NO_MEMORY seen since watchdog start: $nvrm_total)"
+    # The marker line is how the supervisor tells an emergency stop from a
+    # clean stop.sh: only the emergency path emits it (review §4.1).
+    echo "WATCHDOG EMERGENCY STOP $1" >> "$OWN_LOG"
+    # Alert after stop_container so the reason carries the final state; a
+    # failure here must not change control flow (review §4.6).
+    if [[ -x "$REPO_DIR/scripts/alert.sh" ]]; then
+        "$REPO_DIR/scripts/alert.sh" "memwatch emergency stop: $1" || true
+    fi
     [[ -f "$OWN_LOG" ]] && cp -f "$OWN_LOG" "$ARCHIVE_DIR/${CONTAINER}-$ts-memwatch.log"
     exit 2
 }
@@ -89,11 +97,40 @@ below_free=0
 nvrm_total=0
 nvrm_since=$(date '+%Y-%m-%d %H:%M:%S')
 cg_path=""
+# LEAK TREND (review §4.3): baseline driver figure over a post-load window,
+# then flag growth >= TREND_GIB (4) once per day. The baseline window opens
+# only after TREND_WARMUP_S — the weight-load ramp (multi-tens-of-GiB) grows
+# `driver` immediately, and a min-including-that-ramp would make every cold
+# start look like a 4 GiB leak.
+baseline_driver=""
+trend_logged_day=""
+TREND_GIB="${MEMWATCH_TREND_GIB:-4}"
+TREND_WARMUP_S="${MEMWATCH_TREND_WARMUP_S:-900}"
+TREND_BASELINE_S="${MEMWATCH_TREND_BASELINE_S:-600}"
 while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
     eval "$(awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapFree|AnonPages|Shmem|Mapped|Slab|SUnreclaim|PageTables|KernelStack):/ {
                      sub(":", "", $1); print "m_" $1 "=" $2 }' /proc/meminfo)"
     avail=$m_MemAvailable; free=$m_MemFree
     driver=$(( m_MemTotal - m_MemFree - m_Buffers - m_Cached - m_AnonPages - m_Slab - m_PageTables - m_KernelStack ))
+    if (( driver > 0 )); then
+        # Baseline window: [TREND_WARMUP_S, TREND_WARMUP_S + TREND_BASELINE_S)
+        # after memwatch start. Take the minimum driver in that post-load
+        # window, then freeze it.
+        if (( tick >= TREND_WARMUP_S && tick < TREND_WARMUP_S + TREND_BASELINE_S )); then
+            if [[ -z "$baseline_driver" || "$driver" -lt "$baseline_driver" ]]; then
+                baseline_driver="$driver"
+            fi
+        elif (( tick == TREND_WARMUP_S + TREND_BASELINE_S )) && [[ -z "$baseline_driver" ]]; then
+            baseline_driver="$driver"
+        fi
+    fi
+    if [[ -n "$baseline_driver" ]] && (( driver - baseline_driver >= TREND_GIB * 1048576 )); then
+        _today=$(date '+%F')
+        if [[ "$trend_logged_day" != "$_today" ]]; then
+            trend_logged_day="$_today"
+            echo "$(date '+%F %T') LEAK TREND: driver ${TREND_GIB} GiB above the baseline $((baseline_driver/1048576)) MiB (now $((driver/1048576)) MiB). The 2-3 GiB per-request growth is accumulating; scheduled relaunch is the response."
+        fi
+    fi
     if [[ -z "$cg_path" || ! -f "$cg_path" ]]; then
         cg_path="/sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null).scope/memory.current"
     fi
