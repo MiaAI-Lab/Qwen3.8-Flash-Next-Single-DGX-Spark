@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Weekly maintenance timer (plan 1.4): Sunday 04:00, low-traffic hour.
+# ~11 min planned downtime (the same cold start a watchdog stop costs, but
+# scheduled). The slow leak is documented but unmanaged; a scheduled relaunch
+# converts an unscheduled outage into a maintenance item.
+[Unit]
+Description=Weekly maintenance relaunch for Qwen3.8-Flash-Next
+
+[Timer]
+OnCalendar=Sun 04:00:00
+Persistent=true
+Unit=qwen38-flash-maintenance.service
+
+[Install]
+WantedBy=timers.target
