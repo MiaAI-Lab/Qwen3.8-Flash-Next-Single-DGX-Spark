@@ -236,8 +236,21 @@ MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
 # lm_head reads in an MTP-3 engine step; a 32k-row slice is 0.16 GB. Drafts
 # for tokens outside the subset are simply rejected at verification, so this
 # trades acceptance for bandwidth and cannot change what the server emits.
-# Empty disables it and the drafter keeps the full head.
+# Empty disables it and the drafter keeps the full head. Relative paths are
+# resolved against this script's directory, so the shipped
+# files/draft_vocab_en_code_47k.txt works out of the box.
 MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
+if [[ -n "$MTP_DRAFT_VOCAB" && "$MTP_DRAFT_VOCAB" != /* ]]; then
+    MTP_DRAFT_VOCAB="$SCRIPT_DIR/$MTP_DRAFT_VOCAB"
+fi
+if [[ -n "$MTP_DRAFT_VOCAB" && ! -f "$MTP_DRAFT_VOCAB" ]]; then
+    err "MTP_DRAFT_VOCAB=$MTP_DRAFT_VOCAB does not exist. Empty disables reduced-vocabulary drafting."
+fi
+if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 && -z "$MTP_DRAFT_VOCAB" ]]; then
+    warn "  MTP on with the full 248k draft head: reduced-vocabulary drafting is off."
+    warn "  Set MTP_DRAFT_VOCAB (shipped default: files/draft_vocab_en_code_47k.txt)"
+    warn "  for ~17% faster single-stream decode at unchanged accuracy (see CHANGELOG 2026-09-05)."
+fi
 # torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
 # fusion; adds minutes to the first launch and has not been validated against
 # the PLE custom op here).

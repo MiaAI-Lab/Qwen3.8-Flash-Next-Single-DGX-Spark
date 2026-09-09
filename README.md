@@ -197,6 +197,15 @@ target model verifies every drafted token — measured at 250 MGSM problems per
 language, English 94.8% vs 93.6% and Chinese 86.4% vs 86.4%. See the CHANGELOG
 entry for the full method.
 
+That win now ships as the default: `.env.sample` sets `MTP_DRAFT_VOCAB` to the
+checked-in `files/draft_vocab_en_code_47k.txt` (47,149 ids, code-tuned, 99.58%
+held-out coverage on host code+docs), and `start.sh` resolves relative paths
+against the repo and warns when MTP runs with the full head. Empty the knob to
+restore full-vocabulary drafting. One honest caveat: the shipped file was built
+from host code and docs, not from the model's own output, so non-code traffic
+(especially Chinese, where the measured 65k vocab covered only 50.6%) may draft
+worse than the numbers above; correctness is unaffected, only speed.
+
 **Prefill**, same chunk width as the shipped column below:
 
 | context | TTFT | prefill | before | change |

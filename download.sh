@@ -189,6 +189,8 @@ mkdir -p "$HF_CACHE_DIR"
 DL_PY='
 import os, sys
 from huggingface_hub import snapshot_download
+# No single quotes inside this block: it lives in a single-quoted bash string.
+DEFAULT_CMD = "HF_TOKEN=hf_... ./download.sh"
 try:
     p = snapshot_download(
         repo_id=sys.argv[1],
@@ -211,7 +213,7 @@ except Exception as e:
             "Accept the terms on that page:\n"
             f"  https://huggingface.co/{sys.argv[1]}\n"
             "Then retry with HF_TOKEN set:\n"
-            f"  {sys.argv[2] if len(sys.argv) > 2 else 'HF_TOKEN=hf_... ./download.sh'}",
+            f"  {sys.argv[2] if len(sys.argv) > 2 else DEFAULT_CMD}",
             file=sys.stderr,
         )
         sys.exit(1)

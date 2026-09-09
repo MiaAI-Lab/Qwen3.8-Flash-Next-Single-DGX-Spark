@@ -33,6 +33,10 @@
 !/files/patch_ple_offload.py
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_mtp_draft_vocab.py
+# shipped reduced draft vocabulary (47,149 ids, code-tuned). The 65k en+code
+# vocab the +25% decode win was measured with is a generated artifact and is
+# not tracked; this smaller file makes the default path work out of the box.
+!/files/draft_vocab_en_code_47k.txt
 # builds the reduced draft vocabulary the MTP patch reads. Its output is a
 # generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
 !/files/build_draft_vocab.py

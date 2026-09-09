@@ -5,6 +5,50 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-09
+
+### Changed
+
+- **Reduced-vocabulary drafting is now the shipped default** (`.env.sample`,
+  `start.sh`, `files/draft_vocab_en_code_47k.txt`). The +25% decode win from
+  2026-09-05 (76.9 -> 63.9 ms/step single-stream, 36.9 -> 46.3 tok/s) was
+  measured with `MTP_DRAFT_VOCAB` active, but the knob shipped empty, so a fresh
+  clone ran the full 248k draft head and left ~17% single-stream on the table.
+  `.env.sample` now points at the checked-in 47,149-row code-tuned vocab
+  (1.18 GiB head -> 0.22 GiB slice, ~2.9 GiB saved per MTP-3 step), `start.sh`
+  resolves relative paths against the repo, errors when the file is missing,
+  and warns when MTP runs with the full head. Empty the knob to restore full
+  drafting. Correctness is structural (rejection sampling), so the worst case
+  for poor coverage is slower decode, never wrong output.
+
+  The shipped file was built on this host from 30 MiB of host code+docs
+  (8.9M token occurrences, 47k distinct ids, 100% corpus coverage, 99.58%
+  held-out on a 80/20 split) with `files/build_draft_vocab.py`, not from the
+  wikitext+python+model-output corpus behind the measured 65k vocab (97.3%
+  model-output coverage, MGSM en 94.8% vs 93.6%, zh 86.4% vs 86.4%). Code
+  traffic should match the published gain; non-code traffic (especially
+  Chinese) may draft worse — watch per-position acceptance in `/metrics`
+  (`spec_decode_num_accepted_tokens_per_pos_total`) and rebuild from your own
+  output if it drops under ~88% coverage.
+
+  Measured live on this host 2026-09-09, same image/checkpoint/settings
+  (262k native, MTP 3, FP8 KV, BF16 SSM, 2,048 chunks, `MAX_NUM_SEQS=4`),
+  code prompt, thinking off, temperature 0, 200-token cap, non-streaming,
+  one launch per arm: full head 32.0/41.0/44.5 tok/s (median 41.0, warm 42.8)
+  vs shipped 47k vocab 53.9/53.4/51.8 (median **53.4**, after one 37.7 warmup)
+  — **+30% median (+25% warm-to-warm)**, matching the 65k publication (+25.5%)
+  and the byte model. Server log confirms the mechanism (47,149/248,320 rows,
+  head 1.18 -> 0.22 GiB, 2.88 GiB saved per step); KV pool 1,154,019 -> 
+  1,079,330 tokens (within restart variation). Spot-check: tuned answer is a
+  correct `deep_merge` that parses as Python, thinking off.
+
+### Fixed
+
+- **`download.sh` DL_PY quoting broke every checkpoint download** (the
+  `f"...{... else '...'}"` line inside the single-quoted bash string truncated
+  the Python block). The hint is now a double-quoted `DEFAULT_CMD`, so the
+  block contains zero single quotes. Same fix as open #33/#35.
+
 ## 2026-09-06
 
 Overnight measurement pass through `docs/synthesis-astra-fable-2026-09-05.md`
