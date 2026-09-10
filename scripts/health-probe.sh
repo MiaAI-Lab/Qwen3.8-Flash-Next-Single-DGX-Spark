@@ -12,19 +12,36 @@
 #      the model is still inside its thinking block, so the assertion is on
 #      completion_tokens, never on the budget.
 #
-# Env: PORT, SERVED_MODEL_NAME (read from .env first).
+# Env: PORT, SERVED_MODEL_NAME, API_KEY (read from .env first, but the
+# caller's environment wins, matching start.sh's precedence rule).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+_CLI_API_KEY="${API_KEY:-}"
+_CLI_PORT="${PORT:-}"
+_CLI_SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 if [[ -f "$REPO_DIR/.env" ]]; then
     # shellcheck source=.env
     source "$REPO_DIR/.env"
 fi
+[[ -n "$_CLI_API_KEY" ]] && API_KEY="$_CLI_API_KEY"
+[[ -n "$_CLI_PORT" ]] && PORT="$_CLI_PORT"
+[[ -n "$_CLI_SERVED_MODEL_NAME" ]] && SERVED_MODEL_NAME="$_CLI_SERVED_MODEL_NAME"
 PORT="${PORT:-8888}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 API_KEY="${API_KEY:-}"
+# Fallback: the deployment may carry the key as --api-key <value> inside
+# .env's EXTRA_VLLM_ARGS instead of the API_KEY knob (same extraction as
+# smoke-test.sh). Without it the probe 401s and the supervisor reads a
+# healthy authenticated server as wedged.
+if [[ -z "$API_KEY" && -n "${EXTRA_VLLM_ARGS:-}" ]]; then
+    _x=(); read -ra _x <<< "$EXTRA_VLLM_ARGS"
+    for ((i=0; i<${#_x[@]}-1; i++)); do
+        if [[ "${_x[$i]}" == "--api-key" ]]; then API_KEY="${_x[$((i+1))]}"; break; fi
+    done
+fi
 BASE="http://localhost:$PORT"
 PROBE_LATENCY_LOG="$REPO_DIR/logs/probe-latency.log"
 AUTH=(); [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
