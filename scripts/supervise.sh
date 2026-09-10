@@ -131,7 +131,10 @@ ensure_state() {
 }
 
 container_up() { docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}\$"; }
-memwatch_up()  { pgrep -f "memwatch.sh $CONTAINER_NAME" >/dev/null 2>&1; }
+# Anchored to the memwatch binary path: the wrapper's own argv
+# (start-memwatch.sh <container>) must not match, same class of bug as the
+# start-memwatch.sh pkill self-kill found in the drills.
+memwatch_up()  { pgrep -f "[f]iles/memwatch.sh $CONTAINER_NAME" >/dev/null 2>&1; }
 
 clean_shm() {
     # Only when our container is not running and no vLLM/sglang container is
@@ -223,13 +226,19 @@ emergency_stop() {
     local reason="$1"
     alert "SUPERVISOR emergency: $reason (container $CONTAINER_NAME)"
     # stop.sh touches the stopping flag (supervisor hold-off). An emergency
-    # must NOT hold us off — recovery is the whole point — so clear it.
-    # Mark this emergency as supervisor-initiated so the memwatch-marker scan
-    # (which sees the WATCHDOG EMERGENCY STOP line appended by the stop we just
-    # performed) does not double-count the same incident.
+    # must NOT hold us off — recovery is the whole point — so clear the flag
+    # stop.sh just raised. But a flag that was ALREADY there when this
+    # emergency started belongs to a maintenance window (drill-6 finding):
+    # the supervisor must not tear down a handshake it did not raise.
     state_set stop_source emergency
+    local _pre_stop_flag=0
+    [[ -f "$STOPPING_FLAG" ]] && _pre_stop_flag=1
     "$REPO_DIR/stop.sh" >/dev/null 2>&1 || true
-    rm -f "$STOPPING_FLAG" 2>/dev/null || true
+    if [[ "$_pre_stop_flag" == "0" ]]; then
+        rm -f "$STOPPING_FLAG" 2>/dev/null || true
+    else
+        log "logs/stopping predates this emergency (maintenance window); leaving it in place"
+    fi
     # Roll the window BEFORE counting so a stale-window boundary cannot reset
     # the increment that just happened on the same tick.
     local ws; ws=$(state_get window_start "")
@@ -283,15 +292,36 @@ while true; do
     # RELAUNCH a missing container". It must not blind supervision of a
     # container that is actually up (a maintenance wrapper whose smoke test
     # failed leaves the flag while the server may be healthy — stop.sh already
-    # killed the watchdog, so memwatch + probe must resume). A flag older than
-    # STOPPING_MAX_AGE_S is abandoned — reclaim it loudly.
+    # killed the watchdog, so memwatch must resume). But while the flag is
+    # fresh (the maintenance window is mid-flight: its own start.sh is the
+    # readiness authority), the PROBE must also hold: probing a
+    # cold-starting maintenance container to 5 fails would emergency-stop
+    # inside the window and fight the handshake (drill-6 finding). A flag
+    # older than STOPPING_MAX_AGE_S is abandoned — reclaim it loudly.
+    _stopping_fresh=0
     if [[ -f "$STOPPING_FLAG" ]]; then
         _flag_age=$(( $(date +%s) - $(stat -c %Y "$STOPPING_FLAG" 2>/dev/null || echo 0) ))
         if (( _flag_age > STOPPING_MAX_AGE_S )); then
             alert "SUPERVISOR: logs/stopping is ${_flag_age}s old (>${STOPPING_MAX_AGE_S}s) — treating as abandoned and clearing it."
             rm -f "$STOPPING_FLAG"
-        elif container_up; then
-            : # flag only gates relaunch; proceed to observe the up container
+        else
+            _stopping_fresh=1
+        fi
+    fi
+    if [[ "$_stopping_fresh" == "1" ]]; then
+        if container_up; then
+            # memwatch must run for an up container even mid-window; probe holds.
+            if ! memwatch_up; then
+                log "memwatch not running; starting it"
+                MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" \
+                    MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
+                    MEMWATCH_GRACE="$MEMWATCH_GRACE" \
+                    bash "$REPO_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB" || true
+            fi
+            "$REPO_DIR/scripts/memwatch-rotate.sh" "$CONTAINER_NAME" || true
+            state_set last_probe_fail 0
+            sleep "$TICK_S"
+            continue
         else
             sleep "$TICK_S"
             continue
@@ -329,7 +359,14 @@ while true; do
             if [[ -n "$mw_marker" ]]; then
                 _mw_id="${mw_marker}|$(stat -c %Y "$mw_log" 2>/dev/null || echo 0)"
                 _last_mw="$(state_get last_memwatch_emergency "none")"
-                if [[ "$_last_mw" != "$_mw_id" ]]; then
+                if [[ "$_last_mw" == "none" ]]; then
+                    # Fresh state (boot reset or human re-arm) seeing an OLD
+                    # marker: the memwatch log persists across state resets,
+                    # so a marker from a previous generation must not seed a
+                    # fresh breaker count. Adopt it as seen, count nothing.
+                    state_set last_memwatch_emergency "$_mw_id"
+                    log "stale memwatch marker adopted without counting (state was reset)"
+                elif [[ "$_last_mw" != "$_mw_id" ]]; then
                     alert "SUPERVISOR: memwatch emergency stop detected: $mw_marker"
                     state_set last_memwatch_emergency "$_mw_id"
                     ec=$(( $(state_get emergency_count 0) + 1 ))
