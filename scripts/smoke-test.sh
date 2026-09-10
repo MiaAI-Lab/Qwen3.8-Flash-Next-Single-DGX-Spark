@@ -146,7 +146,48 @@ if d["usage"]["completion_tokens"] <= 0:
     fi
 fi
 
-echo "== 7. metrics endpoint =="
+echo "== 7. vision (image understanding) =="
+# The model is multimodal; a broken vision path (image-bump regression, video-
+# processor change, OOM-killed vision encoder) would otherwise surface only in
+# user traffic. Fixture: files/smoke-vision-fixture.jpeg (13 KB, checked in),
+# base64-inline data URL. Same empty-cell guard as everywhere else: the answer
+# must be non-empty AND name the model shown on the image's countdown page.
+_VFIXTURE="$REPO_DIR/files/smoke-vision-fixture.jpeg"
+if [[ ! -f "$_VFIXTURE" ]]; then
+    note "vision fixture missing ($_VFIXTURE); skipping image check"
+else
+    _VB64=$(base64 -w0 "$_VFIXTURE")
+    _VRESP=$(curl -s -m 180 -w '\n%{http_code}' "${AUTH[@]}" -H 'Content-Type: application/json' \
+        "$BASE/v1/chat/completions" -d '{
+  "model": "'"$MODEL"'", "temperature": 0, "max_tokens": 120,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$_VB64"'"}},
+    {"type": "text", "text": "What is shown in this image? Answer in one short sentence."}
+  ]}]
+}')
+    _VCODE=$(echo "$_VRESP" | tail -1)
+    _VBODY=$(echo "$_VRESP" | sed '$d')
+    if [[ "$_VCODE" != "200" ]]; then
+        bad "vision round-trip HTTP $_VCODE (not 200)"
+    else
+        _VANSWER=$(echo "$_VBODY" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d["usage"]["completion_tokens"] <= 0:
+    raise SystemExit("empty")
+print((d["choices"][0]["message"].get("content") or ""))' 2>/dev/null)
+        if [[ -z "$_VANSWER" ]]; then
+            bad "vision check: empty answer (empty-cell trap)"
+        elif echo "$_VANSWER" | grep -qiE "qwen|countdown|timer"; then
+            ok "vision round-trip: HTTP 200, image identified (countdown/Qwen), completion_tokens>0"
+        else
+            bad "vision check: answer does not identify the image: ${_VANSWER:0:120}"
+        fi
+    fi
+fi
+
+echo "== 8. metrics endpoint =="
 curl -s -m 5 "$BASE/metrics" | grep -q "vllm:" \
     && ok "/metrics exposes vllm: series" || bad "/metrics missing vllm: series"
 

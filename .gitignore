@@ -56,6 +56,10 @@
 !/files/build_draft_vocab.py
 # recommended kernel VM tunables (not applied by anything here)
 !/files/sysctl-spark3.conf
+# vision smoke-test fixture (13 KB, 400x225 JPEG: Qwen3.8-Flash-Next release
+# countdown page). Checked in so smoke-test.sh needs no network to verify the
+# multimodal path.
+!/files/smoke-vision-fixture.jpeg
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
