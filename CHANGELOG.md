@@ -5,6 +5,38 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-10
+
+### Fixed
+
+- **`API_KEY` was baked into `.last_launch.sh` in plaintext** (`5da6eb8`).
+  The `--api-key` flag was built through `VLLM_ARGS_STR`, whose expansions the
+  unquoted launch heredoc evaluates at script-generation time — so every
+  launch wrote the key value into the generated script, the same on-disk-secret
+  class as the #9 HF_TOKEN fix. The flag now lives in the heredoc body as
+  `--api-key \$API_KEY` and resolves from the generated script's environment at
+  exec time, exactly like HF_TOKEN. Render verified with a fake key: the
+  generated script carries the placeholder, never the value, and omits the
+  flag entirely when the key is empty. (Found during the 2026-09-10 upstream
+  issues audit; keys written by earlier launches should be rotated.)
+- **`smoke-test.sh` could not authenticate against an authenticated server**
+  (`f29f547`). It never read `.env`, so a deployment with `API_KEY` (or
+  `--api-key` inside `EXTRA_VLLM_ARGS`) got 401s on every generation check —
+  which meant the Sunday-04:00 maintenance smoke failed, the window's
+  `logs/stopping` flag was never released, and the supervisor held off
+  relaunching. It now reads `.env` repo-relative with environment-over-`.env`
+  precedence (same rule as start.sh) and, when the `API_KEY` knob is unset,
+  extracts the key from `EXTRA_VLLM_ARGS` with the same word-split semantics
+  start.sh uses.
+- **`health-probe.sh` silently clobbered its caller's environment**
+  (`bdeb0e0`). It sourced `.env` without capturing `PORT`/`API_KEY` first, so
+  environment values lost to `.env` — breaking the repo's stated precedence
+  rule — and it 401'd against an authenticated server, which would have made
+  the supervisor read a healthy server as wedged. Same env-wins fix plus the
+  same `EXTRA_VLLM_ARGS` key fallback. Verified live against the running
+  authenticated server: probe exit 0, smoke 6 passed / 1 expected determinism
+  WARN.
+
 ## 2026-09-09
 
 ### Added
@@ -20,6 +52,15 @@ as promises.
   reset on host reboot. A systemd `OnFailure=` target fires `alert.sh` when the
   unit fails. Install steps live in the README's "Unattended operation"
   section.
+
+  *Credit where due: several detection and prevention patterns in this 2026-09-09
+  section — sha256 verification with a paginated HF tree manifest, the
+  quant_algo dispatch pre-flight, the MTP ring-capacity legality formula, the
+  JIT compile fan-out bounds, the empty-cell (`completion_tokens > 0`) probe
+  assertion, and the async-scheduling/MTP interaction — were drawn from the
+  failure-mode notes of `jschmied/qwen38-flash-next-gb10` (same model, same
+  GB10 hardware, a different engine build we do not run), then re-derived and
+  verified against our own image and measurements.*
 - **Continuous health probe** (`scripts/health-probe.sh`): stateless single-shot
   check — `/health` must answer 200, then a real 16-token generation must
   return a `finish_reason` and `usage.completion_tokens > 0` (the model
@@ -250,7 +291,10 @@ the vLLM counters around it. Full write-up and every table in
   **full** ~99 GiB snapshot so Hugging Face's terms gate stays in force —
   accept access on the repo page, then `ABLIT=1 ./download.sh` with
   `HF_TOKEN`. It is the same size as stock to the byte (9 of 37 shards differ
-  in content, none in length). The packed PLE table is reused from stock, but
+  in content, none in length — as later measured per-shard and filed upstream
+  as #34, the true figures are 17 of 34 model shards, 35 counting the amax
+  sidecar; see the 2026-09-09 "Known open" note below). The packed PLE table
+  is reused from stock, but
   only after `ABLIT_META.json` is confirmed to report `edit_ple: false`.
   `TP1_MODEL_ID` still overrides checkpoint selection. `README.md` summarises
   the gate's terms (18+, stated intended use, prohibited uses, Qwen Community
