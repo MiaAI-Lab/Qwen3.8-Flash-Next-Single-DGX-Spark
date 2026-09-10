@@ -176,8 +176,9 @@ done
 READY_TIMEOUT_S="${_CLI_READY_TIMEOUT_S:-${READY_TIMEOUT_S:-1800}}"
 # Bearer-token auth for the OpenAI API (--api-key). Empty = no auth (the
 # loopback default is safe without it). A non-empty key ALSO satisfies the
-# non-loopback BIND warning below. The key value is passed at exec time, not
-# baked into .last_launch.sh, same hygiene as HF_TOKEN.
+# non-loopback BIND warning below. The value is resolved from the generated
+# script's environment at exec time, never baked into .last_launch.sh, same
+# hygiene as HF_TOKEN.
 API_KEY="${API_KEY:-}"
 
 MAX_MODEL_LEN="${_CLI_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-65536}}"
@@ -987,10 +988,12 @@ fi
 # EXTRA_VLLM_ARGS is word-split with shell-word semantics, so quoting inside
 # the value is not supported (same contract as EXTRA_DOCKER_ARGS).
 [[ -n "$EXTRA_VLLM_ARGS" ]] && { read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"; VLLM_ARGS+=("${_EXTRA_VLLM[@]}"); }
-# API_KEY knob -> --api-key. Passed as \$API_KEY so the value resolves from the
-# environment at exec time and is not baked into .last_launch.sh (HF_TOKEN
-# hygiene, review #9). Requires export API_KEY below to reach the child shell.
-[[ -n "$API_KEY" ]] && VLLM_ARGS+=("--api-key" "\$API_KEY")
+# API_KEY -> --api-key: added ONLY in the heredoc body below, as
+# --api-key \$API_KEY. VLLM_ARGS_STR must not carry the flag: it flows through
+# the UNQUOTED heredoc, where any $-expansion happens at script-generation
+# time and would bake the secret into .last_launch.sh. The heredoc's
+# \$API_KEY resolves from the generated script's environment at exec time,
+# exactly like HF_TOKEN (see the export below).
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 
 # Non-loopback bind with no api key = the whole network the box is on can
@@ -1063,7 +1066,8 @@ docker run \\
     $MODEL_ID \\
     $VLLM_ARGS_STR \\
     --host $BIND \\
-    --port $PORT
+    --port $PORT \\
+    ${API_KEY:+--api-key \$API_KEY} \\
 LAUNCH_EOF
 chmod +x "$LAUNCH_SCRIPT"
 cp "$LAUNCH_SCRIPT" "$SCRIPT_DIR/.last_launch.sh"
