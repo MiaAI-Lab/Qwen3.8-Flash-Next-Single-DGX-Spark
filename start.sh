@@ -468,8 +468,12 @@ WEIGHT_BYTES=$(du -sb "$MODEL_PATH/$SNAPSHOT_REL/" -L | cut -f1)
 
 # PLE_GIB from the snapshot's actual PLE shard files (index.json weight_map
 # keys matching model-ple*), not from the packed table's du. An override wins.
+# Shipped checkpoints pack the PLE shards as model-ple* files; if a future
+# checkpoint packs them inside the main shards instead, the derivation finds
+# nothing and falls back to the measured 26.82 (drill report 2026-09-10: the
+# stock snapshot reads 0.00 without the fallback and the budget goes negative).
 if [[ -z "$PLE_GIB" ]]; then
-    PLE_GIB=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY'
+    _PLE_DERIVED=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY'
 import json, pathlib, sys
 snap = pathlib.Path(sys.argv[1])
 idx = snap / "model.safetensors.index.json"
@@ -486,9 +490,15 @@ for name in set(wm.values()):
 print(f"{gib/2**30:.2f}")
 PY
 )
-    PLE_GIB="${PLE_GIB:-26.82}"
-    if [[ "$PLE_GIB" != "26.82" ]]; then
-        info "  PLE_GIB derived from checkpoint PLE shards: ${PLE_GIB} GiB (not the stock 26.82)."
+    if [[ "$_PLE_DERIVED" == "0.00" ]]; then
+        PLE_GIB="26.82"
+        warn "PLE_GIB: no model-ple* shards found in this snapshot (PLE packed inside"
+        warn "     the main shards); using the measured 26.82 fallback."
+    else
+        PLE_GIB="$_PLE_DERIVED"
+        if [[ "$PLE_GIB" != "26.82" ]]; then
+            info "  PLE_GIB derived from checkpoint PLE shards: ${PLE_GIB} GiB (not the stock 26.82)."
+        fi
     fi
 fi
 
