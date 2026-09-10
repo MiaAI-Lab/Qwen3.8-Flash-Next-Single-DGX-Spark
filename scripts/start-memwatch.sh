@@ -19,7 +19,10 @@ GRACE="${MEMWATCH_GRACE:-30}"
 MEMWATCH_LOG="${MEMWATCH_LOG:-$REPO_DIR/logs/memwatch-${CONTAINER}.log}"
 
 mkdir -p "$REPO_DIR/logs/archive"
-pkill -f "memwatch.sh $CONTAINER" 2>/dev/null || true
+# Anchor to the memwatch binary path so we kill a running memwatch but never
+# our own argv (which contains "start-memwatch.sh <container>"); the [f] class
+# stops the pattern from matching the very pkill/-f command line we run.
+pkill -f "[f]iles/memwatch.sh $CONTAINER" 2>/dev/null || true
 
 MEMWATCH_MIN_FREE_GIB="$MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$FREE_GATE_GIB" \
     MEMWATCH_GRACE="$GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
