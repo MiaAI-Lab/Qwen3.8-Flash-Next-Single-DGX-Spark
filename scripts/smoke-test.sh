@@ -6,11 +6,39 @@
 # Usage:
 #   ./scripts/smoke-test.sh                      # localhost:8888, no auth
 #   PORT=9000 API_KEY=xyz ./scripts/smoke-test.sh
+#
+# Reads .env (repo-relative) for API_KEY/PORT/SERVED_MODEL_NAME when the
+# caller did not set them, matching start.sh's precedence: environment wins.
+# Without this, a server launched with API_KEY in .env answers 401 here and
+# every authenticated deployment's smoke test fails (maintenance windows
+# then never close their stopping flag).
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+_CLI_API_KEY="${API_KEY:-}"
+_CLI_PORT="${PORT:-}"
+_CLI_SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+if [[ -f "$REPO_DIR/.env" ]]; then
+    # shellcheck source=.env
+    source "$REPO_DIR/.env"
+fi
+[[ -n "$_CLI_API_KEY" ]] && API_KEY="$_CLI_API_KEY"
+[[ -n "$_CLI_PORT" ]] && PORT="$_CLI_PORT"
+[[ -n "$_CLI_SERVED_MODEL_NAME" ]] && SERVED_MODEL_NAME="$_CLI_SERVED_MODEL_NAME"
 
 PORT="${PORT:-8888}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 EXPECT_LEN="${EXPECT_LEN:-}"        # set to 262144 or 524288 to assert context
+# Fallback: the deployment may carry the key as --api-key <value> inside
+# .env's EXTRA_VLLM_ARGS instead of the API_KEY knob. The server requires it
+# either way; without this the smoke test 401s and maintenance windows hang.
+if [[ -z "${API_KEY:-}" && -n "${EXTRA_VLLM_ARGS:-}" ]]; then
+    _x=(); read -ra _x <<< "$EXTRA_VLLM_ARGS"
+    for ((i=0; i<${#_x[@]}-1; i++)); do
+        if [[ "${_x[$i]}" == "--api-key" ]]; then API_KEY="${_x[$((i+1))]}"; break; fi
+    done
+fi
 BASE="http://localhost:$PORT"
 AUTH=(); [[ -n "${API_KEY:-}" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
 
