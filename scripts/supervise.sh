@@ -77,6 +77,7 @@ BREAKER_WINDOW_S="${BREAKER_WINDOW_S:-7200}"
 BREAKER_RESET_ON_BOOT="${BREAKER_RESET_ON_BOOT:-1}"
 BREAKER_OPEN_ALERT_S="${BREAKER_OPEN_ALERT_S:-1800}"
 PROBE_RETRY_S="${PROBE_RETRY_S:-60}"
+LOAD_GATE_WINDOW_S="${LOAD_GATE_WINDOW_S:-180}"
 
 alert() { "$REPO_DIR/scripts/alert.sh" "$*" || true; }
 log()   { echo "$(date '+%F %T') [supervise] $*"; }
@@ -131,6 +132,26 @@ ensure_state() {
 }
 
 container_up() { docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}\$"; }
+
+weights_loading() {
+    # True while the container is alive but has not reached first /health:
+    # while vLLM is streaming shards its log tail shows load-progress lines
+    # ("Loading safetensors checkpoint shards: N/M"), and a generation-probe
+    # failure during that phase is expected, not a wedge. Gate the probe on
+    # THIS observable state rather than elapsed time — a bare start.sh outside
+    # any maintenance window has no stopping flag to hide behind, and an
+    # elapsed-time hold-off either kills slow loads or probes too early
+    # (jschmied: "the failing probe and the healthy one look identical until
+    # you gate on weight-load progress"). Once /health has answered once,
+    # probe failures are real again.
+    container_up || return 1
+    if curl -s -m 5 -o /dev/null -w '%{http_code}' "http://localhost:${PORT:-8888}/health" 2>/dev/null | grep -q 200; then
+        return 1
+    fi
+    docker logs --tail 5 "$CONTAINER_NAME" 2>/dev/null \
+        | grep -qE 'Loading safetensors checkpoint shards|Loading safetensors index|Fetching [0-9]+ files'
+}
+
 # Anchored to the memwatch binary path: the wrapper's own argv
 # (start-memwatch.sh <container>) must not match, same class of bug as the
 # start-memwatch.sh pkill self-kill found in the drills.
@@ -465,6 +486,22 @@ while true; do
     # Probe cadence: 1/min.
     _now=$(date +%s)
     if (( _now - last_probe_ts >= PROBE_RETRY_S )); then
+        # Weight-load gate (jschmied): while the container is mid-weight-load
+        # (alive, /health never answered, load progress in the log tail), a
+        # generation-probe failure is the expected state, not a wedge. Do not
+        # run the probe and do not let a failure counted before the load
+        # started keep aging: hold the counter, log once, move on. This is the
+        # mechanism that must make drill 6's class unreachable even for a bare
+        # start.sh outside a maintenance window.
+        if weights_loading; then
+            _wg_ts="${_wg_ts:-0}"
+            if (( _now - _wg_ts >= 300 )); then
+                _wg_ts=$_now
+                log "weights still loading; probe held (load-progress gate)"
+            fi
+            sleep "$TICK_S"
+            continue
+        fi
         last_probe_ts=$_now
         if probe_once; then
             state_set last_probe_fail 0
