@@ -24,8 +24,10 @@ if [[ -f "$REPO_DIR/.env" ]]; then
 fi
 PORT="${PORT:-8888}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
+API_KEY="${API_KEY:-}"
 BASE="http://localhost:$PORT"
 PROBE_LATENCY_LOG="$REPO_DIR/logs/probe-latency.log"
+AUTH=(); [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
 
 _code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$BASE/health" 2>/dev/null || echo "000")
 if [[ "$_code" != "200" ]]; then
@@ -34,7 +36,7 @@ if [[ "$_code" != "200" ]]; then
 fi
 
 T0=$(date +%s.%N)
-OUT=$(curl -s -m 60 -H 'Content-Type: application/json' "$BASE/v1/chat/completions" -d "{
+OUT=$(curl -s -m 60 "${AUTH[@]}" -H 'Content-Type: application/json' "$BASE/v1/chat/completions" -d "{
   \"model\": \"$MODEL\", \"max_tokens\": 16, \"temperature\": 0,
   \"messages\": [{\"role\":\"user\",\"content\":\"Reply with the single word: ok.\"}]}" 2>/dev/null)
 T1=$(date +%s.%N)

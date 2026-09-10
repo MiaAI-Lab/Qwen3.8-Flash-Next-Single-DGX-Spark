@@ -116,7 +116,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
                     MTP_DRAFT_VOCAB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
-                    YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S
+                    YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
                     MTP_DISABLE_BLOCK_DROP)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -174,6 +174,11 @@ done
 # PLE table. Give the readiness loop this long before it archives + removes
 # the wedged container and exits non-zero for the supervisor to retry.
 READY_TIMEOUT_S="${_CLI_READY_TIMEOUT_S:-${READY_TIMEOUT_S:-1800}}"
+# Bearer-token auth for the OpenAI API (--api-key). Empty = no auth (the
+# loopback default is safe without it). A non-empty key ALSO satisfies the
+# non-loopback BIND warning below. The key value is passed at exec time, not
+# baked into .last_launch.sh, same hygiene as HF_TOKEN.
+API_KEY="${API_KEY:-}"
 
 MAX_MODEL_LEN="${_CLI_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-65536}}"
 # YaRN rope scaling: 0 = off (MAX_MODEL_LEN applies, capped at native),
@@ -982,17 +987,21 @@ fi
 # EXTRA_VLLM_ARGS is word-split with shell-word semantics, so quoting inside
 # the value is not supported (same contract as EXTRA_DOCKER_ARGS).
 [[ -n "$EXTRA_VLLM_ARGS" ]] && { read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"; VLLM_ARGS+=("${_EXTRA_VLLM[@]}"); }
+# API_KEY knob -> --api-key. Passed as \$API_KEY so the value resolves from the
+# environment at exec time and is not baked into .last_launch.sh (HF_TOKEN
+# hygiene, review #9). Requires export API_KEY below to reach the child shell.
+[[ -n "$API_KEY" ]] && VLLM_ARGS+=("--api-key" "\$API_KEY")
 VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 
 # Non-loopback bind with no api key = the whole network the box is on can
 # reach an unauthenticated unfiltered model. Warn, do not refuse (this is
 # exactly the override users opt into).
 if [[ "$BIND" != "127.0.0.1" && "$BIND" != "::1" && "$BIND" != "localhost" ]]; then
-    if ! [[ "$EXTRA_VLLM_ARGS" == *"--api-key"* ]]; then
-        warn "BIND=$BIND is not loopback and no --api-key appears in EXTRA_VLLM_ARGS:"
+    if [[ -z "$API_KEY" && ! "$EXTRA_VLLM_ARGS" == *"--api-key"* ]]; then
+        warn "BIND=$BIND is not loopback and no API_KEY / --api-key is set:"
         warn "     the API is reachable on every interface this box has:"
         warn "     $(hostname -I)"
-        warn "     Serve with --api-key set, or use an ssh tunnel."
+        warn "     Serve with API_KEY (or --api-key), or use an ssh tunnel."
     fi
 fi
 
@@ -1069,9 +1078,10 @@ if ! $DO_LAUNCH; then
     exit 0
 fi
 
-# The generated launch script resolves $HF_TOKEN from ITS environment at exec
-# time (0.3 hygiene), so the token must actually be exported here.
+# The generated launch script resolves $HF_TOKEN and $API_KEY from ITS
+# environment at exec time (token/key hygiene), so both must be exported here.
 export HF_TOKEN
+export API_KEY
 
 # ---------------------------------------------------------------------------
 # 6. Launch + watchdog
