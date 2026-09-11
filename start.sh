@@ -118,7 +118,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -157,10 +157,10 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 PORT="${_CLI_PORT:-${PORT:-8888}}"            # 8888 is safe only while comfy-h3.service is disabled (it watches this port)
 IMAGE="${IMAGE:?IMAGE not set in .env}"
-# Interface the API binds to. Default is loopback: remote clients get
-# connection refused until they set BIND=0.0.0.0 (with an API key) or use an
-# ssh tunnel. See the README migration note.
-BIND="${_CLI_BIND:-${BIND:-127.0.0.1}}"
+# Interface the API binds to. Default is every interface: the box is a
+# server, and the no-key WARN below is the guardrail. Set BIND=127.0.0.1 for
+# loopback-only (ssh-tunnel access). See the README migration note.
+BIND="${_CLI_BIND:-${BIND:-0.0.0.0}}"
 # BIND flows raw into the generated launch script --host argument. An
 # attacker-writable .env could turn it into a shell injection; reject the
 # shell-metacharacter surface — including newline/control bytes, which would
@@ -174,11 +174,11 @@ done
 # PLE table. Give the readiness loop this long before it archives + removes
 # the wedged container and exits non-zero for the supervisor to retry.
 READY_TIMEOUT_S="${_CLI_READY_TIMEOUT_S:-${READY_TIMEOUT_S:-1800}}"
-# Bearer-token auth for the OpenAI API (--api-key). Empty = no auth (the
-# loopback default is safe without it). A non-empty key ALSO satisfies the
-# non-loopback BIND warning below. The value is resolved from the generated
-# script's environment at exec time, never baked into .last_launch.sh, same
-# hygiene as HF_TOKEN.
+# Bearer-token auth for the OpenAI API (--api-key). Empty = no auth; the
+# default BIND=0.0.0.0 then exposes the model on every interface, which the
+# non-loopback BIND warning below prints the interfaces for. The value is
+# resolved from the generated script's environment at exec time, never baked
+# into .last_launch.sh, same hygiene as HF_TOKEN.
 API_KEY="${API_KEY:-}"
 
 MAX_MODEL_LEN="${_CLI_MAX_MODEL_LEN:-${MAX_MODEL_LEN:-65536}}"
@@ -852,7 +852,24 @@ VLLM_ARGS+=("--safetensors-load-strategy" "lazy")
 VLLM_ARGS+=("--enable-chunked-prefill")
 VLLM_ARGS+=("--reasoning-parser" "qwen3")
 VLLM_ARGS+=("--enable-auto-tool-choice")
-VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
+# CHAT_TEMPLATE: host path to a replacement Jinja chat template, mounted into
+# the container read-only. The shipped froggeric v22.5 template
+# (files/chat-template/chat_template.jinja) fixes the stock template's
+# raise_exception on reasoning_effort aliases, its crash on stringified-JSON
+# tool arguments, and the xhigh-by-default token burn. It emits canonical XML
+# tool calls, which pair with qwen3_xml; the stock template pairs with
+# qwen3_coder. Empty keeps the checkpoint's template and qwen3_coder.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"
+if [[ -n "$CHAT_TEMPLATE" ]]; then
+    # Repo-relative paths (files/...) resolve against the script dir; the
+    # generated launch script can run from any cwd, so store absolute.
+    [[ "$CHAT_TEMPLATE" != /* ]] && CHAT_TEMPLATE="$SCRIPT_DIR/$CHAT_TEMPLATE"
+    [[ -r "$CHAT_TEMPLATE" ]] || err "CHAT_TEMPLATE=$CHAT_TEMPLATE is not readable"
+    VLLM_ARGS+=("--chat-template" "/root/chat_template.jinja")
+    VLLM_ARGS+=("--tool-call-parser" "qwen3_xml")
+else
+    VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
+fi
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
@@ -1048,6 +1065,7 @@ docker run \\
     ${GDN_DECODE_KERNEL:+-e VLLM_GDN_DECODE_KERNEL=$GDN_DECODE_KERNEL} \\
     ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
     ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
+    ${CHAT_TEMPLATE:+-v $CHAT_TEMPLATE:/root/chat_template.jinja:ro} \\
     -e HF_HOME=/root/.cache/huggingface \\
     ${HF_TOKEN:+-e HF_TOKEN=\$HF_TOKEN} \\
     -v $PATCHED_PLE:$PLE_PKG:ro \\
