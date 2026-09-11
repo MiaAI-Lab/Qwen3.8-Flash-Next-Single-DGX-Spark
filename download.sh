@@ -18,6 +18,7 @@
 #                                       # https://huggingface.co/drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only
 #   ./download.sh Org/Some-Other-Model  # an explicit repo id
 #   HF_TOKEN=hf_... ./download.sh       # for a gated repo
+#   VERIFY_SHA256=0 ./download.sh       # skip sha256 verification of LFS blobs
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +39,7 @@ done
 _CLI_HF_TOKEN="${HF_TOKEN:-}"
 _CLI_ABLIT="${ABLIT:-}"
 _CLI_TP1_MODEL_ID="${TP1_MODEL_ID:-}"
+_CLI_VERIFY_SHA256="${VERIFY_SHA256:-}"
 if [[ -f .env ]]; then
     # shellcheck source=.env
     source .env
@@ -48,6 +50,7 @@ HF_TOKEN="${HF_TOKEN:-}"
 ABLIT="${ABLIT:-0}"
 [[ "$ABLIT" == "0" || "$ABLIT" == "1" ]] || err "ABLIT must be 0 or 1 (got: '$ABLIT')"
 [[ -n "$_CLI_TP1_MODEL_ID" ]] && TP1_MODEL_ID="$_CLI_TP1_MODEL_ID"
+VERIFY_SHA256="${_CLI_VERIFY_SHA256:-${VERIFY_SHA256:-1}}"
 
 STOCK_MODEL_ID="Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"
 ABLIT_MODEL_ID="drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only"
@@ -246,6 +249,108 @@ SNAP_RC=0
 SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
 [[ -n "$SNAP" ]] || err "No snapshot directory under $MODEL_PATH/snapshots"
 [[ "$SNAP_RC" -eq 0 ]] || err "Snapshot is missing one or more indexed weight shards — the download is incomplete. Rerun this script."
+
+# ---------------------------------------------------------------------------
+# sha256 verification of LFS blobs (review §5.5 / jschmied A1). aria2
+# preallocates to final size, so size checks pass on corrupt content; this is
+# the only catch. VERIFY_SHA256=0 documents a skip but is not the default.
+# ---------------------------------------------------------------------------
+if [[ "$VERIFY_SHA256" == "1" ]]; then
+    SNAP_DIR="$MODEL_PATH/snapshots/$SNAP"
+    STATE_FILE="$MODEL_PATH/.sha256state"
+    auth=(); [[ -n "$HF_TOKEN" ]] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+
+    # Fetches the full LFS metadata manifest, walking the HF tree API with
+    # pagination (50 entries/page via the Link: rel="next" header). The
+    # manifest is <size>\t<lfs.sha256>\t<path> per line, so a truncated fetch
+    # is visible in the entry count printed below.
+    fetch_manifest() {  # <cache-file>
+        local cache="$1"
+        rm -f "$cache"
+        local page=0 total=0
+        local url="https://huggingface.co/api/models/$MODEL_ID/tree/main?recursive=true&expand=true&limit=50"
+        while [[ -n "$url" ]]; do
+            local headers="$cache.headers.$page"
+            local body; body=$(curl -s -D "$headers" -m 60 "${auth[@]}" \
+                -H "Accept: application/json" "$url" || true)
+            [[ -n "$body" ]] || { rm -f "$cache" "$headers"; return 1; }
+            echo "$body" | python3 - "$cache" <<'PY'
+import json, sys
+cache = sys.argv[1]
+with open(cache, "a") as mf:
+    for e in json.loads(sys.stdin.read()):
+        if e.get("type") != "file":
+            continue
+        lfs = e.get("lfs", {})
+        print(f"{e.get('size', 0)}\t{lfs.get('sha256', '')}\t{e.get('path', '')}", file=mf)
+PY
+            total=$(grep -c . "$cache" 2>/dev/null || echo 0)
+            page=$((page + 1))
+            url=""
+            if [[ -f "$headers" ]]; then
+                url=$(tr -d '\r' < "$headers" | grep -i '^Link:' \
+                    | sed -nE 's/.*<([^>]*)>; rel="next".*/\1/p' || true)
+                rm -f "$headers"
+            fi
+            [[ -n "$url" ]] && url=$(printf '%s' "$url" | tr -d '[:space:]')
+        done
+        [[ -s "$cache" ]] || return 1
+        echo "$total"
+        return 0
+    }
+
+    MANIFEST=$(mktemp)
+    ENTRY_COUNT=0
+    ENTRY_COUNT=$(fetch_manifest "$MANIFEST" 2>/dev/null || echo "")
+    if [[ -z "$ENTRY_COUNT" ]]; then
+        warn "sha256 verification: could not fetch the LFS manifest (offline?); skipping verification."
+        warn "     Rerun with network to get the corrupt-blob guard."
+    else
+        info "verifying sha256: ${ENTRY_COUNT} files in the remote tree manifest"
+        # The snapshot must not claim completeness from a truncated manifest.
+        if [[ "$ENTRY_COUNT" -lt 20 ]]; then
+            warn "tree manifest looks truncated (${ENTRY_COUNT} entries < 20); treating as unverifiable."
+        else
+            # The remote tree metadata can only be that much larger than what a
+            # complete download has on disk; fewer remote entries than local LFS
+            # files means we fetched a truncated manifest (jschmied: 50 of 144
+            # "verified" cleanly).
+            _LOCAL_LFS=$(find "$SNAP_DIR" -type f -size +1M 2>/dev/null | wc -l)
+            if (( ENTRY_COUNT < _LOCAL_LFS )); then
+                err "tree manifest records ${ENTRY_COUNT} files but the snapshot has ${_LOCAL_LFS} LFS-sized files — the manifest is truncated (pagination regression). Aborting verification."
+            fi
+            # Only LFS blobs carry a sha256 handle: <size>\t<64-hex>\t<path>.
+            # Everything else in the tree is content-addressed JSON/metadata.
+            while IFS=$'\t' read -r _sz sha path; do
+                # Manifest-controlled path must stay inside the snapshot: reject
+                # traversal and anything that is not a plain relative path
+                # (an integrity-compromised manifest should not turn into a
+                # host-path read oracle).
+                case "$path" in
+                    *".."*|/*|*[[:space:]]*|*[^[:print:]]*|"")
+                        err "sha256 verify: manifest path '$path' is not a safe relative path; aborting."
+                        ;;
+                esac
+                f="$SNAP_DIR/$path"
+                [[ -f "$f" ]] || err "sha256 verify: $path missing from snapshot"
+                # ABLIT resume: skip blobs already verified in a prior run.
+                _done=0
+                if [[ -f "$STATE_FILE" ]]; then
+                    grep -x -F "$sha  $path" "$STATE_FILE" 2>/dev/null && _done=1
+                fi
+                if [[ "$_done" != "1" ]]; then
+                    _have=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo "")
+                    if [[ "$_have" != "$sha" ]]; then
+                        err "sha256 mismatch on $path (got ${_have:-no-file}, want $sha). The checkpoint is corrupt or incomplete; delete $SNAP_DIR and re-download."
+                    fi
+                    printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE"
+                fi
+            done < <(awk -F'\t' 'NF >= 3 && length($2) == 64 { print }' "$MANIFEST")
+            ok "sha256 verified all LFS blobs in snapshot $SNAP."
+        fi
+    fi
+    rm -f "$MANIFEST"
+fi
 
 ok "$MODEL_ID  ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
 next_start_hint

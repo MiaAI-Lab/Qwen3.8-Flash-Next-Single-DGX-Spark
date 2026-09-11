@@ -24,8 +24,22 @@
 !/download.sh
 !/start.sh
 !/stop.sh
+# --- systemd USER units (24/7 supervisor, maintenance, heartbeat, OnFailure=) --
+!/systemd/qwen38-flash-supervisor.service
+!/systemd/qwen38-flash-maintenance.service
+!/systemd/qwen38-flash-maintenance.timer
+!/systemd/qwen38-flash-heartbeat.timer
+!/systemd/qwen38-flash-supervisor-failure@.service
 
 # --- launcher support and patch generators -----------------------------
+!/scripts/smoke-test.sh
+!/scripts/start-memwatch.sh
+!/scripts/supervise.sh
+!/scripts/health-probe.sh
+!/scripts/maintenance-relaunch.sh
+!/scripts/alert.sh
+!/scripts/memwatch-rotate.sh
+!/scripts/heartbeat.sh
 !/files/memwatch.sh
 !/files/build_ple_packed_table.py
 !/files/patch_ple_layer.py
@@ -42,6 +56,13 @@
 !/files/build_draft_vocab.py
 # recommended kernel VM tunables (not applied by anything here)
 !/files/sysctl-spark3.conf
+# vision smoke-test fixture (13 KB, 400x225 JPEG: Qwen3.8-Flash-Next release
+# countdown page). Checked in so smoke-test.sh needs no network to verify the
+# multimodal path.
+!/files/smoke-vision-fixture.jpeg
+# replacement chat template for CHAT_TEMPLATE (start.sh mounts it read-only
+# and switches the tool parser to qwen3_xml). v22.5, Apache-2.0.
+!/files/chat-template/chat_template.jinja
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
@@ -49,6 +70,9 @@
 # which is what makes ms/step and tokens/step comparable across launches.
 !/bench/sweep.py
 !/bench/mixed.py
+# structured (counting-stream) concurrent decode bench for when sparkDash is
+# not running; the 2026-09-11 README row was measured with it.
+!/bench/structured.py
 
 # --- measurement write-ups ---------------------------------------------
 # Host-specific, but they carry the numbers the README and CHANGELOG cite.

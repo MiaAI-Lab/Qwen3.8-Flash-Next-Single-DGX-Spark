@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Alert on supervisor unit failure (plan 1.5): systemd OnFailure= target that
+# posts an alert. Installed alongside qwen38-flash-supervisor.service.
+[Unit]
+Description=Alert on Qwen3.8-Flash-Next supervisor failure
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/qwen38-flash-next
+ExecStart=%h/qwen38-flash-next/scripts/alert.sh "SUPERVISOR UNIT FAILED: %i"

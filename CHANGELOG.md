@@ -5,25 +5,269 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
-## 2026-09-09
+## 2026-09-11
+
+### Added
+
+- **`CHAT_TEMPLATE` knob and the froggeric v22.5 fixed chat template**
+  (`files/chat-template/chat_template.jinja`, Apache-2.0,
+  hf.co/froggeric/Qwen-Fixed-Chat-Templates). Setting `CHAT_TEMPLATE` mounts
+  the file into the container read-only, passes `--chat-template`, and
+  switches the tool parser from `qwen3_coder` to `qwen3_xml` (the template
+  emits canonical XML tool calls). It fixes the checkpoint's stock template
+  on three real cases: `raise_exception` on `reasoning_effort` aliases
+  ("high"/"minimal"/"none" from OpenAI/Claude Code/Cline clients), a crash on
+  stringified-JSON tool arguments in history, and the xhigh-by-default
+  reasoning token burn; it also adds inline `<|think_off|>` / `<|think_low|>`
+  / `<|think_xhigh|>` steering. Verified live on this host: all four probe
+  classes pass, and a follow-up tool call round-trips through `qwen3_xml`.
+  Decode throughput is unchanged (the template is prompt-side). Client note:
+  with thinking off via `<|think_off|>` or `reasoning_effort="none"`, short
+  answers land in `reasoning_content` (vLLM qwen3 parser + prefilled closed
+  think block); explicit `enable_thinking=false` routes to `content`.
+- **`bench/structured.py`** — concurrent structured-decode bench (counting
+  stream, 400 tokens, T=0, thinking off) for when sparkDash is not running.
+  Measured on this host at `MAX_NUM_SEQS=8`, `HOST_RESERVE_GIB=28`: 65.2 /
+  116.2 / 205.9 / 313.6 aggregate tok/s at 1/2/4/8 streams (per-stream 67.7 /
+  60.7 / 53.9 / 42.8). Not comparable to the README prose tables — the
+  counting stream is MTP's best case — it exists so structured-prompt numbers
+  published for this runtime elsewhere can be compared like-for-like.
 
 ### Changed
 
-- **Reduced-vocabulary drafting is now the shipped default** (`.env.sample`,
-  `start.sh`, `files/draft_vocab_en_code_47k.txt`). The +25% decode win from
-  2026-09-05 (76.9 -> 63.9 ms/step single-stream, 36.9 -> 46.3 tok/s) was
-  measured with `MTP_DRAFT_VOCAB` active, but the knob shipped empty, so a fresh
-  clone ran the full 248k draft head and left ~17% single-stream on the table.
-  `.env.sample` now points at the checked-in 47,149-row code-tuned vocab
-  (1.18 GiB head -> 0.22 GiB slice, ~2.9 GiB saved per MTP-3 step), `start.sh`
-  resolves relative paths against the repo, errors when the file is missing,
-  and warns when MTP runs with the full head. Empty the knob to restore full
-  drafting. Correctness is structural (rejection sampling), so the worst case
-  for poor coverage is slower decode, never wrong output.
+- **The API binds `0.0.0.0` by default again** (`BIND`), reversing the
+  loopback-by-default migration. The box is a server; the guardrail is the
+  existing no-key path: with no `API_KEY` / `--api-key`, `start.sh` warns and
+  lists the exposed interfaces. `BIND=127.0.0.1` restores loopback-only
+  (ssh-tunnel access). The shell-metacharacter validation on `BIND` is
+  unchanged.
+- **`.env.sample` documents the `MAX_NUM_SEQS=8` + `HOST_RESERVE_GIB=28`
+  pairing.** Measured 2026-09-11: at `HOST_RESERVE_GIB=26` the 8-width
+  graph-capture spike pushed the driver to ~103 GiB, MemFree under 2 GiB for
+  5 samples with 3 NV_ERR_NO_MEMORY lines, and the watchdog emergency-stopped
+  the launch (exit 137, logs archived). At 28 the identical launch came up
+  clean; KV drops to 14.60 GiB ≈ 916,845 FP8 tokens (~3.5 full 262k
+  contexts). The ten-launch 16.67 GiB profile in the `KV_TARGET_GIB` comment
+  was measured at `MAX_NUM_SEQS=4`.
 
-  The shipped file was built on this host from 30 MiB of host code+docs
+## 2026-09-10
+
+### Fixed
+
+- **`API_KEY` was baked into `.last_launch.sh` in plaintext** (`5da6eb8`).
+  The `--api-key` flag was built through `VLLM_ARGS_STR`, whose expansions the
+  unquoted launch heredoc evaluates at script-generation time — so every
+  launch wrote the key value into the generated script, the same on-disk-secret
+  class as the #9 HF_TOKEN fix. The flag now lives in the heredoc body as
+  `--api-key \$API_KEY` and resolves from the generated script's environment at
+  exec time, exactly like HF_TOKEN. Render verified with a fake key: the
+  generated script carries the placeholder, never the value, and omits the
+  flag entirely when the key is empty. (Found during the 2026-09-10 upstream
+  issues audit; keys written by earlier launches should be rotated.)
+- **`smoke-test.sh` could not authenticate against an authenticated server**
+  (`f29f547`). It never read `.env`, so a deployment with `API_KEY` (or
+  `--api-key` inside `EXTRA_VLLM_ARGS`) got 401s on every generation check —
+  which meant the Sunday-04:00 maintenance smoke failed, the window's
+  `logs/stopping` flag was never released, and the supervisor held off
+  relaunching. It now reads `.env` repo-relative with environment-over-`.env`
+  precedence (same rule as start.sh) and, when the `API_KEY` knob is unset,
+  extracts the key from `EXTRA_VLLM_ARGS` with the same word-split semantics
+  start.sh uses.
+- **`health-probe.sh` silently clobbered its caller's environment**
+  (`bdeb0e0`). It sourced `.env` without capturing `PORT`/`API_KEY` first, so
+  environment values lost to `.env` — breaking the repo's stated precedence
+  rule — and it 401'd against an authenticated server, which would have made
+  the supervisor read a healthy server as wedged. Same env-wins fix plus the
+  same `EXTRA_VLLM_ARGS` key fallback. Verified live against the running
+  authenticated server: probe exit 0, smoke 6 passed / 1 expected determinism
+  WARN.
+
+## 2026-09-09
+
+### Added
+
+- **24/7 supervision loop** (`scripts/supervise.sh`, `scripts/start-memwatch.sh`
+  and systemd user units in `systemd/`). The container now runs without docker
+  `--restart`; the supervisor is the single state machine that keeps the
+  container and the memory watchdog up, health-checks once a minute, recovers
+  from crashes with exponential backoff (30 s × 2ⁿ, capped at 15 min), and
+  holds a file-backed circuit breaker: 3 emergencies in a 2 h rolling window
+  open it, after which it alerts only and waits for a human to re-arm by
+  removing `logs/supervisor.state`. Counters survive supervisor restarts and
+  reset on host reboot. A systemd `OnFailure=` target fires `alert.sh` when the
+  unit fails. Install steps live in the README's "Unattended operation"
+  section.
+
+  *Credit where due: several detection and prevention patterns in this 2026-09-09
+  section — sha256 verification with a paginated HF tree manifest, the
+  quant_algo dispatch pre-flight, the MTP ring-capacity legality formula, the
+  JIT compile fan-out bounds, the empty-cell (`completion_tokens > 0`) probe
+  assertion, and the async-scheduling/MTP interaction — were drawn from the
+  failure-mode notes of `jschmied/qwen38-flash-next-gb10` (same model, same
+  GB10 hardware, a different engine build we do not run), then re-derived and
+  verified against our own image and measurements.*
+- **Continuous health probe** (`scripts/health-probe.sh`): stateless single-shot
+  check — `/health` must answer 200, then a real 16-token generation must
+  return a `finish_reason` and `usage.completion_tokens > 0` (the model
+  emits reasoning first, so a naive length check would otherwise "pass" on an
+  empty answer). The supervisor owns the consecutive-failure counter (5 →
+  emergency) and only escalates when `/health` also stops answering, so probe
+  queueing under load cannot stop a healthy saturated server. Latency is
+  appended to `logs/probe-latency.log`.
+- **Alerting** (`scripts/alert.sh`): POSTs one JSON payload
+  `{hostname,timestamp,message,container,mem_available}` to `ALERT_WEBHOOK`,
+  collapses identical messages to one per 15 min, is a silent no-op when the
+  knob is unset, and never changes control flow on failure. Wired into the
+  supervisor (relaunch failures, breaker trips, emergencies), the watchdog's
+  stop path, the systemd failure target, the maintenance window and the daily
+  heartbeat.
+- **Scheduled graceful relaunch** (`scripts/maintenance-relaunch.sh`, timer at
+  Sun 04:00): drains in-flight requests (`vllm:num_requests_running` down to 0,
+  up to `MAINT_DRAIN_S` = 600 s), then `stop.sh` → `start.sh` →
+  `smoke-test.sh`, and releases the `logs/stopping` handshake only once the new
+  server is healthy, so the supervisor does not fight the maintenance window.
+- **Daily heartbeat** (`scripts/heartbeat.sh`): reports uptime, restart count
+  from supervisor state, `MemAvailable` and disk free on the checkpoint volume
+  every day. Unconditional by design — silence must read as "running".
+- **Per-launch smoke test** (`scripts/smoke-test.sh`), run after every start
+  and inside the maintenance window: `/health`, model metadata, a coherent
+  generation, temperature-0 determinism (WARN-only — the stock top-k kernel is
+  non-deterministic), decode speed (≥ 15 tok/s), a tool-call round-trip (also
+  settles the `qwen3_coder` vs `qwen3_xml` parser question on first launch)
+  and the `/metrics` endpoint.
+- **sha256 verification in `download.sh`** (`VERIFY_SHA256`, default on): the
+  Hugging Face tree API is fetched with pagination (`Link: rel="next"`, 50/page)
+  and the entry count is printed; every LFS blob's `lfs.sha256` is then checked
+  against the file on disk, naming the offender and exiting 1 on a mismatch.
+  Verified blobs are recorded in a `.sha256state` file beside the snapshot so a
+  rerun skips them instead of re-hashing the whole ~99 GiB. Catches the failure
+  class where `aria2` preallocates to the final size and then writes corrupt
+  bytes, which size checks alone cannot see.
+- **Quantization dispatch pre-flight in `start.sh`** (disable with
+  `QUANT_PREFLIGHT_DISABLED=1`): reads `quant_algo` from the checkpoint's
+  `quantization_config` and asks the image's `ModelOptMixedPrecisionConfig`
+  whether it dispatches that algo, once per launch in a throwaway container
+  (~30 s, no GPU work), refusing to launch on a mismatch. An undispatched algo
+  would silently fall back to `UnquantizedLinearMethod` and load packed FP8
+  bytes as BF16 — fluent garbage with zero errors.
+- **MTP legality guard in `start.sh`**: validates
+  `MTP_NUM_SPECULATIVE_TOKENS` against the engine's ring capacity — the
+  attention block size must divide
+  `compress_ratio × ceil((compress_ratio + k) / compress_ratio)`. The block
+  size is introspected from the image and cached keyed on the snapshot hash;
+  when introspection cannot run, it falls back to the known-good set
+  {0,2,3,4,9..12} for block 848 with a warning. k=1 is rejected as strictly
+  dominated (same cache-block cost as k=2, half the decode gain). Also refuses
+  `--async-scheduling` in `EXTRA_VLLM_ARGS` while MTP is enabled (silent
+  n-gram corruption).
+- **`MTP_DISABLE_BLOCK_DROP` knob**: when 1, merges
+  `"disable_eagle_block_drop":true` into the speculative-config JSON
+  (vllm#53388), removing MTP's fixed 1,600-token prefix-cache-block back-off per
+  turn. Ships as an opt-in while it is being A/B measured.
+- **Determinism env pass-through** (`VLLM_QSA_DET_TOPK`, `VLLM_MOE_DET_FINALIZE`,
+  both default unset): plumbing only — deterministic top-k needs a compiled
+  kernel object and bit-stable MoE finalize needs a FlashInfer autotune
+  cache-key backport, so these flags take effect once the image carries the
+  kernels. `GDN_DECODE_KERNEL` likewise ships unset: the default CUDA GDN
+  kernel deterministically hangs the engine at c≈32 with FP8 projections, so
+  the `triton` flip is deferred to a later release after a soak.
+
+### Changed
+
+- **`memwatch.sh`**: an emergency stop now writes
+  `WATCHDOG EMERGENCY STOP <reason>` as its last log line and calls
+  `scripts/alert.sh`; clean `stop.sh` paths produce neither, so the supervisor
+  can tell an emergency from a human stop. New `LEAK TREND` line — once a day
+  if the `driver` figure grows 4 GiB past its post-load baseline
+  (`TREND_WARMUP_S`/`TREND_BASELINE_S`, so the weight-load ramp cannot fake a
+  leak).
+- **The API now binds loopback by default** (`BIND`, default `127.0.0.1`).
+  Remote clients get connection refused until they set `BIND=0.0.0.0` — and
+  serve with an `--api-key`, since `start.sh` warns about exposed interfaces
+  otherwise — or use an ssh tunnel. `BIND` is validated against shell
+  metacharacters (including newline/control bytes) before reaching the launch
+  script.
+- **`stop.sh` reads `.env`** for `TP1_CONTAINER_NAME` and touches
+  `logs/stopping` so the supervisor holds off relaunching while the box is
+  intentionally stopped.
+- **Log rotation**: the container runs with `--log-opt max-size=50m
+  --log-opt max-file=3`; `scripts/memwatch-rotate.sh` copy-truncates the
+  memwatch log at 10 MB; `logs/archive/` is pruned to the newest 20 sets
+  across `start.sh`, `stop.sh` and the rotate script, never deleting a set
+  younger than `MIN_SET_AGE_S` (300 s) so the 10 s tick cannot race a
+  just-written archive.
+- **Readiness timeout**: `start.sh` waits up to `READY_TIMEOUT_S` (1800 s) for
+  `/health`, prints a heartbeat line every ~60 s with elapsed time and the last
+  `/health` code, and on timeout archives the container log to
+  `logs/archive/<c>-<ts>-timeout.log`, removes the wedged container so the
+  supervisor cannot relaunch over a still-registered name, and exits non-zero
+  (retriable by the supervisor).
+- **Memory budget**: `PLE_GIB` is now derived from the checkpoint's own PLE
+  shard sizes (index.json `weight_map` keys matching `model-ple*`) instead of a
+  hardcoded 26.82, so a future checkpoint change cannot silently mis-size the
+  budget. The container env gains `MAX_JOBS=2` and `FLASHINFER_NVCC_THREADS=1`
+  so the JIT compile fan-out after a driver upgrade cannot OOM the whole box.
+- **HF_TOKEN hygiene**: the generated `.last_launch.sh` no longer contains the
+  token value (it is resolved from the environment at exec time) and the file
+  is written `chmod 600`.
+
+### Fixed
+
+- **`EXTRA_VLLM_ARGS` is now word-split** (`read -ra`) so JSON configs or
+  multiple args in a single value land in argv correctly. Quoting inside values
+  is not supported (documented in `.env.sample`); heavy JSON belongs in the
+  scalar-built config knobs instead.
+- **`download.sh`'s download hint broke every checkpoint download**: a
+  single-quote inside the Python block of the single-quoted bash string
+  truncated it. The hint is now a double-quoted `DEFAULT_CMD` containing zero
+  single quotes.
+- **Supervisor state-file writes**: `state_set` now rewrites the file with
+  awk instead of sed, so values containing `|` or `&` (for example the memwatch
+  marker + mtime dedupe key) persist and overwrite correctly. The dedupe
+  previously failed silently, which would have let one memwatch emergency
+  re-count on every tick and trip the 3-emergency breaker.
+- **Adopted containers can now emergency-stop**: the probe-failure counter is
+  reset exactly once when the adoption grace expires instead of on every tick,
+  which had both re-zeroed the counter between probes (making the 5-failure
+  emergency unreachable) and rewritten the state file every 10 s.
+- **The supervisor's relaunch hold-off no longer blinds it**: a fresh
+  `logs/stopping` now gates relaunch *only* — a container that is actually up
+  inside a maintenance window keeps its memwatch and probe supervision. The
+  supervisor also cleans `/dev/shm` NUL-safely (`find -print0 | xargs -0`) and
+  refuses to delete segments still held by another process.
+- **Probe escalation corroborates before stopping**: consecutive probe failures
+  only trigger the emergency stop when `/health` also stops answering; queue
+  congestion under load is alerted and reset instead of stopping a healthy
+  server.
+- **`scripts/memwatch-rotate.sh` archive pruning now covers rotation-only
+  sets.** Rotation creates `<c>-<ts>-memwatch.log` without a `-container.log`
+  sibling; the prune previously only matched anchored sets, so rotated logs
+  accumulated without bound. Set retention is strictly mtime-ordered and keeps
+  the newest 20 prefixes.
+- **`MEMWATCH_GRACE` is honored by the supervisor** (forwarded to
+  `start-memwatch.sh`) instead of being a dead knob.
+- **Alert rate-limiting records a delivery only after a successful POST**, so a
+  webhook outage does not mark a message as sent and suppress its retries for
+  15 minutes.
+
+### Measured
+
+- **Reduced-vocabulary MTP drafting is now the shipped default**
+  (`.env.sample`, `start.sh`, `files/draft_vocab_en_code_47k.txt`). The +25%
+  decode win from 2026-09-05 (76.9 → 63.9 ms/step single-stream, 36.9 → 46.3
+  tok/s) was measured with `MTP_DRAFT_VOCAB` active, but the knob shipped
+  empty, so a fresh clone ran the full 248k draft head and left ~17%
+  single-stream on the table. `.env.sample` now points at the checked-in
+  47,149-row code-tuned vocab (1.18 GiB head → 0.22 GiB slice, ~2.9 GiB saved
+  per MTP-3 step), `start.sh` resolves relative paths against the repo, errors
+  when the file is missing, and warns when MTP runs with the full head. Empty
+  the knob to restore full drafting. Correctness is structural (rejection
+  sampling), so the worst case for poor coverage is slower decode, never wrong
+  output.
+
+  The shipped file was built on this host from 30 MiB of host code + docs
   (8.9M token occurrences, 47k distinct ids, 100% corpus coverage, 99.58%
-  held-out on a 80/20 split) with `files/build_draft_vocab.py`, not from the
+  held-out on an 80/20 split) with `files/build_draft_vocab.py`, not from the
   wikitext+python+model-output corpus behind the measured 65k vocab (97.3%
   model-output coverage, MGSM en 94.8% vs 93.6%, zh 86.4% vs 86.4%). Code
   traffic should match the published gain; non-code traffic (especially
@@ -55,18 +299,25 @@ as promises.
   the byte saving with acceptance preserved, exactly the mechanism the 65k
   work predicted. Peak single reps: 62.3 tok/s code single-stream, 261.9
   aggregate at 8 streams. An earlier direct-curl check agreed (+30% median on
-  a 200-token code prompt). Server log confirms 47,149/248,320 rows and
+  a 200-token code prompt). The server log confirms 47,149/248,320 rows and
   2.88 GiB saved per step; KV pool 1,164,270 → 1,177,451 tokens (restart
   variation); `MemAvailable` min 12.2 GiB, 0 `NV_ERR_NO_MEMORY`, no watchdog
-  event on either arm. Raw rows: `logs/sweep-pr39-{baseline,tuned}.jsonl`
-  (local, same convention as the overnight file).
+  event on either arm. Raw rows: `logs/sweep-{baseline,tuned}.jsonl`.
 
-### Fixed
+### Known open
 
-- **`download.sh` DL_PY quoting broke every checkpoint download** (the
-  `f"...{... else '...'}"` line inside the single-quoted bash string truncated
-  the Python block). The hint is now a double-quoted `DEFAULT_CMD`, so the
-  block contains zero single quotes. Same fix as open #33/#35.
+- `GDN_DECODE_KERNEL` stays unset this release by design; the `triton` flip is
+  deferred until after a soak produces evidence. `VLLM_USE_DEEP_GEMM` relevance
+  on this image has not been checked yet.
+- The ABLIT PLE identity check (verifying the ablit snapshot's PLE shards equal
+  the stock ones before reusing the packed table) is not implemented; `start.sh`
+  still warns that the `edit_ple` flag alone does not prove identity, and 17 of
+  34 PLE shards are known to differ between the two snapshots.
+- `MTP_DISABLE_BLOCK_DROP` is shipped but the A/B measurement deciding whether
+  it becomes a default is still open.
+- The dispatch pre-flight and MTP introspection each launch a throwaway
+  container (~30 s, no GPU work) per launch; if that is too slow on this box,
+  cache the results keyed on (image digest, snapshot hash).
 
 ## 2026-09-06
 
@@ -85,7 +336,10 @@ the vLLM counters around it. Full write-up and every table in
   **full** ~99 GiB snapshot so Hugging Face's terms gate stays in force —
   accept access on the repo page, then `ABLIT=1 ./download.sh` with
   `HF_TOKEN`. It is the same size as stock to the byte (9 of 37 shards differ
-  in content, none in length). The packed PLE table is reused from stock, but
+  in content, none in length — as later measured per-shard and filed upstream
+  as #34, the true figures are 17 of 34 model shards, 35 counting the amax
+  sidecar; see the 2026-09-09 "Known open" note below). The packed PLE table
+  is reused from stock, but
   only after `ABLIT_META.json` is confirmed to report `edit_ple: false`.
   `TP1_MODEL_ID` still overrides checkpoint selection. `README.md` summarises
   the gate's terms (18+, stated intended use, prohibited uses, Qwen Community
