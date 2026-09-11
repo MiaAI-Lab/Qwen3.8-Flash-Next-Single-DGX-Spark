@@ -60,6 +60,9 @@
 # countdown page). Checked in so smoke-test.sh needs no network to verify the
 # multimodal path.
 !/files/smoke-vision-fixture.jpeg
+# replacement chat template for CHAT_TEMPLATE (start.sh mounts it read-only
+# and switches the tool parser to qwen3_xml). v22.5, Apache-2.0.
+!/files/chat-template/chat_template.jinja
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
@@ -67,6 +70,9 @@
 # which is what makes ms/step and tokens/step comparable across launches.
 !/bench/sweep.py
 !/bench/mixed.py
+# structured (counting-stream) concurrent decode bench for when sparkDash is
+# not running; the 2026-09-11 README row was measured with it.
+!/bench/structured.py
 
 # --- measurement write-ups ---------------------------------------------
 # Host-specific, but they carry the numbers the README and CHANGELOG cite.
