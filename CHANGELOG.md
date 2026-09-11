@@ -5,6 +5,51 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-11
+
+### Added
+
+- **`CHAT_TEMPLATE` knob and the froggeric v22.5 fixed chat template**
+  (`files/chat-template/chat_template.jinja`, Apache-2.0,
+  hf.co/froggeric/Qwen-Fixed-Chat-Templates). Setting `CHAT_TEMPLATE` mounts
+  the file into the container read-only, passes `--chat-template`, and
+  switches the tool parser from `qwen3_coder` to `qwen3_xml` (the template
+  emits canonical XML tool calls). It fixes the checkpoint's stock template
+  on three real cases: `raise_exception` on `reasoning_effort` aliases
+  ("high"/"minimal"/"none" from OpenAI/Claude Code/Cline clients), a crash on
+  stringified-JSON tool arguments in history, and the xhigh-by-default
+  reasoning token burn; it also adds inline `<|think_off|>` / `<|think_low|>`
+  / `<|think_xhigh|>` steering. Verified live on this host: all four probe
+  classes pass, and a follow-up tool call round-trips through `qwen3_xml`.
+  Decode throughput is unchanged (the template is prompt-side). Client note:
+  with thinking off via `<|think_off|>` or `reasoning_effort="none"`, short
+  answers land in `reasoning_content` (vLLM qwen3 parser + prefilled closed
+  think block); explicit `enable_thinking=false` routes to `content`.
+- **`bench/structured.py`** — concurrent structured-decode bench (counting
+  stream, 400 tokens, T=0, thinking off) for when sparkDash is not running.
+  Measured on this host at `MAX_NUM_SEQS=8`, `HOST_RESERVE_GIB=28`: 65.2 /
+  116.2 / 205.9 / 313.6 aggregate tok/s at 1/2/4/8 streams (per-stream 67.7 /
+  60.7 / 53.9 / 42.8). Not comparable to the README prose tables — the
+  counting stream is MTP's best case — it exists so structured-prompt numbers
+  published for this runtime elsewhere can be compared like-for-like.
+
+### Changed
+
+- **The API binds `0.0.0.0` by default again** (`BIND`), reversing the
+  loopback-by-default migration. The box is a server; the guardrail is the
+  existing no-key path: with no `API_KEY` / `--api-key`, `start.sh` warns and
+  lists the exposed interfaces. `BIND=127.0.0.1` restores loopback-only
+  (ssh-tunnel access). The shell-metacharacter validation on `BIND` is
+  unchanged.
+- **`.env.sample` documents the `MAX_NUM_SEQS=8` + `HOST_RESERVE_GIB=28`
+  pairing.** Measured 2026-09-11: at `HOST_RESERVE_GIB=26` the 8-width
+  graph-capture spike pushed the driver to ~103 GiB, MemFree under 2 GiB for
+  5 samples with 3 NV_ERR_NO_MEMORY lines, and the watchdog emergency-stopped
+  the launch (exit 137, logs archived). At 28 the identical launch came up
+  clean; KV drops to 14.60 GiB ≈ 916,845 FP8 tokens (~3.5 full 262k
+  contexts). The ten-launch 16.67 GiB profile in the `KV_TARGET_GIB` comment
+  was measured at `MAX_NUM_SEQS=4`.
+
 ## 2026-09-10
 
 ### Fixed
