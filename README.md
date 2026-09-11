@@ -30,12 +30,12 @@ command without running anything. `./stop.sh` sends SIGTERM and waits up to
 the container runs with `--ipc host`, so segments it leaves behind leak onto
 the host's `/dev/shm` until reboot. `./stop.sh --force` skips the wait.
 
-**Migration — the API now binds to loopback.** The API previously listened on
-every interface (`--host 0.0.0.0`); it now binds `127.0.0.1` by default
-(`BIND`). Remote clients get connection refused until you either set
-`BIND=0.0.0.0` in `.env` — and serve with an `--api-key` in `EXTRA_VLLM_ARGS`,
-or `start.sh` prints a WARN with the exposed interfaces — or reach the box
-through an ssh tunnel.
+**Migration — the API binds to every interface again.** The API briefly
+defaulted to loopback (`127.0.0.1`); it now binds `0.0.0.0` by default
+(`BIND`) as it originally did. With no `API_KEY` / `--api-key` set, `start.sh`
+prints a WARN listing the exposed interfaces — anything that can reach the
+port can reach the model, so serve with a key or set `BIND=127.0.0.1` in
+`.env` and reach the box through an ssh tunnel.
 
 ## Measured profile
 
@@ -134,6 +134,24 @@ retrieval unchanged at 15/15.
 every stream count, FULL graphs throughout). K=3 wins at every concurrency,
 K=2 ties it, K=1 loses 8–14% and K=0 loses 32–46%. There is no crossover, so
 `MTP_K_SCHEDULE` has nothing to schedule. The full table is in the CHANGELOG.
+
+#### 2026-09-11: structured (counting-stream) decode at MAX_NUM_SEQS=8
+
+Same launch config as the 2026-09-06 row except `HOST_RESERVE_GIB=28` (at 26
+the 8-width graph-capture spike trips the watchdog on this host — see
+`.env.sample` under `MAX_NUM_SEQS`), measured with `bench/structured.py`:
+a counting-style predictable stream, 400 completion tokens, temperature 0,
+thinking off — the workload shape sparkDash's "structured" prompt type uses.
+**Not comparable to the prose tables above**: near-deterministic continuation
+is MTP's best case, so these read ~35% higher single-stream. They exist so
+structured-prompt numbers published elsewhere can be compared like-for-like.
+
+| streams | aggregate | per stream | TTFT |
+|---|---|---|---|
+| 1 | **65.2 tok/s** | 67.7 tok/s | ~230 ms |
+| 2 | **116.2 tok/s** | 60.7 tok/s | ~290 ms |
+| 4 | **205.9 tok/s** | 53.9 tok/s | ~315 ms |
+| 8 | **313.6 tok/s** | 42.8 tok/s | ~370–1,190 ms |
 
 **Decode under a concurrent prefill** is the one place the shipped chunk width
 hurts. With two streams decoding and one 64k prompt arriving, the gap between
@@ -476,10 +494,9 @@ access — this paragraph is a summary, and the repo's own terms are what bind.
 
 Safety refusals are removed in this checkpoint, which moves the guardrails onto
 you: filtering, human review and access control are yours to supply. That
-matters more here than on stock, because if you serve it to the network
-(`BIND=0.0.0.0` without an `--api-key`, which `start.sh` warns about), anything
-that can reach the port can reach an unfiltered model. The shipped default
-binds loopback only.
+matters more here than on stock, because the shipped default serves the
+network (`BIND=0.0.0.0`): without an `--api-key` — which `start.sh` warns
+about — anything that can reach the port can reach an unfiltered model.
 
 The abliteration splice is by **Keys (drowzeys)**, built on MiaAI Lab's
 single-Spark NVFP4 recipe over Qwen/Alibaba's Qwen3.8-Flash-Next. See the
