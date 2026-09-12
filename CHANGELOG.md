@@ -5,6 +5,21 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-12
+
+### Changed
+
+- **`ABLIT=1` now serves `iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070`** (`start.sh`,
+  `download.sh`, `README.md`): Keys' `o_proj` splice at 70% strength, same Mia
+  34-shard layout, same size, same gate terms. Keys' full-strength checkpoint
+  was clean on neutral prompts but collapsed into empty numbered lists on any
+  refusal-adjacent input and stayed there (issue #36); fp8 KV, bf16 SSM state
+  and the PLE table were each ruled out, the cause is in the nine edited
+  tensors. Interpolating them 0.7 of the way from stock keeps the refusal
+  bypass and the boundary region coherent. The checkpoint ships an
+  `ABLIT_META.json` with `edit_ple: false`, so the stock PLE table is still
+  reused and no launcher logic changed.
+
 ## 2026-09-09
 
 ### Changed

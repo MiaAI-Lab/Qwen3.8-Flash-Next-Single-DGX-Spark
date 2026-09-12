@@ -13,9 +13,9 @@
 #
 # Usage:
 #   ./download.sh                       # stock Mia NVFP4 (ABLIT=0)
-#   ABLIT=1 ./download.sh               # gated Keys ablit checkpoint (~99 GiB, same as stock).
+#   ABLIT=1 ./download.sh               # gated ablit-a070 checkpoint (~99 GiB, same as stock).
 #                                       # Set HF_TOKEN, then accept the terms on
-#                                       # https://huggingface.co/drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only
+#                                       # https://huggingface.co/iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070
 #   ./download.sh Org/Some-Other-Model  # an explicit repo id
 #   HF_TOKEN=hf_... ./download.sh       # for a gated repo
 set -euo pipefail
@@ -50,7 +50,7 @@ ABLIT="${ABLIT:-0}"
 [[ -n "$_CLI_TP1_MODEL_ID" ]] && TP1_MODEL_ID="$_CLI_TP1_MODEL_ID"
 
 STOCK_MODEL_ID="Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"
-ABLIT_MODEL_ID="drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only"
+ABLIT_MODEL_ID="iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070"
 if [[ $# -gt 0 ]]; then
     MODEL_ID="$1"
 elif [[ -n "${TP1_MODEL_ID:-}" ]]; then
