@@ -5,9 +5,11 @@
 # tp1/start.sh — Single-node, single-GPU (TP=1) vLLM launch on ONE DGX Spark.
 #
 # Serves the Mia-AiLab NVFP4 checkpoint — MXFP8 attention + a 4-bit NVFP4 PLE
-# table. ABLIT=1 in .env switches to the gated Keys checkpoint
-# (drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only): same Mia
-# 34-shard layout, QSA self_attn.o_proj replaced at L15/19/23/27/31/35/39/43/47.
+# table. ABLIT=1 in .env switches to the gated abliterated checkpoint
+# (iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070): same Mia 34-shard layout,
+# QSA self_attn.o_proj at L15/19/23/27/31/35/39/43/47 interpolated 70% of the
+# way from stock toward Keys' abliteration splice (Keys at full strength
+# degenerates into numbered lists on refusal-adjacent input; 0.7 does not).
 # That repo is gated — accept the Hugging Face terms, then ABLIT=1 ./download.sh.
 # The memory figures below were measured on the equivalent
 # local-inference-lab build (98.6 GiB on disk); re-check them if this
@@ -66,7 +68,7 @@
 # length; YARN_MAX_MODEL_LEN (default 524288) is served instead when YARN=1.
 # Both live in .env, so the 0/1 flag alone switches between them. 1M does not fit.
 # ABLIT=0/1 likewise switches the checkpoint: 0 is stock Mia NVFP4, 1 is the
-# gated Keys ablit snapshot (accept Hugging Face terms, then ./download.sh).
+# gated ablit-a070 snapshot (accept Hugging Face terms, then ./download.sh).
 # ---------------------------------------------------------------------------
 #
 # Usage:
@@ -134,8 +136,8 @@ done
 # Defaults (see tp1/.env.sample for the known-good profile).
 # ---------------------------------------------------------------------------
 STOCK_MODEL_ID="Mia-AiLab/Qwen3.8-Flash-Next-NVFP4"
-ABLIT_MODEL_ID="drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only"
-# Abliterated weights: 0 = stock Mia NVFP4, 1 = gated Keys checkpoint
+ABLIT_MODEL_ID="iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070"
+# Abliterated weights: 0 = stock Mia NVFP4, 1 = gated ablit-a070 checkpoint
 # (QSA o_proj L15/19/23/27/31/35/39/43/47). Same 0/1 pattern as YARN.
 # TP1_MODEL_ID, if set, still wins and ABLIT is ignored for selection.
 ABLIT="${_CLI_ABLIT:-${ABLIT:-0}}"
@@ -270,8 +272,8 @@ if ! [[ "$MAX_MODEL_LEN" =~ ^[1-9][0-9]*$ ]]; then
 fi
 [[ "$YARN" == "0" || "$YARN" == "1" ]] || err "YARN must be 0 or 1 (got: '$YARN')"
 if [[ "$ABLIT" == "1" ]]; then
-    warn "ABLIT=1: serving gated Keys checkpoint ($ABLIT_MODEL_ID)."
-    warn "     Safety refusals are removed. MTP, PLE, experts and the chat template stay stock."
+    warn "ABLIT=1: serving gated abliterated checkpoint ($ABLIT_MODEL_ID)."
+    warn "     Safety refusals are weakened. MTP, PLE, experts and the chat template stay stock."
     warn "     Compatible ONLY with the Mia single-Spark NVFP4 layout (this recipe)."
 fi
 
@@ -605,7 +607,7 @@ for f in ple_offload_layer connector worker protocol; do
 done
 ok "Patches ready."
 
-# The Keys splice leaves the PLE n-gram shards stock, so the packed table is
+# The ablit edit leaves the PLE n-gram shards stock, so the packed table is
 # shared with the Mia checkpoint instead of rebuilt (~27 GiB). Read that from the
 # checkpoint's own metadata rather than assuming it: if a future ablit ever
 # touches PLE, build a separate table instead of poisoning the stock cache.
@@ -714,7 +716,7 @@ VLLM_ARGS_STR="${VLLM_ARGS[*]}"
 info ""
 info "Config (single Spark, TP=1):"
 info "  Model:      $MODEL_ID"
-info "  Ablit:      $ABLIT$( [[ "$ABLIT" == "1" ]] && echo ' (gated Keys o_proj L15-47)' )"
+info "  Ablit:      $ABLIT$( [[ "$ABLIT" == "1" ]] && echo ' (gated ablit-a070, o_proj L15-47)' )"
 info "  Image:      $IMAGE"
 if [[ -n "$YARN_FACTOR" ]]; then
 info "  Context:    $MAX_MODEL_LEN tokens (YaRN factor $YARN_FACTOR over native $NATIVE_MAX_MODEL_LEN)"

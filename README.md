@@ -427,12 +427,26 @@ benchmarked end to end.
 ### Abliterated checkpoint (`ABLIT`)
 
 `ABLIT=0` serves the stock Mia NVFP4 checkpoint. `ABLIT=1` serves the gated
-Keys checkpoint
-[`drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only`](https://huggingface.co/drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only):
-the same Mia 34-shard layout with QSA `self_attn.o_proj` replaced at layers
-15, 19, 23, 27, 31, 35, 39, 43 and 47. MTP, PLE, routed experts and the chat
-template stay stock. It is valid **only** on this recipe — do not use it with
-other NVFP4 / FP8 / BF16 / GGUF trees.
+abliterated checkpoint
+[`iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070`](https://huggingface.co/iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070):
+the same Mia 34-shard layout with QSA `self_attn.o_proj` at layers 15, 19, 23,
+27, 31, 35, 39, 43 and 47 moved **70% of the way from stock toward Keys'
+abliteration splice** (`W = W_stock + 0.7 · (W_ablit − W_stock)`, requantized
+to the recipe's MXFP8). MTP, PLE, routed experts and the chat template stay
+stock. It is valid **only** on this recipe — do not use it with other NVFP4 /
+FP8 / BF16 / GGUF trees.
+
+Why 0.7 and not Keys' full-strength splice: on this host the full splice is
+clean on neutral prompts but collapses on exactly the inputs an ablit is used
+for. Anything stock would refuse or deflect turns into empty numbered lists
+(`1. Hello`, `1.`) and the conversation stays there — the "ignores every prompt
+and repeats itself" of issue #36. The serving profile is not the cause (fp8 KV,
+bf16 SSM state and the packed PLE table were each ruled out by measurement);
+the delta per edited layer is a rank-1 injection about 6× stock energy, and
+scaling it to 0.7 keeps the refusal bypass while the boundary region stays
+coherent. 0.6 measured the same; 0.8 already leaks list-form answers again.
+The checkpoint's `ABLIT_META.json` records the method, both source snapshots
+and the effective strength per layer.
 
 Both checkpoints are **byte-for-byte the same size** (105,879,543,020 bytes of
 safetensors): `o_proj` is a fixed-shape `F8_E4M3 [2560, 6144]` tensor, so
@@ -453,28 +467,30 @@ ABLIT=1 ./start.sh
 `HF_TOKEN` is required for `ABLIT=1`. A 403 means access has not been granted
 yet — **Accept the terms on that page**, then retry with `HF_TOKEN` set. Stock
 and ablit caches sit side by side; flipping `ABLIT` is the only switch. The
-packed PLE table is reused from stock (those shards are unchanged), so
-`start.sh` does not rebuild the 27 GiB table.
+packed PLE table is reused from stock (those shards are unchanged, and the
+checkpoint's `ABLIT_META.json` says so), so `start.sh` does not rebuild the
+27 GiB table.
 
-**The gate is a binding agreement, not a download button.** The checkpoint
-ships its own `RESPONSIBLE_USE.md`, and requesting access means accepting it.
-In summary: you must be 18 or older, you state your intended use on the request
-form, and the terms prohibit sexual content involving minors, material
-promoting self-harm or suicide, harassment, doxxing or fraud targeting real
-people, anything illegal in your jurisdiction, and any use barred by the
-upstream Qwen Community License. The weights are provided as-is with no
-warranty and inherit their licence from the upstream Qwen base model. Read
-`RESPONSIBLE_USE.md` and `COMPATIBILITY.md` in the repo before requesting
-access — this paragraph is a summary, and the repo's own terms are what bind.
+**The gate is a binding agreement, not a download button.** The access form
+carries the same Responsible Use terms as Keys' checkpoint, and requesting
+access means accepting them. In summary: you must be 18 or older, you state
+your intended use on the request form, and the terms prohibit sexual content
+involving minors, material promoting self-harm or suicide, harassment, doxxing
+or fraud targeting real people, anything illegal in your jurisdiction, and any
+use barred by the upstream Qwen Community License. The weights are provided
+as-is with no warranty and inherit their licence from the upstream Qwen base
+model. Read the terms on the repo page before requesting access — this
+paragraph is a summary, and the repo's own terms are what bind.
 
-Safety refusals are removed in this checkpoint, which moves the guardrails onto
-you: filtering, human review and access control are yours to supply. That
+Safety refusals are weakened in this checkpoint, which moves the guardrails
+onto you: filtering, human review and access control are yours to supply. That
 matters more here than on stock, because `start.sh` binds the server to
 `0.0.0.0` — anything that can reach the port can reach an unfiltered model.
 
-The abliteration splice is by **Keys (drowzeys)**, built on MiaAI Lab's
-single-Spark NVFP4 recipe over Qwen/Alibaba's Qwen3.8-Flash-Next. See the
-checkpoint's `CREDITS.md`, and [Credits](#credits) below.
+The abliteration splice this checkpoint interpolates toward is by **Keys
+(drowzeys)**, built on MiaAI Lab's single-Spark NVFP4 recipe over
+Qwen/Alibaba's Qwen3.8-Flash-Next; the 0.7 interpolation and its packaging are
+by **iSkye**. See [Credits](#credits) below.
 
 ### Reasoning is on by default
 
@@ -795,7 +811,7 @@ buffer or missing quant scales) — see the patch notes below.
 
 - `download.sh` — fetches the checkpoint into the Hugging Face cache
   (resumable; honours `HF_TOKEN` for gated repos). `ABLIT=1` downloads the
-  full Keys ablit snapshot after you accept the Hugging Face terms. Uses the
+  full ablit-a070 snapshot after you accept the Hugging Face terms. Uses the
   host's `huggingface_hub` if present, otherwise the container image.
 - `start.sh` — launcher: derives the GPU budget from live memory under the
   `HOST_RESERVE_GIB` cap, builds the packed PLE table on first run,
@@ -869,9 +885,11 @@ sparkDash's own figures include any other traffic on the port.
   [`Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
 - **local-inference-lab** — the byte-identical Spark checkpoint used as the
   splice base.
-- **Keys (drowzeys)** — the abliteration splice served by `ABLIT=1` (QSA
-  `o_proj` at L15–47 in MXFP8; MTP, routed experts, PLE and the chat template
-  left stock) and its packaging.
+- **Keys (drowzeys)** — the abliteration splice (QSA `o_proj` at L15–47 in
+  MXFP8; MTP, routed experts, PLE and the chat template left stock) that the
+  `ABLIT=1` checkpoint interpolates toward.
+- **iSkye** — the 0.7 interpolation of that splice served by `ABLIT=1`
+  (`iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070`) and its packaging.
 - **[lancelind/qwen3.8-Flash-DGX](https://github.com/lancelind/qwen3.8-Flash-DGX)**
   (Apache-2.0) — the FP8-KV approach behind one patch here, reimplemented
   against this image's own sources. See
@@ -913,8 +931,7 @@ they operate on, each of which carries its own terms:
 - **The model checkpoint** `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` — weights are
   governed by the checkpoint's own license, not by this repository's.
 - **The abliterated checkpoint**
-  `drowzeys/keys-Qwen3.8-flash-next-ablit-Mia-Single-Spark-only`, served only
-  when you opt in with `ABLIT=1` — gated on Hugging Face behind its own
-  `RESPONSIBLE_USE.md` agreement, with its licence inherited from the upstream
-  Qwen base model. This repository ships a flag that can serve those weights.
+  `iSkye/Qwen3.8-Flash-Next-NVFP4-ablit-a070`, served only
+  when you opt in with `ABLIT=1` — gated on Hugging Face behind a Responsible
+  Use agreement, with its licence inherited from the upstream Qwen base model. This repository ships a flag that can serve those weights.
   It does not redistribute them and does not relicense them.
