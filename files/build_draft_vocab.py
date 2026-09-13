@@ -11,9 +11,11 @@ and not the prompts.
   python3 files/build_draft_vocab.py corpus.jsonl --out draft_vocab.txt --size 32768
 
 Reads .jsonl with a "text" field, or plain .txt. Always keeps every special /
-added token, whatever its frequency: those are cheap (a few hundred rows) and
-losing one costs acceptance at exactly the structural boundaries where drafts
-are otherwise easiest.
+added token AND every byte-level token, whatever their frequency: those are
+cheap (a few hundred rows) and losing one costs acceptance at exactly the
+structural boundaries where drafts are otherwise easiest. Byte-level tokens
+matter most for non-English text -- they are what BPE falls back to for
+multi-byte UTF-8 -- and frequency alone will not keep them on a small corpus.
 
 Coverage, not size, is the number to tune on. Report prints the fraction of
 corpus token occurrences the chosen vocabulary covers; the tokens it misses
@@ -87,6 +89,30 @@ def main() -> None:
     special = set(tok.all_special_ids or [])
     added = getattr(tok, "added_tokens_encoder", {}) or {}
     special |= {int(i) for i in added.values()}
+
+    # Byte-level tokens are pinned for the same reason as special tokens, and
+    # the reason is sharper: they are the pieces BPE falls back to for anything
+    # the merges do not cover, which on this tokenizer means every multi-byte
+    # UTF-8 sequence -- accented Latin, CJK, emoji. They are ~256 rows, so
+    # keeping them is free.
+    #
+    # Frequency alone does NOT keep them. A corpus large and varied enough
+    # exercises them often enough to rank; a smaller or narrower one does not,
+    # and then they are silently dropped. Measured on this checkpoint: a build
+    # over 513 MiB of wikitext keeps 376 ids below 400, while one over 11.7 MB
+    # of conversation logs keeps 286 -- 90 fewer, and the missing ones are what
+    # assemble "n-tilde" and the accents. The resulting drafter proposes badly
+    # at exactly those boundaries.
+    byte_level = set()
+    for tid in range(min(512, vocab_size)):
+        piece = tok.convert_ids_to_tokens(tid)
+        if not isinstance(piece, str):
+            continue
+        # "<0xNN>" style, or a single char from the byte-level alphabet
+        if (piece.startswith("<0x") and piece.endswith(">")) or len(piece) == 1:
+            byte_level.add(tid)
+    special |= byte_level
+
     special = {i for i in special if 0 <= i < vocab_size}
 
     ranked = [tid for tid, _ in counts.most_common()]
@@ -105,7 +131,7 @@ def main() -> None:
           f"{len(counts):,} distinct ids")
     print(f"vocabulary:  {vocab_size:,} -> {len(keep):,} "
           f"({100.0 * len(keep) / vocab_size:.1f}%), "
-          f"{len(special)} special/added kept unconditionally")
+          f"{len(special)} pinned unconditionally ({len(byte_level)} byte-level)")
     print(f"coverage:    {100.0 * covered / total:.4f}% of corpus occurrences")
     miss = total - covered
     print(f"             {miss:,} occurrences ({100.0 * miss / total:.4f}%) fall "
