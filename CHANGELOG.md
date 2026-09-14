@@ -7,6 +7,31 @@ as promises.
 
 ## 2026-09-14
 
+### Added
+
+- **Spanish-extended draft vocabulary for deployments serving Spanish**
+  (oscarmenendezgarcia's `gb10-host-adaptation` work, taken as files with
+  authorship preserved in history). `files/draft_vocab_es_en_code_65k.txt`:
+  65,536 rows built by `files/build_draft_vocab_extend.py` — the shipped 47k
+  file whole as a floor (verified: 0 of our 47,172 ids missing) plus 668 MiB
+  of Spanish Wikipedia at natural frequencies, byte-fallback range pinned.
+  Measured on his host with an interleaved ABBA protocol (five prompts per
+  language, drift-cancelling): **Spanish 32.6 → 41.9 tok/s (+28.6%),
+  acceptance 0.94 → 1.56, English unchanged**, for 9% of the draft-head byte
+  saving. Root cause: the 47k English+code file covers only 64.4% of Spanish
+  output occurrences — the reduced-vocab win was largely an English win, and
+  nobody had measured Spanish. Quality is unaffected either way (rejection
+  sampling; ~60,000 audited Spanish tokens, zero replacement characters,
+  zero dialect-drift markers) — this is purely the speed of Spanish traffic.
+  Switch with `MTP_DRAFT_VOCAB=files/draft_vocab_es_en_code_65k.txt`.
+  Companion harnesses: `bench/audit-spanish.py` (per-paragraph Spanish
+  quality gate), `bench/structured-protocol.py`, `bench/verify-smoke.py`,
+  and the full write-up `docs/spanish-drafting-and-performance-2026-09-13.md`
+  — which also documents two findings beyond drafting: sampling parameters
+  differ per mode (thinking vs instruct) and mismatches cause language
+  mixing, and structured-vs-realistic benchmark families are not comparable
+  across recipes.
+
 ### Fixed
 
 - **`build_draft_vocab.py` pins byte-level fallback tokens** (PR #43,
@@ -21,10 +46,8 @@ as promises.
   ids English frequency alone had not kept (À Á Ð å æ ç è ñ ò ó ô õ ö ÷ ø ù
   ú û ü ý þ ÿ č) — 47,149 → 47,172 rows, pure addition, no removals.
   Correctness is unchanged (rejection sampling); non-English and mixed
-  traffic drafts better. Related measurement from the same author, worth
-  knowing before serving non-English traffic: the English+code vocab covers
-  ~64% of Spanish output occurrences (acceptance 1.01, 33.8 vs 45.9 tok/s) —
-  rebuild from your own output distribution for non-English deployments.
+  traffic drafts better. For Spanish traffic specifically, see the 65k
+  Spanish-extended vocabulary in Added above.
 
 ## 2026-09-11
 

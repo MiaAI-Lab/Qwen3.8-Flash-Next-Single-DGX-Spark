@@ -51,9 +51,16 @@
 # vocab the +25% decode win was measured with is a generated artifact and is
 # not tracked; this smaller file makes the default path work out of the box.
 !/files/draft_vocab_en_code_47k.txt
+# Spanish-extended variant (65,536 rows, the 47k file as floor + Spanish
+# Wikipedia; +28.6% Spanish decode, English untouched). For deployments
+# serving Spanish traffic; see docs/spanish-drafting-and-performance-*.md.
+!/files/draft_vocab_es_en_code_65k.txt
 # builds the reduced draft vocabulary the MTP patch reads. Its output is a
 # generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
 !/files/build_draft_vocab.py
+# extends a shipped vocab with a second language, floor-only + byte-fallback
+# pin (oscarmenendezgarcia). Built the 65k ES file above.
+!/files/build_draft_vocab_extend.py
 # recommended kernel VM tunables (not applied by anything here)
 !/files/sysctl-spark3.conf
 # vision smoke-test fixture (13 KB, 400x225 JPEG: Qwen3.8-Flash-Next release
@@ -73,12 +80,20 @@
 # structured (counting-stream) concurrent decode bench for when sparkDash is
 # not running; the 2026-09-11 README row was measured with it.
 !/bench/structured.py
+# Spanish quality gate + comparable-protocol bench (oscarmenendezgarcia);
+# the Spanish write-up below cites them.
+!/bench/audit-spanish.py
+!/bench/structured-protocol.py
+!/bench/verify-smoke.py
 
 # --- measurement write-ups ---------------------------------------------
 # Host-specific, but they carry the numbers the README and CHANGELOG cite.
 !/docs/synthesis-astra-fable-2026-09-05.md
 !/docs/overnight-2026-09-05.md
 !/docs/goal-overnight-2026-09-05.md
+# Serving Spanish: draft-vocab coverage, per-mode sampling, benchmark
+# comparability (oscarmenendezgarcia). The 65k ES-extended vocab cites it.
+!/docs/spanish-drafting-and-performance-2026-09-13.md
 
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
