@@ -476,6 +476,56 @@ The abliteration splice is by **Keys (drowzeys)**, built on MiaAI Lab's
 single-Spark NVFP4 recipe over Qwen/Alibaba's Qwen3.8-Flash-Next. See the
 checkpoint's `CREDITS.md`, and [Credits](#credits) below.
 
+### NVIDIA's official checkpoint (`TP1_MODEL_ID`)
+
+`./download.sh nvidia/Qwen3.8-Flash-Next-NVFP4` (or `TP1_MODEL_ID=nvidia/Qwen3.8-Flash-Next-NVFP4 ./start.sh`)
+serves [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+instead of the stock Mia checkpoint. It is NVIDIA's own Model Optimizer
+(v0.46.0) quantization of the same upstream `Qwen/Qwen3.8-Flash-Next`, not a
+community re-quant: mixed precision (MSE-calibrated NVFP4 on routed MoE
+experts, BF16 kept on attention/shared-experts, FP8 MTP), 124 GiB rather than
+the stock 99 GiB. Weights are unmodified NVIDIA output — this is a serving
+compatibility layer, not a re-quantization or a merge of the two checkpoints.
+
+It needed two fixes beyond pointing `TP1_MODEL_ID` at it, both because its
+internal layout differs from the stock checkpoint this recipe was built
+against:
+
+- **PLE table format.** Stock's n-gram table is NVFP4-coded (`U8` 4-bit codes
+  + a per-shard `F8_E4M3` scale). NVIDIA's is plain per-tensor `F8_E4M3`
+  bytes with a single global `BF16` scale — verified against the checkpoint's
+  own tensors (`shard_N.weight` dtype, no per-shard `weight_scale`).
+  `build_ple_packed_table.py` now branches on the shard dtype; the packed
+  table this produces is 47.68 GiB (not the stock 26.82 GiB — set `PLE_GIB`
+  accordingly, see `.env.sample`). `tests/test_nvidia_ple.py` covers both
+  builder paths plus a byte-exact sample check against the real downloaded
+  checkpoint.
+- **MTP MoE quantization.** NVIDIA's `hf_quant_config.json` declares the MTP
+  draft model's routed experts under their own local layer index
+  (`mtp.layers.0.mlp.experts`, `quant_algo: FP8_BLOCK_SCALES`, `group_size:
+  128`), but `mtp.py`'s `remap_weight_names()` mounts those tensors at the
+  model's global layer index (`mtp.layers.48...`, after the main model's own
+  layers) without renumbering the quantization declaration to match, so it's
+  never found. ModelOpt's config parsing also normalizes that declared
+  algorithm to its own internal name, `FP8_PB_WO` (128x128 block-scaled FP8 —
+  same layout `ModelOptFp8PbWoLinearMethod` already handles for Linear
+  layers, confirmed against this checkpoint's tensors: `down_proj` weight
+  `[2560, 640]` F8_E4M3, `weight_scale_inv` `[20, 5]` BF16), for which
+  `get_quant_method` had no `RoutedExperts` branch at all. `patch_modelopt_mxfp8.py`
+  now bridges the local/global index (MTP always has exactly one local
+  layer) and routes `FP8_PB_WO` MoE experts to vLLM's native (non-ModelOpt)
+  `Fp8MoEMethod`/`Fp8Config`, the same block-scaled implementation DeepSeek-V3
+  checkpoints use. `tests/test_nvidia_mtp.py` covers the index bridging.
+
+Verified on a single DGX Spark (GB10, 121 GiB): clean boot at the shipped
+profile (262144 context, MTP 3, FP8 KV, `CUDAGRAPH_MODE=FULL_DECODE_ONLY`),
+correct Korean generation and `tool_calls` output, ~25 tok/s end-to-end
+(prefill included) on a short single-stream request versus ~18 tok/s with MTP
+off on the same host. That is a spot check, not a sparkDash sweep — the
+prefill/decode tables above are stock-checkpoint numbers and do not apply
+here; NVIDIA's own model card has the accuracy comparison against `Qwen3.8-27B`
+and other baselines.
+
 ### Reasoning is on by default
 
 This build reasons before answering, and `start.sh` passes
@@ -834,7 +884,11 @@ sparkDash's own figures include any other traffic on the port.
   offload; tolerates multi-call `load_weights`; slices the 2560-wide IPC buffer
   to the 1440 valid bytes.
 - **ModelOpt** (`patch_modelopt_mxfp8.py`): BF16 fallback for MXFP8 shapes that
-  FlashInfer rejects.
+  FlashInfer rejects. Also, unrelated to MXFP8: bridges NVIDIA checkpoints'
+  MTP quantized_layers local-index declaration to the global index vLLM
+  queries, and dispatches ModelOpt's `FP8_PB_WO` to vLLM's native block-scaled
+  `Fp8MoEMethod` for `RoutedExperts` (no ModelOpt-native MoE method for it
+  exists) — see [NVIDIA's official checkpoint](#nvidia-s-official-checkpoint-tp1_model_id) above.
 - **PLE offload** (`patch_ple_offload.py`): GB10 has no CUDA stream memory ops
   (`CAN_USE_STREAM_MEM_OPS=0`, measured), and vLLM's offload semaphore used them
   and deadlocked after graph capture. Replaced with a host-side handshake — the
@@ -865,6 +919,11 @@ sparkDash's own figures include any other traffic on the port.
 
 - **Qwen / Alibaba** — [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
   the base model everything here derives from.
+- **NVIDIA** — [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4),
+  the official mixed-precision Model Optimizer quantization served by
+  `TP1_MODEL_ID`. Weights are unmodified NVIDIA output; the PLE-format and
+  MTP quant_algo fixes above are this repository's own compatibility work,
+  not a re-quantization.
 - **MiaAI Lab** — the single-DGX-Spark NVFP4 recipe and
   [`Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
 - **local-inference-lab** — the byte-identical Spark checkpoint used as the

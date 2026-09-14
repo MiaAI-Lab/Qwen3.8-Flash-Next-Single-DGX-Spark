@@ -43,6 +43,12 @@
 # recommended kernel VM tunables (not applied by anything here)
 !/files/sysctl-spark3.conf
 
+# --- regression tests ---------------------------------------------------
+# CPU-only, run inside the pinned image against the patched modelopt.py/
+# ple_layer.py; see README for the docker invocation.
+!/tests/test_nvidia_ple.py
+!/tests/test_nvidia_mtp.py
+
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
 # concurrency level at a time and read the vLLM counters around each level,
