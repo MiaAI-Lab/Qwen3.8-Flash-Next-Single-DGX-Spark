@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Scheduled graceful relaunch — weekly maintenance drain + restart (plan 1.4).
+#
+# Install:
+#   cp qwen38-flash-maintenance.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now qwen38-flash-maintenance.timer
+#
+# The timer runs maintenance-relaunch.sh, which touches logs/stopping (the
+# supervisor's "do not fight maintenance" flag), drains in-flight requests,
+# restarts, smoke-tests and only then releases the flag.
+[Unit]
+Description=Qwen3.8-Flash-Next weekly maintenance relaunch
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/qwen38-flash-next
+ExecStart=%h/qwen38-flash-next/scripts/maintenance-relaunch.sh
+TimeoutStartSec=45min
+# OnFailure= only matters for short-lived units; oneshot ones that fail
+# transition to failed state and are surfaced by the heartbeat path anyway.

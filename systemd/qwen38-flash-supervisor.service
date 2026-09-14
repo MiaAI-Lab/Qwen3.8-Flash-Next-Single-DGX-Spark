@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# systemd USER unit for the 24/7 supervisor.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp qwen38-flash-supervisor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now qwen38-flash-supervisor
+#   loginctl enable-linger "$USER"        # start at boot without login
+#
+# The container itself runs WITHOUT docker --restart: the supervisor is the
+# single state machine, and a docker-restarted container would come back
+# unwatched (memwatch dead) with stale shm. Restart=on-failure here is safe:
+# the circuit-breaker state survives in logs/supervisor.state, so restarting
+# the supervisor does not reset it (jschmied's rule: guards must not reset on
+# the guard's own restart).
+#
+# The unit cannot order after docker.service (docker is a system unit); the
+# supervisor polls `docker info` at boot instead.
+[Unit]
+Description=Qwen3.8-Flash-Next 24/7 supervisor (single Spark, TP=1)
+After=network-online.target
+Wants=network-online.target
+OnFailure=qwen38-flash-supervisor-failure@%n.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/qwen38-flash-next
+ExecStart=%h/qwen38-flash-next/scripts/supervise.sh
+# Restarting the supervisor after a crash is fine: a tick has no critical
+# work in flight. The breaker state lives in the state file, not in systemd.
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

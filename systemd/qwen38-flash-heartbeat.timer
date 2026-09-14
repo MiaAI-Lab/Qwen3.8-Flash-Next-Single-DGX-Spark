@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Daily heartbeat timer (plan 1.5): unconditional, so silence reads as
+# "running" is impossible. Reports uptime, restart count, MemAvailable, disk.
+[Unit]
+Description=Daily heartbeat for Qwen3.8-Flash-Next
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

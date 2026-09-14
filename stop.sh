@@ -7,9 +7,21 @@
 # POSIX shared-memory segments the PLE offload handshake allocates. The
 # container runs with --ipc host, so anything it leaves behind leaks onto the
 # host's /dev/shm and survives until reboot. Use --force to skip the wait.
+#
+# Touches logs/stopping while the stop is in progress so the supervisor waits
+# instead of relaunching a container the human deliberately stopped. Remove
+# that file (or reboot) to let the supervisor bring the server back up.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_CONTAINER_NAME="${TP1_CONTAINER_NAME:-}"
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    # shellcheck source=.env
+    source "$SCRIPT_DIR/.env"
+fi
+if [[ -n "$_CONTAINER_NAME" ]]; then
+    TP1_CONTAINER_NAME="$_CONTAINER_NAME"
+fi
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"      # seconds before docker escalates to SIGKILL
 
@@ -29,6 +41,12 @@ if pkill -f "memwatch.sh $CONTAINER_NAME" 2>/dev/null; then
     echo "watchdog stopped"
 fi
 
+# Signal the supervisor not to fight us: while this flag exists the
+# supervisor holds off relaunching. start.sh / maintenance-relaunch.sh manage
+# its lifecycle around their own relaunches.
+mkdir -p "$SCRIPT_DIR/logs"
+touch "$SCRIPT_DIR/logs/stopping"
+
 if [[ -z "$(docker ps -aq -f "name=^${CONTAINER_NAME}$")" ]]; then
     echo "$CONTAINER_NAME was not running"
 else
@@ -40,6 +58,11 @@ else
     [[ -s "$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log" ]] \
         && cp -f "$SCRIPT_DIR/logs/memwatch-${CONTAINER_NAME}.log" "$ARCHIVE_DIR/${CONTAINER_NAME}-${TS}-memwatch.log"
     echo "archived logs to logs/archive/${CONTAINER_NAME}-${TS}-{container,memwatch}.log"
+    # Keep newest 20 archive sets (same rule as start.sh and the supervisor).
+    ls -1t "$ARCHIVE_DIR"/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+        _set="${f%-container.log}"
+        rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
+    done
     if [[ "$FORCE" == false ]]; then
         echo "stopping $CONTAINER_NAME (SIGTERM, up to ${STOP_TIMEOUT}s)..."
         docker stop -t "$STOP_TIMEOUT" "$CONTAINER_NAME" >/dev/null 2>&1 || true
