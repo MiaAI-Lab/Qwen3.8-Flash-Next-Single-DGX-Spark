@@ -5,6 +5,27 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-14
+
+### Fixed
+
+- **`build_draft_vocab.py` pins byte-level fallback tokens** (PR #43,
+  oscarmenendezgarcia). Special/added tokens were already kept
+  unconditionally; byte-level tokens (`<0xNN>`, the pieces BPE falls back to
+  for every multi-byte UTF-8 sequence — accented Latin, CJK, emoji) lived or
+  died by corpus frequency, and on a small or narrow corpus they were
+  silently dropped (measured: 376 vs 286 ids below 400 on 513 MiB wikitext vs
+  11.7 MB conversation logs), leaving the drafter proposing badly at exactly
+  those boundaries. The builder now pins all 256 byte-level ids alongside the
+  33 special/added. The shipped `draft_vocab_en_code_47k.txt` gains the 23
+  ids English frequency alone had not kept (À Á Ð å æ ç è ñ ò ó ô õ ö ÷ ø ù
+  ú û ü ý þ ÿ č) — 47,149 → 47,172 rows, pure addition, no removals.
+  Correctness is unchanged (rejection sampling); non-English and mixed
+  traffic drafts better. Related measurement from the same author, worth
+  knowing before serving non-English traffic: the English+code vocab covers
+  ~64% of Spanish output occurrences (acceptance 1.01, 33.8 vs 45.9 tok/s) —
+  rebuild from your own output distribution for non-English deployments.
+
 ## 2026-09-11
 
 ### Added
