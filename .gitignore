@@ -56,6 +56,10 @@
 !/docs/overnight-2026-09-05.md
 !/docs/goal-overnight-2026-09-05.md
 
+# --- API usage reporting and CPU-only regression ------------------------
+!/docs/cache-reporting.md
+!/tests/test_prompt_token_details.py
+
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
 #   .env                      may contain HF_TOKEN

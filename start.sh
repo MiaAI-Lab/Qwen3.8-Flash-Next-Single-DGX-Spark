@@ -637,6 +637,7 @@ ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$
 # 5. Build vLLM args.
 # ---------------------------------------------------------------------------
 VLLM_ARGS=()
+VLLM_ARGS+=("--enable-prompt-tokens-details")
 VLLM_ARGS+=("--served-model-name" "$SERVED_MODEL_NAME")
 VLLM_ARGS+=("--tensor-parallel-size" "1")
 VLLM_ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")
