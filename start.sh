@@ -232,13 +232,20 @@ MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 # Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
-# PLE_GIB is derived from the checkpoint's own PLE shard sizes, not from a
-# constant: it subtracts the PLE shards from the on-disk checkpoint size to
-# get GPU-resident weights (start.sh:448). The shipped stock and ablit
-# snapshots are both 26.82 today; the derivation keeps a future checkpoint
-# change from silently mis-sizing the budget. An explicit PLE_GIB override
-# still wins.
-PLE_GIB="${PLE_GIB:-}"
+# PLE_GIB: the packed PLE table's size, subtracted from the on-disk
+# checkpoint size to get GPU-resident weights. The stock and ablit snapshots
+# are both 26.82 (measured, drill report 2026-09-10); the NVIDIA checkpoint
+# (model-fp8-mtp-ple.safetensors) packs 47.68 GiB of PLE in a file whose name
+# contains no "model-ple", so a shard-name derivation cannot find it — set it
+# explicitly for that checkpoint (see .env.sample's reserve table).
+PLE_GIB="${PLE_GIB:-26.82}"
+# GiB of MTP draft weights that live inside the checkpoint but are only loaded
+# when MTP is on. Reason: PLE_GIB subtracts the PLE table from the checkpoint
+# size, but on checkpoints that pack the draft model into the same file (NVIDIA
+# ships model-fp8-mtp-ple.safetensors: 47.68 GiB PLE + 2.34 GiB MTP) the draft
+# weights stay in the derived GPU figure even at MTP_NUM_SPECULATIVE_TOKENS=0,
+# where nothing loads them. Credited back below, MTP-off only. 0 = no credit.
+MTP_WEIGHTS_GIB="${MTP_WEIGHTS_GIB:-0}"
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 REQUIRE_IDLE_GPU="${_CLI_REQUIRE_IDLE_GPU:-${REQUIRE_IDLE_GPU:-true}}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
@@ -472,42 +479,6 @@ info "=== Step 2: Memory budget ==="
 KV_BYTES_PER_TOKEN=29482          # measured: 28.8 KiB/token, bf16 KV, this arch
 WEIGHT_BYTES=$(du -sb "$MODEL_PATH/$SNAPSHOT_REL/" -L | cut -f1)
 
-# PLE_GIB from the snapshot's actual PLE shard files (index.json weight_map
-# keys matching model-ple*), not from the packed table's du. An override wins.
-# Shipped checkpoints pack the PLE shards as model-ple* files; if a future
-# checkpoint packs them inside the main shards instead, the derivation finds
-# nothing and falls back to the measured 26.82 (drill report 2026-09-10: the
-# stock snapshot reads 0.00 without the fallback and the budget goes negative).
-if [[ -z "$PLE_GIB" ]]; then
-    _PLE_DERIVED=$(python3 - "$MODEL_PATH/$SNAPSHOT_REL" <<'PY'
-import json, pathlib, sys
-snap = pathlib.Path(sys.argv[1])
-idx = snap / "model.safetensors.index.json"
-try:
-    wm = json.loads(idx.read_text())["weight_map"]
-except Exception:
-    wm = {}
-gib = 0.0
-for name in set(wm.values()):
-    if "model-ple" in name:
-        f = snap / name
-        if f.is_file():
-            gib += f.stat().st_size
-print(f"{gib/2**30:.2f}")
-PY
-)
-    if [[ "$_PLE_DERIVED" == "0.00" ]]; then
-        PLE_GIB="26.82"
-        warn "PLE_GIB: no model-ple* shards found in this snapshot (PLE packed inside"
-        warn "     the main shards); using the measured 26.82 fallback."
-    else
-        PLE_GIB="$_PLE_DERIVED"
-        if [[ "$PLE_GIB" != "26.82" ]]; then
-            info "  PLE_GIB derived from checkpoint PLE shards: ${PLE_GIB} GiB (not the stock 26.82)."
-        fi
-    fi
-fi
-
 read -r MEM_TOTAL_GIB MEM_AVAIL_GIB MEM_USED_GIB SWAP_USED_GIB <<<"$(python3 -c "
 m={l.split(':')[0]:int(l.split()[1]) for l in open('/proc/meminfo') if ':' in l}
 g=1048576
@@ -515,7 +486,12 @@ print(m['MemTotal']/g, m['MemAvailable']/g,
       f\"{(m['MemTotal']-m['MemAvailable'])/g:.1f}\", f\"{(m['SwapTotal']-m['SwapFree'])/g:.1f}\")")"
 
 MTP_GIB=0
-[[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]] && MTP_GIB=1.49
+MTP_OFF_CREDIT=0
+if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    MTP_GIB=1.49
+else
+    MTP_OFF_CREDIT="$MTP_WEIGHTS_GIB"
+fi
 KV_MULT=1.0
 # FP8 halves the main KV (12 full-attn layers, ~84% of bytes/token) but the QSA
 # side/compressor caches stay BF16, so the real saving is ~1.7x, not 2x.
@@ -531,6 +507,7 @@ KV_MULT=1.0
 read -r WEIGHTS_GPU_GIB KV_NEED_GIB BUDGET_GIB DERIVED_GMU KV_EXPECT_GIB KV_EXPECT_TOK BUDGET_CAP_GIB CAP_BINDS <<<"$(python3 -c "
 import math
 w=$WEIGHT_BYTES/2**30-$PLE_GIB
+w-=min($MTP_OFF_CREDIT,max(w,0))
 fixed=w+$OVERHEAD_GIB+$MTP_GIB
 kv_need=$MAX_MODEL_LEN*$KV_BYTES_PER_TOKEN*$KV_MULT/2**30
 wish=fixed+max(kv_need,$KV_TARGET_GIB)
@@ -561,6 +538,7 @@ MAX_CONTAINER_GIB=$(python3 -c "print(int($MEM_TOTAL_GIB-$OS_RESERVE_GIB))")
 
 info "  unified pool ............. ${MEM_TOTAL_GIB%.*} GiB total, ${MEM_AVAIL_GIB%.*} GiB available now"
 info "  weights on GPU ........... ${WEIGHTS_GPU_GIB} GiB  (checkpoint minus ${PLE_GIB} GiB PLE table)"
+[[ "$MTP_OFF_CREDIT" != 0 ]] && info "  MTP draft weights ........ ${MTP_OFF_CREDIT} GiB  credited back (MTP off: packed in the checkpoint, never loaded)"
 info "  PLE table ................ ${PLE_GIB} GiB  memory-mapped in the CPU offload worker"
 info "  runtime overhead ......... ${OVERHEAD_GIB} GiB"
 [[ "$MTP_GIB" != 0 ]] && info "  MTP draft model .......... ${MTP_GIB} GiB"
@@ -833,6 +811,7 @@ ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$
 # 5. Build vLLM args.
 # ---------------------------------------------------------------------------
 VLLM_ARGS=()
+VLLM_ARGS+=("--enable-prompt-tokens-details")
 VLLM_ARGS+=("--served-model-name" "$SERVED_MODEL_NAME")
 VLLM_ARGS+=("--tensor-parallel-size" "1")
 VLLM_ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")

@@ -71,6 +71,12 @@
 # and switches the tool parser to qwen3_xml). v22.5, Apache-2.0.
 !/files/chat-template/chat_template.jinja
 
+# --- regression tests ---------------------------------------------------
+# CPU-only, run inside the pinned image against the patched modelopt.py/
+# ple_layer.py; see README for the docker invocation.
+!/tests/test_nvidia_ple.py
+!/tests/test_nvidia_mtp.py
+
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
 # concurrency level at a time and read the vLLM counters around each level,
@@ -94,6 +100,10 @@
 # Serving Spanish: draft-vocab coverage, per-mode sampling, benchmark
 # comparability (oscarmenendezgarcia). The 65k ES-extended vocab cites it.
 !/docs/spanish-drafting-and-performance-2026-09-13.md
+
+# --- API usage reporting and CPU-only regression ------------------------
+!/docs/cache-reporting.md
+!/tests/test_prompt_token_details.py
 
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts

@@ -229,8 +229,7 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
-    # MIXED_PRECISION checkpoints (modelopt_mixed) declare the PLE table
-    # format in text_config.ple_embedding_dtype, not via ModelOptNvFp4Config.
+    # Some checkpoints declare PLE storage directly in text_config.
     if _ple_dtype_is_nvfp4(ple_embedding_dtype):
         logger.info_once(
             "PLE embedding %s uses the runtime NVFP4 method (ple_embedding_dtype)",
@@ -243,6 +242,20 @@ def _get_ple_embedding_quant_method(
             prefix,
         )
         return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # NVIDIA stores this in quantized_layers, without ple_embedding_dtype.
+        # Use vLLM's resolver: apply_vllm_mapper has already renamed HF prefixes.
+        algo = quant_config._resolve_quant_algo(prefix)
+        if algo == "FP8":
+            logger.info_once("PLE embedding %s uses ModelOpt mixed FP8", prefix)
+            return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+        if algo == "NVFP4":
+            logger.info_once("PLE embedding %s uses ModelOpt mixed NVFP4", prefix)
+            return Qwen3_8FlashNextPLENVFp4EmbeddingMethod()
+        if algo is not None:
+            raise ValueError(f"Unsupported ModelOpt PLE storage {algo}: {prefix}")
+        return None
 
     if isinstance(quant_config, Fp8Config):
         if not quant_config.is_checkpoint_fp8_serialized:
@@ -571,7 +584,7 @@ def main() -> None:
             "import os\n"
             "from vllm.logger import init_logger\n"
             "from vllm.model_executor.layers.quantization.modelopt import "
-            "ModelOptNvFp4Config\n"
+            "ModelOptNvFp4Config, ModelOptMixedPrecisionConfig\n"
             "from vllm.model_executor.utils import set_weight_attrs\n\n"
             "logger = init_logger(__name__)\n",
         ),
@@ -827,7 +840,8 @@ def main() -> None:
             "                    getattr(emb, \"_packed_table_fd\", None), ids, row_width\n"
             "                )\n"
             "                torch.index_select(\n"
-            "                    packed, 0, ids, out=output.reshape(-1, row_width)\n"
+            "                    packed, 0, ids,\n"
+            "                    out=output.reshape(-1, row_width).view(torch.uint8)\n"
             "                )\n"
             "                return output\n"
             "            if scales is not None and scales.dim() == 2:\n"

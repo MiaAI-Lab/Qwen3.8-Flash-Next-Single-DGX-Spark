@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MiaAI Lab (https://x.com/MiaAI_lab)
-"""Build a packed NVFP4 PLE table file for memory-mapped CPU offload.
+"""Build a packed NVFP4 or per-tensor FP8 PLE table for CPU offload.
 
 The checkpoint stores the PLE n-gram table as 128 row shards, each split into
 4-bit codes (uint8 [rows, head_dim/2]) and FP8 block scales ([rows, head_dim/16]).
@@ -9,6 +9,10 @@ vLLM's NVFP4 PLE lookup returns, per row, ``cat(codes, scales.view(uint8))``.
 This script writes exactly that layout as one flat file: [total_rows, 90] uint8,
 row r of shard i at index i*shard_rows + r. The offload worker memory-maps it,
 so the 26.8 GiB table lives in the (evictable) page cache instead of RSS.
+
+NVIDIA's FP8 table instead contains unmodified F8_E4M3 weight bytes (160
+bytes/row). Its one global scale stays in the original checkpoint; this is
+storage repacking, not a quantization or training operation.
 
 Streams shard-by-shard with numpy memmaps; peak RAM is well under 1 GiB.
 
@@ -52,28 +56,57 @@ for prefix in prefix_of:
     shards = sorted({int(k[len(prefix) + len(".shard_"):].split(".")[0])
                      for k in idx if k.startswith(prefix + ".shard_")})
     assert shards == list(range(len(shards))), shards
-    w0, dt = view(f"{prefix}.shard_0.weight"); assert dt == "U8", dt
-    s0, dt = view(f"{prefix}.shard_0.weight_scale"); assert dt == "F8_E4M3", dt
-    rows, cw = w0.shape; sw = s0.shape[1]
+    w0, dt = view(f"{prefix}.shard_0.weight")
+    # Two checkpoint families seen so far:
+    #  - NVFP4-packed (community/Mia-AiLab): weight=U8 4-bit codes, PLUS a
+    #    per-shard F8_E4M3 weight_scale of the same row count. Packed row =
+    #    codes || scale.
+    #  - plain per-tensor FP8 (NVIDIA official): weight=F8_E4M3 already
+    #    byte-sized, ONE global ngram_embedding.weight_scale (no per-shard
+    #    scale tensor at all). Packed row = weight bytes only; the single
+    #    global scale is loaded separately by patch_ple_layer.py's
+    #    Fp8EmbeddingMethod path, not baked into this table.
+    has_per_shard_scale = f"{prefix}.shard_0.weight_scale" in idx
+    if dt == "U8":
+        assert has_per_shard_scale, "U8-coded PLE shard without a per-shard weight_scale"
+        s0, sdt = view(f"{prefix}.shard_0.weight_scale"); assert sdt == "F8_E4M3", sdt
+        rows, cw = w0.shape; sw = s0.shape[1]
+    elif dt == "F8_E4M3":
+        assert not has_per_shard_scale, "F8_E4M3 PLE shard unexpectedly has a per-shard weight_scale"
+        scale_name = f"{prefix}.weight_scale"
+        assert scale_name in idx, "FP8 PLE requires its global weight_scale"
+        scale_meta = header(idx[scale_name])[0][scale_name]
+        assert scale_meta["shape"] in ([1], []), "FP8 PLE scale must be per-tensor"
+        rows, cw = w0.shape; sw = 0
+    else:
+        sys.exit(f"unrecognized PLE shard dtype: {dt}")
     width = cw + sw
     out_name = os.path.join(out_dir, vname + ".packed_u8")
     meta = {"rows_per_shard": rows, "num_shards": len(shards), "row_width": width,
             "codes_width": cw, "scales_width": sw, "total_rows": rows * len(shards),
-            "snapshot": os.path.basename(os.path.normpath(snap))}
+            "shard_dtype": dt, "snapshot": os.path.basename(os.path.normpath(snap))}
     if os.path.exists(out_name) and os.path.getsize(out_name) == rows * len(shards) * width:
-        print("exists:", out_name); continue
+        meta_path = out_name + ".json"
+        if not os.path.exists(meta_path) or json.load(open(meta_path)) != meta:
+            sys.exit(f"packed cache metadata/source mismatch: {out_name}; rebuild explicitly")
+        print("verified cache metadata:", out_name); continue
     print(f"building {out_name}: {len(shards)} shards x {rows} rows x {width} B = "
-          f"{rows*len(shards)*width/2**30:.2f} GiB", flush=True)
+          f"{rows*len(shards)*width/2**30:.2f} GiB (dtype={dt})", flush=True)
     t0 = time.time()
     tmp = out_name + ".tmp"
     CH = 1 << 19
     with open(tmp, "wb") as out:
         for i in shards:
-            w, _ = view(f"{prefix}.shard_{i}.weight")
-            s, _ = view(f"{prefix}.shard_{i}.weight_scale")
-            assert w.shape == (rows, cw) and s.shape == (rows, sw), (i, w.shape, s.shape)
+            w, shard_dt = view(f"{prefix}.shard_{i}.weight")
+            assert shard_dt == dt, (i, shard_dt, dt)
+            assert w.shape == (rows, cw), (i, w.shape)
+            if sw:
+                s, scale_dt = view(f"{prefix}.shard_{i}.weight_scale")
+                assert scale_dt == "F8_E4M3", (i, scale_dt)
+                assert s.shape == (rows, sw), (i, s.shape)
             for c in range(0, rows, CH):
-                np.concatenate([w[c:c + CH], s[c:c + CH]], axis=1).tofile(out)
+                chunk = np.concatenate([w[c:c + CH], s[c:c + CH]], axis=1) if sw else w[c:c + CH]
+                chunk.tofile(out)
             if i % 8 == 0:
                 print(f"  shard {i}/{len(shards)} {time.time()-t0:.0f}s", flush=True)
     assert os.path.getsize(tmp) == rows * len(shards) * width
