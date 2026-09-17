@@ -206,6 +206,13 @@ MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
 PLE_GIB="${PLE_GIB:-26.82}"
+# GiB of MTP draft weights that live inside the checkpoint but are only loaded
+# when MTP is on. Reason: PLE_GIB subtracts the PLE table from the checkpoint
+# size, but on checkpoints that pack the draft model into the same file (NVIDIA
+# ships model-fp8-mtp-ple.safetensors: 47.68 GiB PLE + 2.34 GiB MTP) the draft
+# weights stay in the derived GPU figure even at MTP_NUM_SPECULATIVE_TOKENS=0,
+# where nothing loads them. Credited back below, MTP-off only. 0 = no credit.
+MTP_WEIGHTS_GIB="${MTP_WEIGHTS_GIB:-0}"
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 REQUIRE_IDLE_GPU="${_CLI_REQUIRE_IDLE_GPU:-${REQUIRE_IDLE_GPU:-true}}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
@@ -430,7 +437,12 @@ print(m['MemTotal']/g, m['MemAvailable']/g,
       f\"{(m['MemTotal']-m['MemAvailable'])/g:.1f}\", f\"{(m['SwapTotal']-m['SwapFree'])/g:.1f}\")")"
 
 MTP_GIB=0
-[[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]] && MTP_GIB=1.49
+MTP_OFF_CREDIT=0
+if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    MTP_GIB=1.49
+else
+    MTP_OFF_CREDIT="$MTP_WEIGHTS_GIB"
+fi
 KV_MULT=1.0
 # FP8 halves the main KV (12 full-attn layers, ~84% of bytes/token) but the QSA
 # side/compressor caches stay BF16, so the real saving is ~1.7x, not 2x.
@@ -446,6 +458,7 @@ KV_MULT=1.0
 read -r WEIGHTS_GPU_GIB KV_NEED_GIB BUDGET_GIB DERIVED_GMU KV_EXPECT_GIB KV_EXPECT_TOK BUDGET_CAP_GIB CAP_BINDS <<<"$(python3 -c "
 import math
 w=$WEIGHT_BYTES/2**30-$PLE_GIB
+w-=min($MTP_OFF_CREDIT,max(w,0))
 fixed=w+$OVERHEAD_GIB+$MTP_GIB
 kv_need=$MAX_MODEL_LEN*$KV_BYTES_PER_TOKEN*$KV_MULT/2**30
 wish=fixed+max(kv_need,$KV_TARGET_GIB)
@@ -476,6 +489,7 @@ MAX_CONTAINER_GIB=$(python3 -c "print(int($MEM_TOTAL_GIB-$OS_RESERVE_GIB))")
 
 info "  unified pool ............. ${MEM_TOTAL_GIB%.*} GiB total, ${MEM_AVAIL_GIB%.*} GiB available now"
 info "  weights on GPU ........... ${WEIGHTS_GPU_GIB} GiB  (checkpoint minus ${PLE_GIB} GiB PLE table)"
+[[ "$MTP_OFF_CREDIT" != 0 ]] && info "  MTP draft weights ........ ${MTP_OFF_CREDIT} GiB  credited back (MTP off: packed in the checkpoint, never loaded)"
 info "  PLE table ................ ${PLE_GIB} GiB  memory-mapped in the CPU offload worker"
 info "  runtime overhead ......... ${OVERHEAD_GIB} GiB"
 [[ "$MTP_GIB" != 0 ]] && info "  MTP draft model .......... ${MTP_GIB} GiB"
