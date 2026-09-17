@@ -1163,6 +1163,14 @@ while true; do
         echo ""
         ok "vLLM ready on port $PORT (TP=1, single Spark) after ${ELAPSED}s."
         docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "GPU KV cache size|Available KV cache|Maximum concurrency" | tail -3 || true
+        # Resuming after a manual stop clears the manual stopping flag: the
+        # operator's own relaunch IS the resume (stop.sh's header promise).
+        # A non-manual flag belongs to a maintenance window — leave it;
+        # maintenance-relaunch.sh closes its own handshake.
+        if [[ -f "$SCRIPT_DIR/logs/stopping" && "$(head -n 1 "$SCRIPT_DIR/logs/stopping" 2>/dev/null)" == "manual" ]]; then
+            rm -f "$SCRIPT_DIR/logs/stopping"
+            info "manual stop flag cleared — supervisor resumes full supervision."
+        fi
         info ""
         info "Stop:  ./stop.sh   (graceful; --force to skip the SIGTERM wait)"
         break
