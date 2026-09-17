@@ -5,6 +5,55 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-17
+
+### Fixed (PR #41 review, jvr0x — all three blocking findings and six non-blocking)
+
+- **`PLE_GIB` is a documented constant again; the `model-ple*` shard
+  derivation is gone.** The derivation matched zero files on every real
+  checkpoint layout — the stock snapshot's `weight_map` has no
+  `model-ple*` entries and NVIDIA's packs its 47.68 GiB PLE table inside
+  `model-fp8-mtp-ple.safetensors`, whose name contains no `model-ple` — so
+  the 26.82 fallback was the only path that ever ran, costing a spurious
+  WARN on every stock launch and, on the NVIDIA checkpoint, a 20.86 GiB
+  overstatement of GPU-resident weights that refused to boot
+  (`HOST_RESERVE_GIB` cap). Merged from upstream #47 alongside its
+  `MTP_WEIGHTS_GIB` companion knob (draft weights packed with the PLE
+  table, credited back at MTP 0).
+- **`stop.sh` validates `STOP_TIMEOUT` before use.** `docker stop -t abc`
+  exits 125 on a bad value; the `|| true` swallowed it and the
+  unconditional `docker rm -f` SIGKILLed the container while the output
+  still read "stopped" — silently downgrading the graceful stop (and
+  reintroducing the shm leak the SIGTERM path exists to avoid). Now a
+  non-integer `STOP_TIMEOUT` is a hard error before anything is touched.
+- **A manual `./stop.sh` can no longer resurrect itself.** The stopping
+  flag now records its author: a `manual` first line (stop.sh) is held
+  forever — the supervisor never reclaims it — while a maintenance-window
+  flag is still reclaimed loudly after `STOPPING_MAX_AGE_S` (a crashed
+  maintenance wrapper must not wedge supervision forever). stop.sh will
+  not overwrite an existing flag (an emergency inside a maintenance
+  window keeps the window's flag; the supervisor keeps leaving it alone).
+- **The supervisor's hold is no longer silent**: both the manual-stop and
+  the maintenance-window holds log once an hour instead of nothing.
+- **A failed launch no longer destroys its own evidence**: each attempt
+  writes `logs/supervise-start-<ts>.log`; `supervise-start.log` symlinks
+  the newest, old attempts rotate (keep 10).
+- **Backoff is charged to failed attempts only**: the first attempt on a
+  clean cold start (or first tick after reboot) fires immediately instead
+  of idling 30 s (was `30 * 2^lf` slept before the attempt, including
+  `lf=0`).
+- **`clean_shm` follows `stop.sh`'s rule** ("their segments are not ours
+  to remove"): still refuses to delete anything a live process holds, and
+  now also refuses when neither `fuser` nor `lsof` can prove the segments
+  unheld — reporting instead of removing. Both files label the figure as
+  *allocated* MiB (POSIX shm is not sparse; the old figure read like a
+  du total).
+- **`.env.sample` carries one reserve table** consolidating the three
+  recommendations (26 stock / 28 at `MAX_NUM_SEQS=8` / 30 NVIDIA
+  checkpoint) that previously drifted in three places, plus an explicit
+  note that the `BIND=0.0.0.0` default is a deliberate choice with
+  `API_KEY` as the control.
+
 ## 2026-09-14
 
 ### Added

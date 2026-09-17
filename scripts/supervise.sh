@@ -17,10 +17,16 @@
 #      docker.service; poll instead). No alert storm while docker is down.
 #   2. comfy-h3.service (user + system scope) active -> do nothing, alert at
 #      most once/hour (port thief, review §4.7).
-#   3. Container missing -> if stop.sh-initiated (flag file logs/stopping
-#      touched by maintenance/stop) wait; else clean_shm -> start.sh -> on
-#      non-zero exit backoff 30s*2^n cap 15min, count launch_failures; reset
-#      only after a launch reaches /health 200.
+#   3. Container missing -> if a stopping flag is up (flag file logs/stopping;
+#      a "manual" first line = a human's stop.sh: held forever, never
+#      reclaimed, resumed by start.sh / maintenance-relaunch.sh or reboot;
+#      anything else = a maintenance window, reclaimed loudly after
+#      STOPPING_MAX_AGE_S) wait; else clean_shm -> start.sh -> on non-zero
+#      exit backoff 30s*2^n cap 15min charged to FAILED attempts only
+#      (first attempt is immediate), count launch_failures; reset only after
+#      a launch reaches /health 200. Each attempt writes its own
+#      logs/supervise-start-<ts>.log (supervise-start.log symlinks the
+#      newest) so a failed attempt's evidence survives the next one.
 #   4. Container up but memwatch not running -> start it via the shared
 #      scripts/start-memwatch.sh (same invocation start.sh uses).
 #   5. Probe cadence 1/min: 5 consecutive failures -> emergency: alert ->
@@ -57,9 +63,11 @@ MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
 # that is mid-weight-load. Default ~15 min covers cold start + first-boot PLE
 # build.
 ADOPT_GRACE_S="${ADOPT_GRACE_S:-900}"
-# A logs/stopping flag older than this is abandoned (maintenance crashed, or a
-# manual stop nobody resumed); the supervisor reclaims it instead of waiting
-# forever. 2h is far longer than any normal maintenance window.
+# A logs/stopping flag older than this is abandoned (a maintenance window
+# that crashed without closing); the supervisor reclaims it instead of
+# waiting forever. Manual-stop flags ("manual" first line, stop.sh) are
+# exempt: they are never reclaimed, only resumed by the operator or cleared
+# by reboot. 2h is far longer than any normal maintenance window.
 STOPPING_MAX_AGE_S="${STOPPING_MAX_AGE_S:-7200}"
 # Mirror start.sh's readiness window: a launch the supervisor starts should get
 # the same deadline before its stale launching flag expires.
@@ -157,6 +165,7 @@ weights_loading() {
 # start-memwatch.sh pkill self-kill found in the drills.
 memwatch_up()  { pgrep -f "[f]iles/memwatch.sh $CONTAINER_NAME" >/dev/null 2>&1; }
 
+SHM_PATTERNS=(-name 'psm_*' -o -name 'sem.mp-*')
 clean_shm() {
     # Only when our container is not running and no vLLM/sglang container is
     # running: their segments are not ours to remove (stop.sh's rule).
@@ -173,21 +182,37 @@ clean_shm() {
         return 0
     fi
     leaked_count=0
-    leaked=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -print0 2>/dev/null | tr -cd '\0' | wc -c)
+    leaked=$(find /dev/shm -maxdepth 1 \( "${SHM_PATTERNS[@]}" \) -print0 2>/dev/null | tr -cd '\0' | wc -c)
     if [[ "$leaked" -gt 0 ]]; then
-        # Authoritative guard: a live process holding a segment means an
-        # engine we failed to identify by image name still uses it. Refuse to
-        # delete anything that is open elsewhere (fuser/lsof may be absent).
+        # stop.sh's rule is the correct one: other containers on this host also
+        # run --ipc host, so their segments live here too and are not ours to
+        # remove. psm_/sem.mp- are generic POSIX IPC names with no owner
+        # prefix, so ownership cannot be proved by name — but it CAN be proved
+        # by liveness: POSIX unlink does not disturb an already-mapped
+        # process, yet we still refuse to touch anything a live process holds
+        # (it may re-open the name and expect the same object). A segment no
+        # process holds is a leak by definition, whoever created it, and is
+        # what the kill-recovery path (SIGKILLed engine leaks its handshake
+        # segments; drill 1) exists to clear.
         # NUL-safe throughout: /dev/shm is world-writable and a whitespace or
         # newline in a planted file name must not become a second target.
-        _held=""
         _fuser=""
         if command -v fuser >/dev/null 2>&1; then
-            _fuser=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -print0 2>/dev/null \
+            _fuser=$(find /dev/shm -maxdepth 1 \( "${SHM_PATTERNS[@]}" \) -print0 2>/dev/null \
                      | xargs -0 -r fuser 2>/dev/null || true)
         elif command -v lsof >/dev/null 2>&1; then
-            _fuser=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -print0 2>/dev/null \
-                     | xargs -0 -r -n1 lsof 2>/dev/null || true)
+            _fuser=$(find /dev/shm -maxdepth 1 \( "${SHM_PATTERNS[@]}" \) -print0 2>/dev/null \
+                     | xargs -0 -r -n1 lsof 2>/dev/null | awk '{print $1}' || true)
+        else
+            # Neither tool available: we cannot prove any segment unheld.
+            # stop.sh's rule wins — report, do not delete.
+            _shm_warn_ts="${_shm_warn_ts:-0}"
+            _now=$(date +%s)
+            if (( _now - _shm_warn_ts >= 3600 )); then
+                log "WARN fuser/lsof both absent; cannot prove /dev/shm segments unheld — reporting only, not removing (stop.sh's rule)"
+                _shm_warn_ts=$_now
+            fi
+            return 0
         fi
         if [[ -n "$_fuser" ]]; then
             _shm_warn_ts="${_shm_warn_ts:-0}"
@@ -198,11 +223,11 @@ clean_shm() {
             fi
             return 0
         fi
-        bytes=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -print0 2>/dev/null \
+        bytes=$(find /dev/shm -maxdepth 1 \( "${SHM_PATTERNS[@]}" \) -print0 2>/dev/null \
                 | xargs -0 -r stat -c '%s' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-        find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -print0 2>/dev/null \
+        find /dev/shm -maxdepth 1 \( "${SHM_PATTERNS[@]}" \) -print0 2>/dev/null \
             | xargs -0 -r rm -f 2>/dev/null
-        log "shm cleanup: removed $leaked segment(s) ($((bytes/1048576)) MiB)"
+        log "shm cleanup: removed $leaked unheld leak(s) ($((bytes/1048576)) MiB allocated; held segments left in place per stop.sh's rule)"
     fi
 }
 
@@ -222,7 +247,17 @@ relaunch() {
     _launch_until=$(( $(date +%s) + (READY_TIMEOUT_S > 0 ? READY_TIMEOUT_S : 1800) ))
     state_set launching 1
     state_set launch_until "$_launch_until"
-    if "$REPO_DIR/start.sh" >"$REPO_DIR/logs/supervise-start.log" 2>&1; then
+    # One log file per attempt: a truncating redirect would overwrite the
+    # evidence of why the previous attempt failed before anyone reads it
+    # (review: "a failed launch destroys its own evidence"). The stable
+    # supervise-start.log path is kept for the alert message and humans:
+    # symlink to the newest attempt. Old attempts rotate; keep 10.
+    _attempt_ts=$(date '+%Y%m%dT%H%M%S')
+    _attempt_log="$REPO_DIR/logs/supervise-start-${_attempt_ts}.log"
+    if "$REPO_DIR/start.sh" >"$_attempt_log" 2>&1; then
+        ln -sfn "$(basename "$_attempt_log")" "$REPO_DIR/logs/supervise-start.log"
+        ls -1t "$REPO_DIR/logs"/supervise-start-*.log 2>/dev/null | tail -n +11 \
+            | while read -r _old; do rm -f "$_old"; done
         state_set launch_failures 0
         state_set launching 0
         state_set launch_until 0
@@ -238,7 +273,12 @@ relaunch() {
     state_set launch_until 0
     state_set launch_failures "$(( $(state_get launch_failures 0) + 1 ))"
     state_set last_probe_fail 0
-    log "launch attempt failed (launch_failures=$(state_get launch_failures 0))"
+    # Symlink the newest attempt on the failure path too (post-mortem evidence
+    # is the whole point), and prune old attempt logs to the newest 10.
+    ln -sfn "$(basename "$_attempt_log")" "$REPO_DIR/logs/supervise-start.log"
+    ls -1t "$REPO_DIR/logs"/supervise-start-*.log 2>/dev/null | tail -n +11 \
+        | while read -r _old; do rm -f "$_old"; done
+    log "launch attempt failed (launch_failures=$(state_get launch_failures 0), log $_attempt_log)"
     return 1
 }
 
@@ -317,13 +357,32 @@ while true; do
     # fresh (the maintenance window is mid-flight: its own start.sh is the
     # readiness authority), the PROBE must also hold: probing a
     # cold-starting maintenance container to 5 fails would emergency-stop
-    # inside the window and fight the handshake (drill-6 finding). A flag
-    # older than STOPPING_MAX_AGE_S is abandoned — reclaim it loudly.
+    # inside the window and fight the handshake (drill-6 finding).
+    #
+    # Flag authorship (review: "a manual stop.sh resurrects itself after two
+    # hours"): a flag whose first line is "manual" (stop.sh writes it) belongs
+    # to a human's deliberate stop — NEVER reclaimed, stays down until the
+    # operator relaunches (start.sh / maintenance-relaunch.sh) or reboots
+    # (ensure_state clears pre-reboot flags). Any other flag is a maintenance
+    # window: a crashed maintenance wrapper must not wedge the supervisor
+    # forever, so older than STOPPING_MAX_AGE_S it is reclaimed loudly.
     _stopping_fresh=0
     if [[ -f "$STOPPING_FLAG" ]]; then
+        _flag_manual=0
+        [[ "$(head -n 1 "$STOPPING_FLAG" 2>/dev/null)" == "manual" ]] && _flag_manual=1
         _flag_age=$(( $(date +%s) - $(stat -c %Y "$STOPPING_FLAG" 2>/dev/null || echo 0) ))
-        if (( _flag_age > STOPPING_MAX_AGE_S )); then
-            alert "SUPERVISOR: logs/stopping is ${_flag_age}s old (>${STOPPING_MAX_AGE_S}s) — treating as abandoned and clearing it."
+        if [[ "$_flag_manual" == "1" ]]; then
+            # Say it once an hour so an operator wondering why a stopped
+            # server stays down finds the reason in the journal, not by
+            # knowing where to look (review: "the hold is silent").
+            _hold_ts="${_hold_ts:-0}"
+            if (( $(date +%s) - _hold_ts >= 3600 )); then
+                log "manual stop flag present (${_flag_age}s old); holding relaunch (operator stop — remove logs/stopping or run start.sh to resume)"
+                _hold_ts=$(date +%s)
+            fi
+            _stopping_fresh=1
+        elif (( _flag_age > STOPPING_MAX_AGE_S )); then
+            alert "SUPERVISOR: logs/stopping is ${_flag_age}s old (>${STOPPING_MAX_AGE_S}s) — treating as abandoned maintenance flag and clearing it."
             rm -f "$STOPPING_FLAG"
         else
             _stopping_fresh=1
@@ -344,6 +403,15 @@ while true; do
             sleep "$TICK_S"
             continue
         else
+            # Stopping flag set, container down: hold relaunch, and say so
+            # hourly — an operator wondering why the server is not coming
+            # back must find the reason in the journal (review: the hold
+            # was silent).
+            _hold_ts="${_hold_ts:-0}"
+            if (( $(date +%s) - _hold_ts >= 3600 )); then
+                log "stopping flag present (${_flag_age}s old); holding relaunch"
+                _hold_ts=$(date +%s)
+            fi
             sleep "$TICK_S"
             continue
         fi
@@ -411,17 +479,21 @@ while true; do
             fi
             # Persistent exponential backoff: 30 s * 2^n, cap 15 min, keyed on
             # launch_failures in state so a supervisor crash restart resumes it.
+            # lf=0 is a clean cold start (or first tick after reboot): backoff
+            # is charged to FAILED attempts only, so the first try happens
+            # immediately instead of idling 30 s (review: backoff charged to
+            # the zeroth attempt added 30 s of downtime on every boot).
             lf=$(state_get launch_failures 0)
             if (( lf >= MAX_LAUNCH_FAILURES )); then
                 alert "SUPERVISOR: ${lf} launch failures (cap ${MAX_LAUNCH_FAILURES}) — holding off. Remove logs/supervisor.state to re-arm, or fix the launch cause."
                 sleep "$TICK_S"
                 continue
             fi
-            _bs=$(( BACKOFF_INIT_S * 2 ** lf ))
-            if (( _bs > BACKOFF_MAX_S )); then
-                _bs=$BACKOFF_MAX_S
-            fi
-            if (( _bs > 0 )); then
+            if (( lf > 0 )); then
+                _bs=$(( BACKOFF_INIT_S * 2 ** (lf - 1) ))
+                if (( _bs > BACKOFF_MAX_S )); then
+                    _bs=$BACKOFF_MAX_S
+                fi
                 log "backing off ${_bs}s (launch_failures=$lf)"
                 sleep "$_bs"
             fi

@@ -9,8 +9,11 @@
 # host's /dev/shm and survives until reboot. Use --force to skip the wait.
 #
 # Touches logs/stopping while the stop is in progress so the supervisor waits
-# instead of relaunching a container the human deliberately stopped. Remove
-# that file (or reboot) to let the supervisor bring the server back up.
+# instead of relaunching a container the human deliberately stopped. The flag
+# carries a "manual" first line: the supervisor NEVER reclaims it (unlike a
+# maintenance-window flag, which is reclaimed after STOPPING_MAX_AGE_S), so a
+# manual stop stays down until you relaunch (start.sh, maintenance-
+# relaunch.sh), remove logs/stopping, or reboot (which clears it).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +27,14 @@ if [[ -n "$_CONTAINER_NAME" ]]; then
 fi
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"      # seconds before docker escalates to SIGKILL
+# Validate before use: docker stop -t rejects a bad value with exit 125, which
+# the `|| true` below would swallow — the unconditional forced removal would
+# then SIGKILL the container while the output still reads "stopped", silently
+# downgrading the graceful path (the exact failure the #13 shm fix exists for).
+if ! [[ "$STOP_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    echo "STOP_TIMEOUT must be a non-negative integer (got: '$STOP_TIMEOUT')" >&2
+    exit 1
+fi
 
 FORCE=false
 for arg in "$@"; do
@@ -42,10 +53,17 @@ if pkill -f "memwatch.sh $CONTAINER_NAME" 2>/dev/null; then
 fi
 
 # Signal the supervisor not to fight us: while this flag exists the
-# supervisor holds off relaunching. start.sh / maintenance-relaunch.sh manage
-# its lifecycle around their own relaunches.
+# supervisor holds off relaunching. The "manual" first line marks authorship —
+# the supervisor never reclaims a manual flag (a deliberate stop stays down
+# until the operator resumes it); start.sh / maintenance-relaunch.sh manage
+# the flag's lifecycle around their own relaunches. A flag that ALREADY
+# exists belongs to a maintenance window (or a concurrent stop): keep it —
+# overwriting it with a manual marker would make an abandoned maintenance
+# window un-reclaimable forever.
 mkdir -p "$SCRIPT_DIR/logs"
-touch "$SCRIPT_DIR/logs/stopping"
+if [[ ! -f "$SCRIPT_DIR/logs/stopping" ]]; then
+    printf 'manual\n%s\n' "$(date -Is)" > "$SCRIPT_DIR/logs/stopping"
+fi
 
 if [[ -z "$(docker ps -aq -f "name=^${CONTAINER_NAME}$")" ]]; then
     echo "$CONTAINER_NAME was not running"
@@ -77,7 +95,7 @@ leaked=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) 2>/de
 if (( leaked > 0 )); then
     bytes=$(find /dev/shm -maxdepth 1 \( -name 'psm_*' -o -name 'sem.mp-*' \) -printf '%s\n' 2>/dev/null \
             | awk '{s+=$1} END {print s+0}')
-    echo "note: $leaked multiprocessing segment(s) in /dev/shm ($((bytes/1048576)) MiB)."
+    echo "note: $leaked multiprocessing segment(s) in /dev/shm ($((bytes/1048576)) MiB allocated)."
     echo "      Inspect with: ls -la /dev/shm"
     echo "      Only remove them once no vLLM/sglang container is running."
 fi
