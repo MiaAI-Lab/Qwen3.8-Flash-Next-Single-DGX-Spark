@@ -19,10 +19,24 @@ results can be compared against structured-prompt numbers published elsewhere.
     python3 bench/structured.py                          # C1 C2 C4, 2 reps
     python3 bench/structured.py --streams 1 2 4 8 --reps 2 --port 8888
 """
-import argparse, json, threading, time, urllib.request
+import argparse, json, os, threading, time, urllib.request
 
 PROMPT = ("Count from 1 to 200, one number per line, no commentary. "
           "Start now with 1.")
+
+API_KEY = os.environ.get("API_KEY", "")
+if not API_KEY:
+    try:
+        for line in open(os.path.join(os.path.dirname(__file__), "..", ".env")):
+            line = line.strip()
+            if line.startswith("EXTRA_VLLM_ARGS=") and "--api-key" in line:
+                API_KEY = line.split("--api-key", 1)[1].split()[0].strip('"')
+                break
+    except OSError:
+        pass
+HEADERS = {"Content-Type": "application/json"}
+if API_KEY:
+    HEADERS["Authorization"] = f"Bearer {API_KEY}"
 
 
 def one_stream(url, model, max_tokens, result, idx):
@@ -35,7 +49,7 @@ def one_stream(url, model, max_tokens, result, idx):
     }
     req = urllib.request.Request(f"{url}/chat/completions",
                                  data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=HEADERS)
     start = time.perf_counter()
     first = None; usage = {}; deltas = 0
     with urllib.request.urlopen(req, timeout=600) as r:

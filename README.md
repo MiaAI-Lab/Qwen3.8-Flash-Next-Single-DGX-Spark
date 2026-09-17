@@ -42,7 +42,9 @@ port can reach the model, so serve with a key or set `BIND=127.0.0.1` in
 `.env.sample` ships **262,144 context (YaRN off), MTP 3, `HOST_RESERVE_GIB=26`,
 `KV_TARGET_GIB=20`, `KV_CACHE_DTYPE=fp8`, `MAMBA_SSM_CACHE_DTYPE=bfloat16`,
 `MAX_NUM_SEQS=4`, `MAX_NUM_BATCHED_TOKENS=2048`**, with the V2 model runner
-pinned through `EXTRA_DOCKER_ARGS`.
+pinned through `EXTRA_DOCKER_ARGS`. For Spanish traffic, also swap the draft
+vocabulary: `MTP_DRAFT_VOCAB=files/draft_vocab_es_en_code_65k.txt`
+(see [Serving Spanish](#serving-spanish-65k-draft-vocab)).
 Everything below was measured on this host on 2026-09-04; each row names the
 configuration it came from, because the numbers move a lot between them.
 Decode numbers are not in this table: they predate the 2026-09-05 optimisation
@@ -325,6 +327,37 @@ under PIECEWISE CUDA graphs with the full 248,320-token draft vocabulary. They
 are superseded in both directions: acceptance is much higher, and ordinary
 prose now measures 48.7 tok/s single-stream.
 
+
+### Serving Spanish: 65k draft vocab
+
+`MTP_DRAFT_VOCAB=files/draft_vocab_es_en_code_65k.txt` extends the shipped
+47k English+code draft vocabulary to **65,536 rows** — the 47k file whole as
+a floor (verified: 0 of the 47,172 ids missing) plus 668 MiB of Spanish
+Wikipedia at natural frequencies, byte-fallback range pinned. It costs 9% of
+the draft-head byte saving (0.31 vs 0.22 GiB lm_head, still 2.61 GiB/step
+under MTP 3) and exists for one reason: **the 47k file covers only 64.4% of
+Spanish output occurrences**, so Spanish drafting runs at ~0.9–1.0 accepted
+tokens/draft where English prose runs ~1.8 (per-position 0.80/0.59/0.41). Correctness is identical either way —
+rejection sampling rejects drafts outside the subset, never wrong output —
+poor coverage only costs speed.
+
+Measured on the contributor's host with an interleaved ABBA protocol
+(five prompts per language, drift-cancelling): **Spanish 32.6 → 41.9 tok/s
+(+28.6%), acceptance 0.94 → 1.56, English unchanged.** Re-verified here on
+2026-09-14 against the live server after the merge: acceptance 1.53
+accepted/draft aggregate (11,958/7,819 since relaunch) against the 0.94
+baseline measured on the 47k file, English structured decode unchanged (67.9 / 114.4 tok/s at C1/C2
+against the 65.2 / 116.2 reference), and the Spanish quality gate
+(`bench/audit-spanish.py`: ~14k tokens across long-form essays, narrative,
+Spanish-docstring code, JSON and a five-turn conversation) passes with **zero
+replacement characters and zero dialect-drift markers**. The full method and
+the two further findings it surfaced (per-mode sampling parameters and
+benchmark-family comparability) are in
+`docs/spanish-drafting-and-performance-2026-09-13.md`.
+
+Use it when a meaningful share of your traffic is Spanish; otherwise stay on
+the shipped 47k and keep the extra byte saving. Both files are built by
+`files/build_draft_vocab.py` / `files/build_draft_vocab_extend.py`.
 
 ## Multimodal (images and video)
 
@@ -930,7 +963,8 @@ Two 2026-09-09 additions tie the watchdog into the supervisor loop:
 ## Sanity test
 
 ```
-curl -s localhost:8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
+curl -s localhost:8888/v1/chat/completions -H 'Content-Type: application/json' \
+  ${API_KEY:+-H "Authorization: Bearer $API_KEY"} -d '{
  "model":"qwen3.8-flash-next","temperature":0,"max_tokens":400,
  "messages":[{"role":"user","content":"In one sentence, what is a DGX Spark?"}]}' \
  | python3 -c "
@@ -944,7 +978,9 @@ This build emits reasoning **before** the answer, in a `reasoning` field rather
 than `content`. Budget at least ~400 `max_tokens`: at 200 the reply is still
 inside its reasoning, so `content` comes back empty on a perfectly healthy
 server. Gibberish in either field means the PLE path has regressed (bf16 IPC
-buffer or missing quant scales) — see the patch notes below.
+buffer or missing quant scales) — see the patch notes below. If `--api-key` is
+set (the shipped default), set `API_KEY` in the shell first or the call 401s;
+`scripts/smoke-test.sh` and the bench scripts read it from `.env` themselves.
 
 ## Layout
 
@@ -992,6 +1028,22 @@ buffer or missing quant scales) — see the patch notes below.
 - `bench/mixed.py` — decode under a concurrent prefill: two streams decoding
   when a ~64k prompt arrives, reporting the p95/p99 gap between their streamed
   chunks (one per engine step, ~2.7 tokens each) inside the prefill window. sparkDash has no mode for this shape.
+- `bench/audit-spanish.py` — Spanish quality gate: long-form, multi-turn and
+  accent-heavy generations scored per paragraph for replacement characters
+  (broken byte-fallback), neighbouring-dialect markers (asturiano/gallego/
+  catalán/portugués) and incorrect-spelling forms. Exits non-zero on any
+  failure. Reads `PORT`/`SERVED_MODEL_NAME`/`API_KEY` from the environment,
+  falling back to `.env`'s `EXTRA_VLLM_ARGS --api-key`.
+- `bench/structured.py` — sparkDash-free structured (counting-stream)
+  concurrent decode bench: N streams started together, 400 completion tokens,
+  temperature 0, thinking off. Numbers are MTP's best case (~35% above prose)
+  and exist so structured-prompt numbers published elsewhere can be compared
+  like-for-like. Same env/`.env` auth as `audit-spanish.py`.
+- `bench/structured-protocol.py` — protocol-shape structured bench (the
+  structured workload over realistic request shapes).
+- `bench/verify-smoke.py` — quick speculative-decode acceptance check:
+  reads `spec_decode_num_accepted_tokens_per_pos_total` deltas from
+  `/metrics` around a few targeted generations.
 
 The published prefill and decode numbers were measured with sparkDash, driven
 by those two scripts. Both need an idle server: the counter deltas and
@@ -1047,6 +1099,13 @@ sparkDash's own figures include any other traffic on the port.
   (Apache-2.0) — the FP8-KV approach behind one patch here, reimplemented
   against this image's own sources. See
   [What is patched and why](#what-is-patched-and-why).
+- **[oscarmenendezgarcia](https://github.com/oscarmenendezgarcia)** — the
+  Spanish-extended 65k draft vocabulary (`gb10-host-adaptation` work, merged
+  with authorship preserved), the byte-level fallback pin in
+  `build_draft_vocab.py` (PR #43), the Spanish audit gate
+  (`bench/audit-spanish.py`) and the Spanish drafting write-up. See
+  [Serving Spanish](#serving-spanish-65k-draft-vocab) and the CHANGELOG
+  2026-09-14 entries.
 
 ## License
 

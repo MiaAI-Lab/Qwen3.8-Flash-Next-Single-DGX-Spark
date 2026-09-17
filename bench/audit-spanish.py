@@ -21,6 +21,19 @@ print = functools.partial(print, flush=True)
 PORT = os.environ.get("PORT", "8888")
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 MODEL = os.environ.get("SERVED_MODEL_NAME", "qwen3.8-flash-next")
+API_KEY = os.environ.get("API_KEY", "")
+if not API_KEY:
+    try:
+        for line in open(os.path.join(os.path.dirname(__file__), "..", ".env")):
+            line = line.strip()
+            if line.startswith("EXTRA_VLLM_ARGS=") and "--api-key" in line:
+                API_KEY = line.split("--api-key", 1)[1].split()[0].strip('"')
+                break
+    except OSError:
+        pass
+HEADERS = {"Content-Type": "application/json"}
+if API_KEY:
+    HEADERS["Authorization"] = f"Bearer {API_KEY}"
 
 # Qwen publica ajustes DISTINTOS por modo, y mezclarlos es lo que provoca
 # "language mixing" segun su propia advertencia. El generation_config.json del
@@ -38,7 +51,7 @@ def chat(messages, mt=2000, temp=None):
     body = {"model": MODEL, "messages": messages, "max_tokens": mt,
             "chat_template_kwargs": {"enable_thinking": THINKING}, **SAMPLING}
     if temp is not None: body["temperature"] = temp
-    req = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(URL, json.dumps(body).encode(), HEADERS)
     d = json.loads(urllib.request.urlopen(req, timeout=900).read())
     m = d["choices"][0]["message"]; u = d["usage"]
     return ((m.get("content") or "").strip(), u["completion_tokens"],
