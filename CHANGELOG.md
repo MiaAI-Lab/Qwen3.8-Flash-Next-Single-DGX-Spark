@@ -5,6 +5,23 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-18
+
+### Measured
+
+- **The NVIDIA × `MAX_NUM_SEQS=8` reserve cell** (jvr0x's follow-up ask on PR
+  #41): `TP1_MODEL_ID=nvidia/Qwen3.8-Flash-Next-NVFP4`, `MAX_NUM_SEQS=8`,
+  `PLE_GIB=47.68`, `MTP_WEIGHTS_GIB=2.34`, `HOST_RESERVE_GIB=30` on the
+  121.69 GiB host. Peak driver **98.3 GiB** against the 91.63 GiB budget —
+  the same capture-spike overshoot #47 measured at width 4, absorbed by the
+  reserve; MemFree floor **12.05 GiB** (never near the 2 GiB watchdog
+  floor); **2 `NV_ERR_NO_MEMORY`**, both at engine init before shard load
+  (the README's "a handful during startup is normal" class), **0** through
+  graph capture, serving and C4 benchmark bursts; KV pool **8.87 GiB =
+  591,654 tokens** (2.26x at 262144); smoke 7/8 + the known GB10
+  determinism WARN, vision passing on re-run. Verdict: **30 covers both
+  bumps**; the `.env.sample` reserve table now has the measured cell.
+
 ## 2026-09-17
 
 ### Fixed (PR #41 review, jvr0x — all three blocking findings and six non-blocking)
