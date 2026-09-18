@@ -147,18 +147,20 @@ fi
 
 # Already complete? Require every shard named by the safetensors index. A
 # config.json appears early in a partial download and is not sufficient.
+# A complete cache still runs the sha256 guard below: "downloaded" and
+# "verified" are different claims, and a blob corrupted on disk after the
+# download (the case #32 exists for) is only caught by re-running it.
 if [[ -d "$MODEL_PATH" ]]; then
     SNAP=""
     SNAP_RC=0
     SNAP="$(resolve_snapshot "$MODEL_PATH")" && SNAP_RC=0 || SNAP_RC=$?
     if [[ "$SNAP_RC" -eq 0 && -n "$SNAP" ]]; then
         ok "Already in cache: $MODEL_PATH ($(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1))"
-        info "Nothing to do."
-        next_start_hint
-        exit 0
-    fi
-    if [[ -n "$SNAP" ]]; then
-        warn "Partial download found (snapshot $SNAP); resuming."
+        SKIP_ARIA=1
+    else
+        if [[ -n "$SNAP" ]]; then
+            warn "Partial download found (snapshot $SNAP); resuming."
+        fi
     fi
 fi
 
@@ -230,16 +232,24 @@ else
     RETRY_HINT="HF_TOKEN=hf_... ./download.sh $MODEL_ID"
 fi
 
-info "Downloading (resumable; interrupt and rerun to continue)..."
-if python3 -c "import huggingface_hub" 2>/dev/null; then
-    HF_HOME="$HF_CACHE_DIR" HF_TOKEN="$HF_TOKEN" python3 -c "$DL_PY" "$MODEL_ID" "$RETRY_HINT"
-else
+if [[ "${SKIP_ARIA:-0}" != "1" ]]; then
+    info "Downloading (resumable; interrupt and rerun to continue)..."
+    if python3 -c "import huggingface_hub" 2>/dev/null; then
+        HF_HOME="$HF_CACHE_DIR" HF_TOKEN="$HF_TOKEN" python3 -c "$DL_PY" "$MODEL_ID" "$RETRY_HINT"
+    else
     info "huggingface_hub not on the host; using the container image instead."
     IMAGE="${IMAGE:-vllm/vllm-openai:qwen38-flash-next}"
+    # Drop to the invoking user's uid:gid inside the container: the cache
+    # must stay owned by the host user, or the unprivileged sha256 verify
+    # below (and hf/huggingface-cli on the host) cannot write their state.
     docker run --rm -i \
         -e HF_HOME=/hf -e HF_TOKEN="$HF_TOKEN" \
+        -u "$(id -u):$(id -g)" \
         -v "$HF_CACHE_DIR:/hf" \
         --entrypoint python3 "$IMAGE" -c "$DL_PY" "$MODEL_ID" "$RETRY_HINT"
+    fi
+else
+    info "Snapshot already complete; skipping the download pass (sha256 guard still runs)."
 fi
 
 # Verify exactly what start.sh will look for, so a broken download fails here.
@@ -274,15 +284,20 @@ if [[ "$VERIFY_SHA256" == "1" ]]; then
             local body; body=$(curl -s -D "$headers" -m 60 "${auth[@]}" \
                 -H "Accept: application/json" "$url" || true)
             [[ -n "$body" ]] || { rm -f "$cache" "$headers"; return 1; }
-            echo "$body" | python3 - "$cache" <<'PY'
-import json, sys
+            # The heredoc below is python3's stdin (python3 - reads its
+            # program from stdin, so a piped body would be discarded);
+            # the page body travels through the environment instead.
+            BODY="$body" python3 - "$cache" <<'PY'
+import json, os, sys
 cache = sys.argv[1]
 with open(cache, "a") as mf:
-    for e in json.loads(sys.stdin.read()):
+    for e in json.loads(os.environ["BODY"]):
         if e.get("type") != "file":
             continue
         lfs = e.get("lfs", {})
-        print(f"{e.get('size', 0)}\t{lfs.get('sha256', '')}\t{e.get('path', '')}", file=mf)
+        # lfs.oid IS the sha256 (matches the blob name HF writes into the
+        # cache); the tree API has no lfs.sha256 key.
+        print(f"{e.get('size', 0)}\t{lfs.get('oid', '')}\t{e.get('path', '')}", file=mf)
 PY
             total=$(grep -c . "$cache" 2>/dev/null || echo 0)
             page=$((page + 1))
@@ -307,10 +322,11 @@ PY
         warn "     Rerun with network to get the corrupt-blob guard."
     else
         info "verifying sha256: ${ENTRY_COUNT} files in the remote tree manifest"
-        # The snapshot must not claim completeness from a truncated manifest.
-        if [[ "$ENTRY_COUNT" -lt 20 ]]; then
-            warn "tree manifest looks truncated (${ENTRY_COUNT} entries < 20); treating as unverifiable."
-        else
+        # No fixed minimum entry count: a small repo is legitimately small,
+        # and real truncation is caught by the local-file comparison below
+        # (a manifest with fewer entries than LFS-sized files on disk means
+        # the pagination walk came up short).
+        {
             # The remote tree metadata can only be that much larger than what a
             # complete download has on disk; fewer remote entries than local LFS
             # files means we fetched a truncated manifest (jschmied: 50 of 144
@@ -336,18 +352,27 @@ PY
                 # ABLIT resume: skip blobs already verified in a prior run.
                 _done=0
                 if [[ -f "$STATE_FILE" ]]; then
-                    grep -x -F "$sha  $path" "$STATE_FILE" 2>/dev/null && _done=1
+                    grep -qxF "$sha  $path" "$STATE_FILE" 2>/dev/null && _done=1
                 fi
                 if [[ "$_done" != "1" ]]; then
                     _have=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo "")
                     if [[ "$_have" != "$sha" ]]; then
                         err "sha256 mismatch on $path (got ${_have:-no-file}, want $sha). The checkpoint is corrupt or incomplete; delete $SNAP_DIR and re-download."
                     fi
-                    printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE"
+                    # The state file is a resume optimization, not a gate: an
+                    # unwritable cache dir (root-owned snapshot from a
+                    # pre-uid-fix download) must not turn a PASSING verify
+                    # into a crash mid-loop. Warn once, keep verifying.
+                    if ! printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE" 2>/dev/null; then
+                        if [[ "${_state_warned:-0}" != "1" ]]; then
+                            warn "cannot write the sha256 resume state ($STATE_FILE); verification still complete, but the next run will re-hash every blob."
+                            _state_warned=1
+                        fi
+                    fi
                 fi
             done < <(awk -F'\t' 'NF >= 3 && length($2) == 64 { print }' "$MANIFEST")
             ok "sha256 verified all LFS blobs in snapshot $SNAP."
-        fi
+        }
     fi
     rm -f "$MANIFEST"
 fi
