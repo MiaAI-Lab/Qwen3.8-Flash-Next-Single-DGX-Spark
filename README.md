@@ -537,9 +537,52 @@ checkpoint's `CREDITS.md`, and [Credits](#credits) below.
 
 ### NVIDIA's official checkpoint (`TP1_MODEL_ID`)
 
-`./download.sh nvidia/Qwen3.8-Flash-Next-NVFP4` (or `TP1_MODEL_ID=nvidia/Qwen3.8-Flash-Next-NVFP4 ./start.sh`)
-serves [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-instead of the stock Mia checkpoint. It is NVIDIA's own Model Optimizer
+This is optional. The stock Mia checkpoint stays the default, and nothing
+changes unless you set `TP1_MODEL_ID`. To serve
+[`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+instead, download it:
+
+```bash
+./download.sh nvidia/Qwen3.8-Flash-Next-NVFP4
+```
+
+then set these three lines in `.env` and run `./start.sh`:
+
+```bash
+TP1_MODEL_ID=nvidia/Qwen3.8-Flash-Next-NVFP4
+PLE_GIB=47.68
+HOST_RESERVE_GIB=30
+```
+
+Without `PLE_GIB=47.68` the budget check counts the PLE table as GPU weights
+and refuses to boot. Without `HOST_RESERVE_GIB=30` the CUDA-graph capture at
+startup runs past the memory budget. If you turn MTP off
+(`MTP_NUM_SPECULATIVE_TOKENS=0`), also set `MTP_WEIGHTS_GIB=2.34`.
+`.env.sample` explains all of them.
+
+**Trade-offs against the default checkpoint**, measured on one DGX Spark:
+
+| | default (Mia) | NVIDIA |
+|---|---|---|
+| weights on the GPU | 71.8 GiB | 75.9 GiB |
+| PLE table in host memory | 26.8 GiB | 47.7 GiB |
+| disk (checkpoint + packed PLE table) | ~99 + 27 GiB | ~124 + 48 GiB |
+| `HOST_RESERVE_GIB` it needs | 26 (the default) | 30 |
+| KV pool at that reserve | ~975K tokens | ~545K-570K tokens |
+
+At `HOST_RESERVE_GIB=26` the NVIDIA checkpoint peaked at 101.1 GiB of driver
+memory against a 95.65 GiB budget during graph capture, with 12
+`NV_ERR_NO_MEMORY` in the kernel log. At 30 it peaked at 90.0 GiB with none.
+30 also covers `MAX_NUM_SEQS=8` (measured).
+
+Decode speed has not been measured against the default on equal settings.
+NVIDIA keeps attention and the shared experts in BF16, so each token moves
+more bytes, and decode is expected to be slower. Output quality has not been
+compared here either; NVIDIA's model card has its own accuracy numbers. Use
+this checkpoint when you want NVIDIA's own quantization. For one Spark, the
+default checkpoint is the better fit.
+
+The checkpoint is NVIDIA's own Model Optimizer
 (v0.46.0) quantization of the same upstream `Qwen/Qwen3.8-Flash-Next`, not a
 community re-quant: mixed precision (MSE-calibrated NVFP4 on routed MoE
 experts, BF16 kept on attention/shared-experts, FP8 MTP), 124 GiB rather than
