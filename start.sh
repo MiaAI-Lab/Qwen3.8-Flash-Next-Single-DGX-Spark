@@ -1095,10 +1095,14 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
 # without a prune the archive grows forever and threatens the checkpoint
 # disk cache.
+# On a fresh install logs/archive/ is empty, so the glob does not expand, ls
+# exits 2, and 2>/dev/null hides it. Under `set -euo pipefail` that aborted the
+# script here -- silently, before the container was ever launched. The prune is
+# best-effort (see the rm above); it must never be fatal.
 ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
-done
+done || true
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
     docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
