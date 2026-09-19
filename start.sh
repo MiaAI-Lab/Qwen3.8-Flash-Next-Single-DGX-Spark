@@ -1098,7 +1098,7 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
-done
+done || true
 if docker inspect "$CONTAINER_NAME" &>/dev/null; then
     # The old container is removed below; keep its log for the post-mortem first.
     docker logs --tail 3000 "$CONTAINER_NAME" > "$SCRIPT_DIR/logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-container.log" 2>&1 || true
