@@ -286,12 +286,14 @@ if [[ "$VERIFY_SHA256" == "1" ]]; then
             [[ -n "$body" ]] || { rm -f "$cache" "$headers"; return 1; }
             # The heredoc below is python3's stdin (python3 - reads its
             # program from stdin, so a piped body would be discarded);
-            # the page body travels through the environment instead.
-            BODY="$body" python3 - "$cache" <<'PY'
-import json, os, sys
+            # the page body travels through a file instead.
+            local bodyf; bodyf=$(mktemp)
+            printf '%s' "$body" > "$bodyf"
+            python3 - "$cache" "$bodyf" <<'PY'
+import json, sys
 cache = sys.argv[1]
 with open(cache, "a") as mf:
-    for e in json.loads(os.environ["BODY"]):
+    for e in json.loads(open(sys.argv[2]).read()):
         if e.get("type") != "file":
             continue
         lfs = e.get("lfs", {})
@@ -299,6 +301,7 @@ with open(cache, "a") as mf:
         # cache); the tree API has no lfs.sha256 key.
         print(f"{e.get('size', 0)}\t{lfs.get('oid', '')}\t{e.get('path', '')}", file=mf)
 PY
+            rm -f "$bodyf"
             total=$(grep -c . "$cache" 2>/dev/null || echo 0)
             page=$((page + 1))
             url=""
@@ -335,6 +338,11 @@ PY
             if (( ENTRY_COUNT < _LOCAL_LFS )); then
                 err "tree manifest records ${ENTRY_COUNT} files but the snapshot has ${_LOCAL_LFS} LFS-sized files — the manifest is truncated (pagination regression). Aborting verification."
             fi
+            _resume=1
+            if grep -q '^complete ' "$STATE_FILE" 2>/dev/null; then
+                _resume=0
+                { : > "$STATE_FILE"; } 2>/dev/null || true
+            fi
             # Only LFS blobs carry a sha256 handle: <size>\t<64-hex>\t<path>.
             # Everything else in the tree is content-addressed JSON/metadata.
             while IFS=$'\t' read -r _sz sha path; do
@@ -351,19 +359,19 @@ PY
                 [[ -f "$f" ]] || err "sha256 verify: $path missing from snapshot"
                 # ABLIT resume: skip blobs already verified in a prior run.
                 _done=0
-                if [[ -f "$STATE_FILE" ]]; then
+                if [[ "$_resume" == "1" && -f "$STATE_FILE" ]]; then
                     grep -qxF "$sha  $path" "$STATE_FILE" 2>/dev/null && _done=1
                 fi
                 if [[ "$_done" != "1" ]]; then
                     _have=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo "")
                     if [[ "$_have" != "$sha" ]]; then
-                        err "sha256 mismatch on $path (got ${_have:-no-file}, want $sha). The checkpoint is corrupt or incomplete; delete $SNAP_DIR and re-download."
+                        err "sha256 mismatch on $path (got ${_have:-no-file}, want $sha). The checkpoint is corrupt or incomplete; remove $(readlink -f "$f") and rerun ./download.sh $MODEL_ID to fetch it again."
                     fi
                     # The state file is a resume optimization, not a gate: an
                     # unwritable cache dir (root-owned snapshot from a
                     # pre-uid-fix download) must not turn a PASSING verify
                     # into a crash mid-loop. Warn once, keep verifying.
-                    if ! printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE" 2>/dev/null; then
+                    if ! { printf '%s  %s\n' "$sha" "$path" >> "$STATE_FILE"; } 2>/dev/null; then
                         if [[ "${_state_warned:-0}" != "1" ]]; then
                             warn "cannot write the sha256 resume state ($STATE_FILE); verification still complete, but the next run will re-hash every blob."
                             _state_warned=1
@@ -371,6 +379,7 @@ PY
                     fi
                 fi
             done < <(awk -F'\t' 'NF >= 3 && length($2) == 64 { print }' "$MANIFEST")
+            { printf 'complete %s\n' "$SNAP" >> "$STATE_FILE"; } 2>/dev/null || true
             ok "sha256 verified all LFS blobs in snapshot $SNAP."
         }
     fi
