@@ -9,6 +9,17 @@ measurements already in this repository, and a harness for each.
 | **1** | A draft vocabulary built from a dictionary destroys Spanish. Use the one this repo ships. |
 | **2** | Sampling parameters differ by mode, and mixing them causes language mixing. |
 | **3** | The published tok/s and the tok/s you measure are different benchmarks, not a deployment problem. |
+| **4** | Spanish output carries ~40x more lexical corruption than English, and it comes from the checkpoint, not from drafting. |
+
+> **Correction, 2026-09-14, from the fork these notes came from.** Finding 1
+> stands as written: a dictionary-built vocabulary does degrade drafting, and
+> rebuilding it from text is the right move. What it does not do is fix the
+> Spanish. The revision of this document that reached this repository presented
+> finding 1 as the *cause* of the language drift. That attribution is wrong.
+> Section 4 records the measurements: the drift reproduces with the corrected
+> 65k vocabulary loaded, at the sampling of section 2, and with speculative
+> decoding switched off entirely. Fixing the vocabulary bought acceptance rate,
+> which is speed. It did not buy correctness. The cause is in the checkpoint.
 
 ---
 
@@ -251,6 +262,84 @@ not identical, and MTP acceptance is prompt-dependent.
 will contend and preempt, and no long-context run has been done. This host's
 traffic is long sessions, which is exactly the untested case. The other recipe
 runs 8 without publishing a long-context test either.
+
+---
+
+## 4. Cross-language leakage is the checkpoint's, not the pipeline's
+
+Spanish output from this checkpoint contains words that do not exist in Spanish
+and that no writer produces: `comenzana` for *comenzaban*, `bloqua` for
+*bloquea*, `cabizajo` for *cabizbajo*. A distinct subset is spelled with letters
+foreign to Spanish orthography — `generaziones`, `parezian`, `plastiko`,
+`neblika`, `esperansa` — subword pieces belonging to a neighbouring language's
+spelling, not random letter noise. The same signature appears when a reply slips
+into Italian (`revizione` for *revisione*) and, at the extreme, when a whole
+generation leaves Castilian and does not come back.
+
+**It is specific to Spanish.** Same sampling, same day, ten matched prompts per
+language:
+
+| language | words | malformations | per 10k |
+|---|---|---|---|
+| Spanish | 16,792 | 29 | **17.3** |
+| English | 22,236 | 1 (arguable) | **0.4** |
+
+English is clean once contractions and dictionary gaps are removed. That rules
+out generic quantization damage to the output head, which would not respect
+language.
+
+**It is not the drafter.** `MTP_NUM_SPECULATIVE_TOKENS=0`, then restored,
+measuring the same battery in each state. The third arm exists because two arms
+cannot separate an effect from run-to-run spread:
+
+| arm | words | malformations | per 10k | generations drifting |
+|---|---|---|---|---|
+| MTP on (container A) | 13,628 | 168 | 123.3 | 2/30 |
+| **MTP off** (container B) | 13,734 | 200 | **145.6** | 0/30 |
+| MTP on (container C) | 13,625 | 232 | 170.3 | 1/30 |
+
+A and C are **identical** configurations and differ by 47 points. That spread is
+wider than anything switching MTP off produces, and the MTP-off arm lands
+between them. Speculative decoding, the reduced draft vocabulary and the whole
+drafting path are excluded.
+
+**It is not the nucleus being skipped.** In
+`vllm/v1/worker/gpu/sample/sampler.py` the only caller passing
+`skip_top_k_top_p=True` is the non-speculative `sample()`, which applies the
+filter itself; the speculative `_verify()` path takes the default and filters
+the target logits before `rejection_sample`. Behaviourally, at `temperature 2.0`
+both `top_k=1` and `top_p=0.01` return coherent prose while `top_k=0` with
+`top_p=1.0` returns token salad. The filters work.
+
+**Where the mass is.** Forcing the exact prefix that preceded each malformation
+and reading the top-20 (`bench/probe-logprobs.py`):
+
+| produced | correct | rank/p of correct | rank/p of malformed |
+|---|---|---|---|
+| `arancaba` | *arrancaba* | 1 / 0.479 | 8 / **0.016** |
+| `nocha` | *noche* | 1 / 0.622 | 19 / **0.0017** |
+| `chocoate` | *chocolate* | 1 / 0.241 | 8 / **0.016** |
+
+Batched MoE decoding is not deterministic, so exact figures move a few points
+between runs, but the shape is stable: the malformed continuation carries
+**1-2% of the probability mass**, not a remote tail. `top_k=20` and `top_p=0.95`
+both keep it and `temperature 1.0` samples it at that rate. Lowering temperature
+sharpens the distribution and is the only sampling lever that moves the rate; it
+does not remove the mass.
+
+**What the mass is.** The per-layer-embedding n-gram table — 320,001,536 rows of
+160 — is the part of this architecture that carries surface-form, sub-word
+knowledge, and in the NVFP4 mirror it is quantized with everything else. A token
+touches 16 of those rows, so the error does not average out across a large
+matmul the way it does in a dense layer; it lands directly on the spelling of
+the next piece. That is consistent with the two observations above: English,
+whose n-grams are the best covered, is unaffected, and the damage shows up as
+neighbouring-language subword pieces rather than noise.
+
+Serving NVIDIA's checkpoint, which keeps that table at higher precision, on the
+same host and the same sampling: **30.0 malformations per 10k against 123.3, and
+0/30 generations drifting against 2/30.** That is the test, and it is the only
+change between the two arms.
 
 ---
 
