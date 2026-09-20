@@ -100,6 +100,7 @@
 # Serving Spanish: draft-vocab coverage, per-mode sampling, benchmark
 # comparability (oscarmenendezgarcia). The 65k ES-extended vocab cites it.
 !/docs/spanish-drafting-and-performance-2026-09-13.md
+!/docs/qad-quality-evaluation-2026-09-20.md
 
 # --- API usage reporting and CPU-only regression ------------------------
 !/docs/cache-reporting.md

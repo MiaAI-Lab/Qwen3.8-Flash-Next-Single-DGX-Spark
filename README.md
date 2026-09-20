@@ -51,6 +51,23 @@ Decode numbers are not in this table: they predate the 2026-09-05 optimisation
 pass and are superseded by the [sparkDash sweep](#prefill-and-decode-measured-with-sparkdash)
 below (48.7 tok/s single-stream prose, 162.9 aggregate at 8 streams).
 
+### Independent QAD checkpoint quality run
+
+An independent run on one ASUS Ascent GX10 used this kit's runtime with
+[`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)
+revision `7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd`. It measured **91.41%** on
+GPQA Diamond, **82.31%** on IFBench, and **95/100** on Tool Eval Bench. The
+full configuration, sample counts, protocols, comparison caveats, and source
+links are in the [independent QAD evaluation report](docs/qad-quality-evaluation-2026-09-20.md).
+
+The repository default remains unchanged. To try the evaluated checkpoint as
+an explicit opt-in:
+
+```bash
+./download.sh local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+TP1_MODEL_ID=local-inference-lab/Qwen3.8-Flash-Next-NVFP4 ./start.sh
+```
+
 | Configuration | KV pool | Prefill @400k | Needles 5/50/95% |
 |---|---|---|---|
 | 262k, `KV_TARGET_GIB=20`, BF16 | 21.28 GiB = 736,837 tok (2.81x a 262k req) | — | — |
