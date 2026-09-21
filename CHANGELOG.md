@@ -44,6 +44,18 @@ as promises.
   1-hour soak: 784 requests, 0 errors. See the README section.
 - `scripts/supervise.sh` and `scripts/maintenance-relaunch.sh` relaunch
   through the entry point recorded in `logs/launch-lane`.
+- **Readiness checks and probes follow `BIND` instead of assuming `localhost`
+  (PR #63).** With `BIND` set to a specific interface address (a LAN or
+  Tailscale IP) — neither `0.0.0.0` nor loopback — vLLM does not listen on
+  loopback, but the readiness loop, smoke test, health probe, maintenance
+  relaunch and both supervisor `/health` checks all probed
+  `http://localhost:$PORT`. On a healthy server that reads as `last /health
+  code 000` forever; after `READY_TIMEOUT_S` (1800 s) `start.sh` archived and
+  removed the container ("wedged before /health"), and the smoke test failed
+  at its first check. A small `probe_host` helper now returns `localhost` for
+  a wildcard bind (`0.0.0.0`, `::`) — so existing setups are unchanged — and
+  the bound address otherwise (IPv6 literals bracketed). No new knob, no new
+  file.
 
 ## 2026-09-24
 
