@@ -21,6 +21,7 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 _CLI_API_KEY="${API_KEY:-}"
 _CLI_PORT="${PORT:-}"
+_CLI_BIND="${BIND:-}"
 _CLI_SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 if [[ -f "$REPO_DIR/.env" ]]; then
     # shellcheck source=.env
@@ -28,6 +29,7 @@ if [[ -f "$REPO_DIR/.env" ]]; then
 fi
 [[ -n "$_CLI_API_KEY" ]] && API_KEY="$_CLI_API_KEY"
 [[ -n "$_CLI_PORT" ]] && PORT="$_CLI_PORT"
+[[ -n "$_CLI_BIND" ]] && BIND="$_CLI_BIND"
 [[ -n "$_CLI_SERVED_MODEL_NAME" ]] && SERVED_MODEL_NAME="$_CLI_SERVED_MODEL_NAME"
 PORT="${PORT:-8888}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
@@ -42,7 +44,18 @@ if [[ -z "$API_KEY" && -n "${EXTRA_VLLM_ARGS:-}" ]]; then
         if [[ "${_x[$i]}" == "--api-key" ]]; then API_KEY="${_x[$((i+1))]}"; break; fi
     done
 fi
-BASE="http://localhost:$PORT"
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
+BASE="http://$(probe_host):$PORT"
 PROBE_LATENCY_LOG="$REPO_DIR/logs/probe-latency.log"
 AUTH=(); [[ -n "$API_KEY" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
 
