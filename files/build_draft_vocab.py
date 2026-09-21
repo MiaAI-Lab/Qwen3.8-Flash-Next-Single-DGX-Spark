@@ -103,6 +103,12 @@ def main() -> None:
     # of conversation logs keeps 286 -- 90 fewer, and the missing ones are what
     # assemble "n-tilde" and the accents. The resulting drafter proposes badly
     # at exactly those boundaries.
+    #
+    # The scan assumes the first 512 ids are the byte-level alphabet, which is a
+    # property of GPT-2-style byte fallback, not a general rule that a
+    # single-character token is byte-level. Here it pins exactly 256 ids, 0-255,
+    # every one through `len(piece) == 1`; the `<0x..>` branch is for the
+    # SentencePiece spelling and never fires on this tokenizer.
     byte_level = set()
     for tid in range(min(512, vocab_size)):
         piece = tok.convert_ids_to_tokens(tid)
