@@ -76,6 +76,9 @@
 # ple_layer.py; see README for the docker invocation.
 !/tests/test_nvidia_ple.py
 !/tests/test_nvidia_mtp.py
+# Hermetic bash test for files/memwatch.sh; runs on the host with fake
+# docker, journalctl and sudo.
+!/tests/test_memwatch_relief.sh
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
