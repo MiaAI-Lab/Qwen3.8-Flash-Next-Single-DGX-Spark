@@ -1009,6 +1009,31 @@ samples here, with excursions past 1 GiB):
   weight loading: `MemFree` 0.9 GiB, `MemAvailable` 32 GiB, zero driver
   errors — and an ungated version of this trigger killed a healthy launch.
 
+The MemFree floor has an optional relief step, `MEMWATCH_RELIEF=drop_caches`
+(default `off`). At the stock kernel
+watermarks kswapd reclaims page cache only near 150 MiB free, so the floor
+can fire while GiBs of clean page cache are still resident: on 2026-09-23
+it stopped a single-Spark server at `MemFree` 1.2 GiB and `MemAvailable` 8.3 GiB with
+5.7 GiB cached. With relief on, after `MEMWATCH_RELIEF_AT` (2) sub-floor
+samples, and when at least `MEMWATCH_RELIEF_MIN_GIB` (1) of file cache is
+reclaimable, the watchdog runs `echo 1 | sudo -n tee
+/proc/sys/vm/drop_caches` under `timeout -k 2 10`. Then it logs `MemFree`,
+`MemAvailable` and the reclaimable cache before and after, resets the
+counter, and stops only if the floor holds for 5 more samples. It does this
+at most once per `MEMWATCH_RELIEF_INTERVAL` (60) seconds. A failed relief
+(no sudo rule) is logged once and relief stays off for that run. The relief
+runs in the background: the watchdog waits at most 1 s for it, then both
+floors and the `NV_ERR_NO_MEMORY` check keep sampling, and the counter
+resets when the relief ends. No signal stops the kernel's drop_caches scan,
+so a relief still running 14 s after its start is logged as stuck and relief
+stays off for that run. drop_caches skips mapped pages, so the PLE table
+rows the gather reads through its memmap stay in memory. The
+`MemAvailable` floor has no relief. The step needs a sudoers rule; the
+header of `files/memwatch.sh` has it. Raising `vm.watermark_scale_factor` is
+not the alternative: it lowers `MemAvailable` by the watermark size, and the
+`MemAvailable` floor then fires. `bash tests/test_memwatch_relief.sh` runs
+the hermetic tests.
+
 Every 10 s it counts `NV_ERR_NO_MEMORY` lines in `journalctl -k` and logs any
 non-zero count. Read it together with `MemAvailable`: a handful during
 startup, when the driver takes the weights and then the KV pool in two large

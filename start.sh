@@ -110,6 +110,7 @@ _CLI_READY_TIMEOUT_S="${READY_TIMEOUT_S:-}"
 # Snapshot anything set in the environment, then restore it after the source.
 _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
+                    MEMWATCH_RELIEF MEMWATCH_RELIEF_AT MEMWATCH_RELIEF_MIN_GIB MEMWATCH_RELIEF_INTERVAL
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
                     MAMBA_SSM_CACHE_DTYPE
                     IMAGE SERVED_MODEL_NAME CUDAGRAPH_MODE HF_TOKEN
@@ -231,6 +232,15 @@ MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 # Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
+# Relief step for the MemFree floor: off (default) or drop_caches. With
+# drop_caches the watchdog drops clean page cache (sudo -n, needs a NOPASSWD
+# rule; see files/memwatch.sh) after MEMWATCH_RELIEF_AT sub-floor samples
+# when at least MEMWATCH_RELIEF_MIN_GIB is reclaimable, at most once per
+# MEMWATCH_RELIEF_INTERVAL seconds, and stops only if MemFree stays low.
+MEMWATCH_RELIEF="${MEMWATCH_RELIEF:-off}"
+MEMWATCH_RELIEF_AT="${MEMWATCH_RELIEF_AT:-2}"
+MEMWATCH_RELIEF_MIN_GIB="${MEMWATCH_RELIEF_MIN_GIB:-1}"
+MEMWATCH_RELIEF_INTERVAL="${MEMWATCH_RELIEF_INTERVAL:-60}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
 # PLE_GIB: the packed PLE table's size, subtracted from the on-disk
 # checkpoint size to get GPU-resident weights. The stock and ablit snapshots
@@ -1120,8 +1130,13 @@ if [[ -s "$MEMWATCH_LOG" ]]; then
 fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
     MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
+    MEMWATCH_RELIEF="$MEMWATCH_RELIEF" MEMWATCH_RELIEF_AT="$MEMWATCH_RELIEF_AT" \
+    MEMWATCH_RELIEF_MIN_GIB="$MEMWATCH_RELIEF_MIN_GIB" MEMWATCH_RELIEF_INTERVAL="$MEMWATCH_RELIEF_INTERVAL" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
 ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
+if [[ "$MEMWATCH_RELIEF" != "off" ]]; then
+    info "Watchdog relief: MEMWATCH_RELIEF=${MEMWATCH_RELIEF} after ${MEMWATCH_RELIEF_AT} sub-floor MemFree samples (the watchdog log confirms or rejects the knobs)"
+fi
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
