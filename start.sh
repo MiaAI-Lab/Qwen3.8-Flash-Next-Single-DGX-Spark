@@ -867,7 +867,10 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _MTP_BLOCK=""; _MTP_CR=""; _MTP_INTRO_SRC="fallback"
     _MTP_INTRO_FILE="$_MTP_CACHE_DIR/mtp-ring-$(printf '%s' "$SNAP" | cut -c1-16)"
     if [[ -r "$_MTP_INTRO_FILE" ]]; then
-        read -r _MTP_BLOCK _MTP_CR < "$_MTP_INTRO_FILE" && _MTP_INTRO_SRC="cache"
+        # Accept only "<int> <int>": an old cache could hold a vLLM log line
+        # ("INFO 09-23 ..."), and "09" then breaks bash arithmetic as octal.
+        _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1 || true)
+        [[ -n "$_MTP_CACHED" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_CACHED" && _MTP_INTRO_SRC="cache"
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
         # Best-effort; any failure falls through to the known-good table.
@@ -894,7 +897,7 @@ for mod in ("vllm.models.qwen3_8_flash_next.nvidia.qsa",
 if bs is None:
     bs = 0
 print(f"{int(bs)} {cr}")
-' 2>/dev/null || true)
+' 2>/dev/null | grep -E '^[0-9]+ [0-9]+$' | tail -1 || true)
         if [[ -n "$_MTP_INTRO" ]]; then
             read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_INTRO"
             [[ -n "$_MTP_BLOCK" && -n "$_MTP_CR" ]] && _MTP_INTRO_SRC="introspect" \
@@ -1095,7 +1098,9 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
 # without a prune the archive grows forever and threatens the checkpoint
 # disk cache.
-ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+# "|| true": on a fresh install the glob matches nothing, ls exits 2, and
+# pipefail would stop the launch here without a message.
+{ ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null || true; } | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
 done
