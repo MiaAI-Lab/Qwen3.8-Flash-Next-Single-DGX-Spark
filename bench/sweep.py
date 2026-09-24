@@ -104,6 +104,8 @@ def run_level(s, prompt, max_tokens):
         except urllib.error.HTTPError as e:
             if e.code == 409:
                 print("  sparkDash busy, waiting 10 s", file=sys.stderr); time.sleep(10); continue
+            if e.code == 429 and b"work budget" not in e.read():
+                print("  sparkDash rate limit, waiting 15 s", file=sys.stderr); time.sleep(15); continue
             raise
     bid = job["benchId"]
     while True:
