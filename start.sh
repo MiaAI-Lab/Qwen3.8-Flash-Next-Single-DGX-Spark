@@ -649,6 +649,13 @@ extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
 
+DET_DIR="$SCRIPT_DIR/files/determinism"
+MOE_CUTLASS_PKG="$VLLM_PKG/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py"
+mkdir -p "$DET_DIR/orig"
+extract "$MOE_CUTLASS_PKG" "$DET_DIR/orig/flashinfer_cutlass_moe.py"
+python3 "$SCRIPT_DIR/files/patch_determinism.py" || err "patch_determinism.py failed"
+[[ -f "$DET_DIR/flashinfer_cutlass_moe.py" ]] || err "determinism patch missing: flashinfer_cutlass_moe.py"
+
 # Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
 # is set in the container, so it is applied unconditionally.
 PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
@@ -1044,6 +1051,7 @@ docker run \\
     -e FLASHINFER_NVCC_THREADS=1 \\
     ${VLLM_QSA_DET_TOPK:+-e VLLM_QSA_DET_TOPK=$VLLM_QSA_DET_TOPK} \\
     ${VLLM_MOE_DET_FINALIZE:+-e VLLM_MOE_DET_FINALIZE=$VLLM_MOE_DET_FINALIZE} \\
+    $( [[ "$VLLM_MOE_DET_FINALIZE" == 1 ]] && echo "-e VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0 -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/root/.cache/vllm/flashinfer_autotune_cache_unfused" ) \\
     ${GDN_DECODE_KERNEL:+-e VLLM_GDN_DECODE_KERNEL=$GDN_DECODE_KERNEL} \\
     ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
     ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
@@ -1055,6 +1063,7 @@ docker run \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
+    -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
