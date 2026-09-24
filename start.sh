@@ -311,6 +311,11 @@ GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
 MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
+# The pinned image does not know that key (its SpeculativeConfig rejects
+# unknown keys), so Step 4 also mounts a backport of vllm#53388
+# (files/patch_block_drop.py) when this knob is 1 and MTP is on.
+[[ "$MTP_DISABLE_BLOCK_DROP" == 0 || "$MTP_DISABLE_BLOCK_DROP" == 1 ]] \
+    || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -656,6 +661,26 @@ extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
 
+# vllm#53388 backport: without it the image ignores "disable_eagle_block_drop".
+BLOCK_DROP_MOUNTS=""
+if [[ "$MTP_DISABLE_BLOCK_DROP" == 1 && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    BLOCK_DROP_DIR="$SCRIPT_DIR/files/block_drop"
+    # The paths under the vllm package that the backport changes.
+    BLOCK_DROP_FILES=$(python3 "$SCRIPT_DIR/files/patch_block_drop.py" --list) \
+        || err "patch_block_drop.py --list failed"
+    for f in $BLOCK_DROP_FILES; do
+        mkdir -p "$(dirname "$BLOCK_DROP_DIR/orig/$f")"
+        extract "$VLLM_PKG/$f" "$BLOCK_DROP_DIR/orig/$f"
+    done
+    python3 "$SCRIPT_DIR/files/patch_block_drop.py" || err "patch_block_drop.py failed"
+    for f in $BLOCK_DROP_FILES; do
+        # No output file: the image already has the option (see the patch script).
+        if [[ -f "$BLOCK_DROP_DIR/$f" ]]; then
+            BLOCK_DROP_MOUNTS+=" -v $BLOCK_DROP_DIR/$f:$VLLM_PKG/$f:ro"
+        fi
+    done
+fi
+
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
 extract "$VLLM_PKG/model_executor/layers/ple_offload_layer.py" "$OFFLOAD_DIR/orig/ple_offload_layer.py"
@@ -936,7 +961,8 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
     # disable_eagle_block_drop (vllm#53388, plan 2.4): removes MTP's fixed
     # prefix-cache-block back-off per turn. Merged the same way as the other
-    # scalars; a vLLM that does not know the key ignores it harmlessly.
+    # scalars. SpeculativeConfig forbids unknown keys, so Step 4 mounts the
+    # backport whenever this key is merged.
     [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
@@ -1018,7 +1044,7 @@ info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup c
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
-info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
+info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}   Disable block drop: $MTP_DISABLE_BLOCK_DROP"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT  (bind $BIND)"
 info ""
@@ -1052,6 +1078,7 @@ docker run \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
+    $BLOCK_DROP_MOUNTS \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
