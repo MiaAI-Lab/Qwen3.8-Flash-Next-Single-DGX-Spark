@@ -894,11 +894,21 @@ VLLM_ARGS+=("--distributed-executor-backend" "mp")
 # introspection cannot run (offline / old image), fall back to the known-good
 # table {0,2,3,4,9..12} for block 848 with a WARN. k=1 is rejected separately:
 # it is strictly dominated (same fixed cache-block cost as k=2, half the gain).
+# The engine derives the block for EACH k (the GDN conv state in the mamba page
+# has kernel - 1 + k rows) and for the SSM and KV dtypes, so one block for all
+# k is wrong: block 848 rejects k=6, which the engine runs at block 1728 with
+# the .env.sample dtypes. files/mtp_block.py calculates the block for this k
+# from config.json and goes first. The cache, introspection and 848 table stay
+# only for a checkpoint that the formula does not know.
 _MTP_CACHE_DIR="$HOME/.cache/vllm/ple_cache"
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _MTP_BLOCK=""; _MTP_CR=""; _MTP_INTRO_SRC="fallback"
+    _MTP_FORMULA=$(python3 "$SCRIPT_DIR/files/mtp_block.py" "$MODEL_PATH/$SNAPSHOT_REL/config.json" \
+        "$MTP_NUM_SPECULATIVE_TOKENS" "$MAMBA_SSM_CACHE_DTYPE" "$KV_CACHE_DTYPE" 2>/dev/null \
+        | grep -E '^[0-9]+ [0-9]+$' | tail -1 || true)
+    [[ -n "$_MTP_FORMULA" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_FORMULA" && _MTP_INTRO_SRC="formula"
     _MTP_INTRO_FILE="$_MTP_CACHE_DIR/mtp-ring-$(printf '%s' "$SNAP" | cut -c1-16)"
-    if [[ -r "$_MTP_INTRO_FILE" ]]; then
+    if [[ -z "$_MTP_BLOCK" && -r "$_MTP_INTRO_FILE" ]]; then
         # Accept only "<int> <int>": an old cache could hold a vLLM log line
         # ("INFO 09-23 ..."), and "09" then breaks bash arithmetic as octal.
         _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1 || true)
@@ -951,6 +961,7 @@ print(f"{int(bs)} {cr}")
     _CAP=$(( _MTP_CR * ((_MTP_CR + _K + _MTP_CR - 1) / _MTP_CR) ))
     _MTP_LEGAL=1
     (( _MTP_BLOCK % _CAP == 0 )) && _MTP_LEGAL=0
+    info "MTP legality: k=$_K block $_MTP_BLOCK ring $_CAP ($_MTP_INTRO_SRC)"
     if [[ "$_MTP_LEGAL" == "1" ]]; then
         err "MTP_NUM_SPECULATIVE_TOKENS=$_K is illegal for block ${_MTP_BLOCK}, compress ratio ${_MTP_CR} ($_MTP_INTRO_SRC): illegal k hard-fails the engine at config validation. Use a legal k (shipped default 3)."
     fi
