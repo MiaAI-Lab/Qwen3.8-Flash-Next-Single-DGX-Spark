@@ -1172,8 +1172,8 @@ sparkDash's own figures include any other traffic on the port.
   the 1,440-byte packed row (PR #67): at the old 2,560 width the `[:T, :1440]`
   slice was not contiguous for T > 1, so every prefill chunk and MTP verify
   step shipped stale rows to the GPU. Fixing it took mean NLL on 15,776 fixed
-  positions from 1.397 to 1.344 and HumanEval from 153 to 157/164, decode
-  unchanged (2026-09-24).
+  positions from 1.397 to 1.344 (every text improved), decode unchanged
+  (2026-09-24).
 - **FP8 KV cache** (`patch_qsa_fp8_kv.py`, via `KV_CACHE_DTYPE=fp8`): casts
   FP8 K/V tiles to BF16 for the tensor-core dots and applies the per-tensor
   scales once to the score and the normalised output, plumbs `k_scale`/
