@@ -101,7 +101,7 @@ def level(url, model, max_tokens, c, reps):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8888)
-    ap.add_argument("--model", default="Qwen3.8-Flash-Next")
+    ap.add_argument("--model", default="qwen3.8-flash-next")
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--streams", type=int, nargs="+", default=[1, 2, 4])
     ap.add_argument("--reps", type=int, default=2)
