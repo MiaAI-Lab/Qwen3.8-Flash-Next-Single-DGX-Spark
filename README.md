@@ -1168,7 +1168,12 @@ sparkDash's own figures include any other traffic on the port.
   `MADV_RANDOM`: without it the kernel faults in a ~64 KiB window to serve each
   90-byte row lookup, and measurements here showed **24x** more disk read per
   decoded token (1,366 -> 57 KiB/token) plus ~2 GiB of page cache wasted on
-  readahead that is never used.
+  readahead that is never used. The worker's pinned staging buffer is sized to
+  the 1,440-byte packed row (PR #67): at the old 2,560 width the `[:T, :1440]`
+  slice was not contiguous for T > 1, so every prefill chunk and MTP verify
+  step shipped stale rows to the GPU. Fixing it took mean NLL on 15,776 fixed
+  positions from 1.397 to 1.344 and HumanEval from 153 to 157/164, decode
+  unchanged (2026-09-24).
 - **FP8 KV cache** (`patch_qsa_fp8_kv.py`, via `KV_CACHE_DTYPE=fp8`): casts
   FP8 K/V tiles to BF16 for the tensor-core dots and applies the per-tensor
   scales once to the score and the normalised output, plumbs `k_scale`/
@@ -1184,8 +1189,8 @@ sparkDash's own figures include any other traffic on the port.
   (Apache-2.0), reimplemented here against this image's own sources. That
   credit applies to this one patch; nothing else in this repository derives
   from that project.
-- **vllm#53388 backport** (`patch_block_drop.py`, opt-in via
-  `MTP_DISABLE_BLOCK_DROP=1`): adds `disable_eagle_block_drop` to the image's
+- **vllm#53388 backport** (`patch_block_drop.py`, `MTP_DISABLE_BLOCK_DROP=1`,
+  on in `.env.sample`): adds `disable_eagle_block_drop` to the image's
   `SpeculativeConfig`, the KV cache manager and the scheduler. The image's
   `SpeculativeConfig` rejects unknown keys, so the key needs this backport.
   With the key, a multi-turn request keeps its last full prefix-cache block
@@ -1202,6 +1207,15 @@ sparkDash's own figures include any other traffic on the port.
   the image to `files/block_drop/orig/<path>` and mounts the patched copies.
   The engine log says "EAGLE trailing prefix-cache block dropping is
   disabled".
+- **Reproducible greedy decoding** (`patch_determinism.py`, opt-in via
+  `VLLM_QSA_DET_TOPK=1` and `VLLM_MOE_DET_FINALIZE=1`, #28): the QSA top-k
+  kernel returns the right block set in atomic arrival order and the sparse
+  attention sums in that order, so the patch sorts each row; the NVFP4 MoE
+  switches to FlashInfer's unfused finalize (vllm#54948) with its own autotune
+  cache dir, because the shared cache holds fused-mode tactics and fails the
+  launch. With both, identical requests give bit-identical logits (0 of 1,742
+  positions differ; before, median 0.19 and max 4.8 nats), NLL unchanged,
+  decode within noise, prefill -3.4% at 47k tokens.
 
 ## Credits
 
