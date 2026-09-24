@@ -338,8 +338,23 @@ neighbouring-language subword pieces rather than noise.
 
 Serving NVIDIA's checkpoint, which keeps that table at higher precision, on the
 same host and the same sampling: **30.0 malformations per 10k against 123.3, and
-0/30 generations drifting against 2/30.** That is the test, and it is the only
-change between the two arms.
+0/30 generations drifting against 2/30.** That is the test: one change of
+configuration, measured end to end.
+
+**One change of configuration is not the same as one mechanism, and #67 is why.**
+That pull request reports a second defect reaching the same table: the pinned
+staging buffer is sized from `config.ple_embed_dim` while `forward_impl` slices
+it to the layer's packed row width, so when the two differ the slice is not
+contiguous past one token and the rows never reach the GPU — one verify step in
+four at MTP K=3. The widths differ exactly when the table is packed at 4 bits
+(16 heads x 90 bytes against an embedding dim of 2560) and coincide when it is
+not (16 x 160). So the arm that read 123.3 carried both a 4-bit table and that
+staging bug, and the arm that read 30.0 carried neither.
+
+The numbers above stand, and so does what to do about them. What does not is
+attributing the gap to quantization alone: these measurements cannot separate
+the two. Splitting them means serving the 4-bit mirror with #67 applied and
+re-running this battery, which the author of these notes has not done.
 
 ---
 
