@@ -45,6 +45,7 @@
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
+!/files/mtp_block.py
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_mtp_draft_vocab.py
 # shipped reduced draft vocabulary (47,149 ids, code-tuned). The 65k en+code
@@ -76,6 +77,7 @@
 # ple_layer.py; see README for the docker invocation.
 !/tests/test_nvidia_ple.py
 !/tests/test_nvidia_mtp.py
+!/tests/test_mtp_block.py
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
