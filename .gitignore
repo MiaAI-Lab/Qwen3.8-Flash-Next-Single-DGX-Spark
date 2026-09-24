@@ -45,6 +45,7 @@
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
+!/files/mtp_block.py
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_determinism.py
 !/files/patch_mtp_draft_vocab.py
@@ -79,6 +80,7 @@
 !/tests/test_nvidia_mtp.py
 !/tests/test_ple_staging_width.py
 !/tests/test_determinism_patch.py
+!/tests/test_mtp_block.py
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
