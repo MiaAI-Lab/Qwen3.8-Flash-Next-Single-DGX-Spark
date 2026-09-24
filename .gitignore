@@ -108,6 +108,12 @@
 !/docs/cache-reporting.md
 !/tests/test_prompt_token_details.py
 
+# --- opt-in MTP patch: vllm#53388 block-drop backport --------------------
+# Generator only. start.sh runs it when MTP_DISABLE_BLOCK_DROP=1; its output
+# (files/block_drop/) stays ignored. The test runs on the host, CPU only.
+!/files/patch_block_drop.py
+!/tests/test_block_drop.py
+
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
 #   .env                      may contain HF_TOKEN
@@ -119,3 +125,4 @@
 #   files/ple_layer_patched.py, files/modelopt_patched.py,
 #   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch
+#   files/block_drop/         orig/ from the image, patched copies generated per launch

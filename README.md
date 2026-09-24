@@ -1112,6 +1112,10 @@ set (the shipped default), set `API_KEY` in the shell first or the call 401s;
   (27 GiB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
 - `files/sysctl-spark3.conf` — recommended kernel VM tunables, not applied by
   anything here; read its header first.
+- `files/patch_block_drop.py` — opt-in generator for `MTP_DISABLE_BLOCK_DROP=1`
+  (see [What is patched and why](#what-is-patched-and-why)). `start.sh` runs
+  it only when the knob is 1. `tests/test_block_drop.py` checks it and its
+  `start.sh` wiring on CPU.
 
 - `bench/sweep.py` — decode sweep. Submits one
   [sparkDash](https://github.com/MiaAI-Lab/sparkDash) job per concurrency level
@@ -1180,6 +1184,24 @@ sparkDash's own figures include any other traffic on the port.
   (Apache-2.0), reimplemented here against this image's own sources. That
   credit applies to this one patch; nothing else in this repository derives
   from that project.
+- **vllm#53388 backport** (`patch_block_drop.py`, opt-in via
+  `MTP_DISABLE_BLOCK_DROP=1`): adds `disable_eagle_block_drop` to the image's
+  `SpeculativeConfig`, the KV cache manager and the scheduler. The image's
+  `SpeculativeConfig` rejects unknown keys, so the key needs this backport.
+  With the key, a multi-turn request keeps its last full prefix-cache block
+  instead of computing it again. The drafter still runs. The change can move
+  acceptance only: the target verifies every draft token. On one GB10 at
+  MTP 3, the second turn of a session read 9,984 cached tokens instead of
+  8,320, and its server TTFT went from about 1.79 s to 0.91 s. After a 5K-token
+  tool output it went from 3.26 s to 2.58 s. Cold and first-turn TTFT did not
+  change. The backport changes six of the seven vllm
+  files that vllm#53388 changes. It leaves out the sliding-window fix in
+  `single_type_kv_cache_manager.py`, because this model has no sliding window.
+  Three of the six are KV transfer and offload connectors, so a connector
+  keeps the same block as the scheduler. `start.sh` extracts the files from
+  the image to `files/block_drop/orig/<path>` and mounts the patched copies.
+  The engine log says "EAGLE trailing prefix-cache block dropping is
+  disabled".
 
 ## Credits
 
