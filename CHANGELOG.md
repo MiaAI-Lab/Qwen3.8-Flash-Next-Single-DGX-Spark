@@ -5,6 +5,20 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-25
+
+### Added
+
+- **`./start-v030.sh`: an opt-in lane on stock vLLM 0.30.0 with the nvidia
+  checkpoint.** Three overlays: a file-backed PLE table read over ATS
+  (persistent, one file per snapshot), a backport of vllm#55557 for FP8 KV,
+  and the reduced draft vocab ported to v0.30. Versus the default lane on one
+  GB10: NLL 1.344 -> 1.332, prefill +10%, turn-1 TTFT 0.81 -> 0.67 s, code
+  decode +6% at S=4, prose decode -25..-32%. KV 801k tokens at 12 GiB. A
+  1-hour soak: 784 requests, 0 errors. See the README section.
+- `scripts/supervise.sh` and `scripts/maintenance-relaunch.sh` relaunch
+  through the entry point recorded in `logs/launch-lane`.
+
 ## 2026-09-24
 
 All measured on one GB10, `.env.sample` profile (262k, MTP 3, 47k vocab, FP8 KV,
