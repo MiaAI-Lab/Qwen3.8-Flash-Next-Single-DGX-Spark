@@ -109,6 +109,19 @@ prefill columns are **not** a clean A/B — they differ in rope config and KV
 target as well as chunk width — so each is labelled with what it was measured
 at.
 
+**Reading a sweep: the admission-queue trap (issue #19).** Aggregate decode
+tok/s does not flatline at the shipped `MAX_NUM_SEQS` — measured on this box
+it gains ~40–55% from S=4 to S=8 on every config, with per-stream decode
+still 25–31 tok/s at S=8, and the 8→16 cap A/B is null within noise. So a
+benchmark whose aggregate flatlines at exactly its client count is measuring
+`MAX_NUM_SEQS`, not the GPU: requests past the cap sit in the admission
+queue, which reads identically to saturation in a tok/s-vs-clients curve.
+`sweep.py` records `queue_waiting_max` (the max of vLLM's
+`num_requests_waiting` gauge) per level for exactly this: a level that
+flatlined while it was non-zero was queued, not saturated. Before calling a
+box full from a load test, check that number and cap-aware: offer more
+streams than `MAX_NUM_SEQS` and see whether aggregate rises past the cap.
+
 #### 2026-09-06: BF16 recurrent state and every verify width on a graph
 
 Measured on 512k YaRN, MTP 3, FP8 KV, 2,048 chunks, `CUDAGRAPH_CAPTURE_SIZES=auto`,

@@ -31,6 +31,10 @@ COUNTERS = [
     "vllm:spec_decode_num_accepted_tokens_total",
     "vllm:spec_decode_num_draft_tokens_total",
     "vllm:generation_tokens_total",
+    # Gauge, not a counter: the depth of the admission queue at snapshot time.
+    # A level that flatlines at exactly its offered concurrency while this is
+    # non-zero is queued on MAX_NUM_SEQS, not GPU-saturated (issue #19).
+    "vllm:num_requests_waiting",
 ]
 LINE = re.compile(r'^(vllm:[a-z_]+)(\{[^}]*\})? ([0-9.eE+-]+)$')
 
@@ -87,12 +91,18 @@ class MemMin(threading.Thread):
         super().__init__(daemon=True)
         self.stop = threading.Event()
         self.avail = self.free = 1e9
+        self.waiting_max = 0
 
     def run(self):
         while not self.stop.is_set():
             m = meminfo()
             self.avail = min(self.avail, m["MemAvailable"])
             self.free = min(self.free, m["MemFree"])
+            try:
+                w = snapshot().get("vllm:num_requests_waiting", 0)
+                self.waiting_max = max(self.waiting_max, w)
+            except Exception:
+                pass                                   # metrics endpoint blip
             self.stop.wait(1)
 
 
@@ -131,7 +141,7 @@ def main():
 
     running = snapshot()
     order = list(a.streams)
-    print(f"{'tag':<6}{'prompt':<8}{'S':>3}{'rep':>4}{'ms/step':>9}{'tok/step':>9}{'p1/p2/p3':>18}{'dash tok/s':>11}{'ttft ms':>9}{'avail':>7}{'free':>6}{'nvrm':>6}")
+    print(f"{'tag':<6}{'prompt':<8}{'S':>3}{'rep':>4}{'ms/step':>9}{'tok/step':>9}{'p1/p2/p3':>18}{'dash tok/s':>11}{'ttft ms':>9}{'avail':>7}{'free':>6}{'wait':>5}{'nvrm':>6}")
     for rep in range(a.repeats):
         seq = order if rep % 2 == 0 else order[::-1]
         for s in seq:
@@ -156,6 +166,7 @@ def main():
                     "gen_tokens": d.get("vllm:generation_tokens_total"),
                     "wall_s": time.time() - t0,
                     "mem_avail_min_gib": round(mm.avail, 2), "mem_free_min_gib": round(mm.free, 2),
+                    "queue_waiting_max": mm.waiting_max,
                     "nvrm": nvrm, "note": a.note,
                     "benchId": job.get("benchId"), "status": job.get("status"),
                 }
@@ -164,7 +175,7 @@ def main():
                 pp = "/".join(f"{x:.2f}" for x in row["per_pos"][:3])
                 print(f"{a.tag:<6}{prompt:<8}{s:>3}{rep:>4}{row['ms_per_step']:>9.1f}{row['tok_per_step']:>9.2f}{pp:>18}"
                       f"{(row['dash_aggregate_tps'] or 0):>11.1f}{(row['dash_ttft_ms'] or 0):>9.0f}{mm.avail:>7.1f}{mm.free:>6.1f}"
-                      f"{(nvrm if nvrm is not None else -1):>6}", flush=True)
+                      f"{mm.waiting_max:>5.0f}{(nvrm if nvrm is not None else -1):>6}", flush=True)
 
 
 if __name__ == "__main__":
