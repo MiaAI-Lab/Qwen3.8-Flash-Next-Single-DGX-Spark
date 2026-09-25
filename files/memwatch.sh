@@ -24,6 +24,22 @@
 #     32 GiB, zero NVRM errors. Free pages backed by reclaimable cache are not
 #     what the driver runs out of; free pages with no cache left to reclaim are.
 #
+#     2026-09-19: the MemFree trigger stopped the server on a FALSE positive:
+#     a vision request held MemFree at 1.2-1.5 GiB for 5 s while MemAvailable
+#     stayed at ~7 GiB (5+ GiB of reclaimable cache), zero NV_ERR_NO_MEMORY,
+#     serving clean. Sub-floor-but-reclaimable is a load transient, not the
+#     exhaustion the trigger exists for. The trigger now also requires
+#     EVIDENCE that the host is actually exhausting, counted only while at
+#     least one holds:
+#       - NV_ERR_NO_MEMORY appeared since the previous check (the driver
+#         itself refusing; checked at the 10 s cadence below, so the evidence
+#         window is generous), or
+#       - MemAvailable < MEMWATCH_EXHAUSTED_GIB (default 3): the page cache
+#         is effectively gone and MemFree is all the memory there is.
+#     A sub-floor sample with neither evidence flag is LOGGED (suppressed,
+#     not counted) so the transient stays visible in the log for trend
+#     analysis without costing uptime.
+#
 # Every 10 s it also counts NV_ERR_NO_MEMORY lines the kernel log gained since
 # the previous check; that is the earliest signal this box gives and is logged
 # whenever it is non-zero. (A fixed 12 s window every 10 s double-counted lines
@@ -49,6 +65,7 @@
 CONTAINER="${1:?container}"; MIN_GIB="${2:-6}"; CONSEC="${3:-5}"
 MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
+EXHAUSTED_GIB="${MEMWATCH_EXHAUSTED_GIB:-3}"
 GRACE="${MEMWATCH_GRACE:-30}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -58,11 +75,12 @@ ARCHIVE_DIR="${MEMWATCH_ARCHIVE_DIR:-$REPO_DIR/logs/archive}"
 MIN_KB=$(( MIN_GIB * 1048576 ))
 MIN_FREE_KB=$(( MIN_FREE_GIB * 1048576 ))
 FREE_GATE_KB=$(( FREE_GATE_GIB * 1048576 ))
+EXHAUSTED_KB=$(( EXHAUSTED_GIB * 1048576 ))
 NEAR_KB=$(( MIN_KB + 1048576 ))            # verbose band: avail floor + 1 GiB
 NEAR_FREE_KB=$(( MIN_FREE_KB + 1048576 ))  # verbose band: free floor + 1 GiB
 
 echo "$(date '+%F %T') watchdog start: container=$CONTAINER" \
-     "floors: MemAvailable<${MIN_GIB}GiB, MemFree<${MIN_FREE_GIB}GiB (while MemAvailable<${FREE_GATE_GIB}GiB);" \
+     "floors: MemAvailable<${MIN_GIB}GiB, MemFree<${MIN_FREE_GIB}GiB (while MemAvailable<${FREE_GATE_GIB}GiB and evidence: NV_ERR since last check or MemAvailable<${EXHAUSTED_GIB}GiB);" \
      "trigger=${CONSEC} consecutive samples; grace=${GRACE}s; archive=$ARCHIVE_DIR"
 
 archive_logs() {  # <timestamp>
@@ -96,6 +114,11 @@ tick=0
 below_avail=0
 below_free=0
 nvrm_total=0
+# Evidence the host is actually exhausting, refreshed at the NVRM check
+# cadence below (every 10 s): nvrm>0 means the driver refused an allocation
+# in the last window. Only sub-floor MemFree samples seen while this flag or
+# the exhausted-avail condition holds are counted toward the stop.
+nvrm_recent=0
 nvrm_since=$(date '+%Y-%m-%d %H:%M:%S')
 cg_path=""
 # LEAK TREND (review §4.3): baseline driver figure over a post-load window,
@@ -146,9 +169,20 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
         below_avail=0
     fi
     if (( free < MIN_FREE_KB && avail < FREE_GATE_KB )); then
-        below_free=$(( below_free + 1 ))
-        echo "$(date '+%F %T') below MemFree floor ${below_free}/${CONSEC}: MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB"
-        (( below_free >= CONSEC )) && stop_container "MemFree under ${MIN_FREE_GIB} GiB for ${CONSEC} samples"
+        # Evidence gate (see header): count only when the driver is refusing
+        # allocations (nvrm_recent, refreshed every 10 s below) or the page
+        # cache is effectively gone (avail under the exhaustion floor). A
+        # sub-floor sample with reclaimable cache still on the table is a
+        # load transient: log it, but it must not cost 11 min of downtime
+        # (the 2026-09-19 22:29 false positive).
+        if (( nvrm_recent > 0 || avail < EXHAUSTED_KB )); then
+            below_free=$(( below_free + 1 ))
+            echo "$(date '+%F %T') below MemFree floor ${below_free}/${CONSEC}: MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB (evidence: $(( nvrm_recent > 0 ? 1 : 0 )) NV_ERR=$nvrm_recent, avail-exhausted=$(( avail < EXHAUSTED_KB ? 1 : 0 )))"
+            (( below_free >= CONSEC )) && stop_container "MemFree under ${MIN_FREE_GIB} GiB for ${CONSEC} samples (driver refusing or cache exhausted)"
+        else
+            below_free=0
+            echo "$(date '+%F %T') MemFree sub-floor SUPPRESSED (no NV_ERR since last check, MemAvailable=$((avail/1024)) MiB still reclaimable): MemFree=$((free/1024)) MiB"
+        fi
     else
         (( below_free > 0 )) && echo "$(date '+%T') recovered after ${below_free} sub-floor MemFree sample(s): MemFree=$((free/1024)) MiB"
         below_free=0
@@ -160,6 +194,12 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
         nvrm_now=$(date '+%Y-%m-%d %H:%M:%S')
         nvrm=$(journalctl -k --since "$nvrm_since" --until "$nvrm_now" -q 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true)
         nvrm_since="$nvrm_now"
+        # Evidence flag for the MemFree trigger: the driver refused something
+        # in this window. It decays naturally at the next 10 s check (set to
+        # the new window's count); a 10 s evidence horizon over a 5 s debounce
+        # means a single refusal keeps the gate open through a whole stop
+        # decision, and quiet windows close it again.
+        nvrm_recent=$nvrm
         if (( nvrm > 0 )); then
             nvrm_total=$(( nvrm_total + nvrm ))
             echo "$(date '+%F %T') NVRM: ${nvrm} NV_ERR_NO_MEMORY since last check (total ${nvrm_total}); MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB"
