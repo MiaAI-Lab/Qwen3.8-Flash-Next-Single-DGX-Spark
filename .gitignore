@@ -116,6 +116,18 @@
 !/files/patch_block_drop.py
 !/tests/test_block_drop.py
 
+# --- opt-in vLLM 0.30 lane (start-v030.sh) -------------------------------
+# Generators only; files/v030_fp8kv/, files/v030_ple/ and
+# files/mtp_v030_patched.py* are generated per launch and stay ignored.
+!/start-v030.sh
+!/scripts/launch-lane.sh
+!/files/patch_mtp_draft_vocab_v030.py
+!/files/patch_qsa_fp8_kv_v030.py
+!/files/patch_ple_mmap_v030.py
+!/tests/test_v030_lane.py
+!/tests/test_qsa_fp8_kv_v030.py
+!/tests/test_ple_mmap_v030.py
+
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
 #   .env                      may contain HF_TOKEN
