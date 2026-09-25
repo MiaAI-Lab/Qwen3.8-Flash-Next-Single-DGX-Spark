@@ -27,7 +27,7 @@ BF16 SSM, `MAX_NUM_SEQS=4`), one launch per arm. NLL = mean prompt NLL over
 
 - **`MTP_DISABLE_BLOCK_DROP=1` works and ships on in `.env.sample`** (PR #71,
   vllm#53388 backport; the key used to fail the launch). Warm second turn
-  1.66 -> **0.81 s** TTFT, turn after a 4k tool output 3.60 -> 2.70 s, decode
+  1.66 -> **0.81 s** TTFT, turn after a 4k tool output 3.61 -> 2.72 s (medians of 3), decode
   unchanged. `start.sh` still defaults to 0 for existing `.env` files.
 - **`VLLM_QSA_DET_TOPK=1` / `VLLM_MOE_DET_FINALIZE=1` now work** (were
   plumbing only; #28). `files/patch_determinism.py` sorts the QSA top-k rows
