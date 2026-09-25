@@ -26,7 +26,18 @@ CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 PORT="${PORT:-8888}"
 MAINT_DRAIN_S="${MAINT_DRAIN_S:-600}"
 STOPPING_FLAG="$REPO_DIR/logs/stopping"
-BASE="http://localhost:$PORT"
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
+BASE="http://$(probe_host):$PORT"
 
 alert() { "$REPO_DIR/scripts/alert.sh" "$*" || true; }
 log()   { echo "$(date '+%F %T') [maintenance] $*"; }

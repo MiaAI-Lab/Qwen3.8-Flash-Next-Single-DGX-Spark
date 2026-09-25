@@ -170,6 +170,17 @@ for _ch in '"' "'" ';' '$' '`' '\' '|' '<' '>' '&' '(' ')' '{' '}' ' ' '*' $'\n'
         err "BIND='$BIND' contains a shell metacharacter; refusing to use it."
     fi
 done
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
 # Cold start is ~11 min; the first boot additionally builds the ~27 GB packed
 # PLE table. Give the readiness loop this long before it archives + removes
 # the wedged container and exits non-zero for the supervisor to retry.
@@ -1274,7 +1285,7 @@ while true; do
         fi
         err "Container exited. Full logs: docker logs $CONTAINER_NAME"
     fi
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/health" 2>/dev/null || echo "000")
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$(probe_host):$PORT/health" 2>/dev/null || echo "000")
     if [[ "$CODE" == "200" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""

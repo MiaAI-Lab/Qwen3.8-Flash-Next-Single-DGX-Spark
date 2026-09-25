@@ -52,6 +52,17 @@ if [[ -f "$REPO_DIR/.env" ]]; then
     # shellcheck source=.env
     source "$REPO_DIR/.env"
 fi
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
 CONTAINER_NAME="${TP1_CONTAINER_NAME:-vllm-fn-tp1}"
 MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-6}"
 MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
@@ -156,7 +167,7 @@ weights_loading() {
     # you gate on weight-load progress"). Once /health has answered once,
     # probe failures are real again.
     container_up || return 1
-    if curl -s -m 5 -o /dev/null -w '%{http_code}' "http://localhost:${PORT:-8888}/health" 2>/dev/null | grep -q 200; then
+    if curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$(probe_host):${PORT:-8888}/health" 2>/dev/null | grep -q 200; then
         return 1
     fi
     docker logs --tail 5 "$CONTAINER_NAME" 2>/dev/null \
@@ -593,7 +604,7 @@ while true; do
                 # engine. If /health still answers 200, do not emergency-stop a
                 # healthy saturated server (this box: stop/relaunch is the
                 # riskiest operation, unified memory).
-                _health=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://localhost:${PORT:-8888}/health" 2>/dev/null || echo "000")
+                _health=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$(probe_host):${PORT:-8888}/health" 2>/dev/null || echo "000")
                 if [[ "$_health" == "200" ]]; then
                     alert "SUPERVISOR: ${pf} probe failures but /health is 200 — treating as queue congestion, not escalating."
                     state_set last_probe_fail 0

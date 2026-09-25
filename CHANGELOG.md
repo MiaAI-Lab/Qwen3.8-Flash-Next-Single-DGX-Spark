@@ -7,6 +7,21 @@ as promises.
 
 ## 2026-09-25
 
+### Fixed
+
+- **Readiness checks and probes follow `BIND` instead of assuming `localhost`.**
+  With `BIND` set to a specific interface address (a LAN or Tailscale IP) —
+  neither `0.0.0.0` nor loopback — vLLM does not listen on loopback, but
+  `start.sh`'s readiness loop, `scripts/smoke-test.sh`, `scripts/health-probe.sh`,
+  `scripts/maintenance-relaunch.sh` and both `/health` checks in
+  `scripts/supervise.sh` all probed `http://localhost:$PORT`. On a healthy
+  server that reads as `last /health code 000` forever; after
+  `READY_TIMEOUT_S` (1800 s) `start.sh` archived and removed the container
+  ("wedged before /health"), and the smoke test failed at its first check. A small
+  `probe_host` helper now returns `localhost` for a wildcard bind
+  (`0.0.0.0`, `::`) — so existing setups are unchanged — and the bound
+  address otherwise (IPv6 literals bracketed). No new knob, no new file.
+
 ### Added
 
 - **`./start-v030.sh`: an opt-in lane on stock vLLM 0.30.0 with the nvidia
