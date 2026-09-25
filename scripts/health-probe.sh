@@ -37,9 +37,12 @@ API_KEY="${API_KEY:-}"
 # Fallback: the deployment may carry the key as --api-key <value> inside
 # .env's EXTRA_VLLM_ARGS instead of the API_KEY knob (same extraction as
 # smoke-test.sh). Without it the probe 401s and the supervisor reads a
-# healthy authenticated server as wedged.
+# healthy authenticated server as wedged. Tokenized with start.sh's shlex
+# semantics so quoted values survive.
+source "$REPO_DIR/scripts/launch-lane.sh"
 if [[ -z "$API_KEY" && -n "${EXTRA_VLLM_ARGS:-}" ]]; then
-    _x=(); read -ra _x <<< "$EXTRA_VLLM_ARGS"
+    split_extra_vllm_args _x "$EXTRA_VLLM_ARGS" \
+        || { echo "EXTRA_VLLM_ARGS has an unterminated single quote" >&2; exit 1; }
     for ((i=0; i<${#_x[@]}-1; i++)); do
         if [[ "${_x[$i]}" == "--api-key" ]]; then API_KEY="${_x[$((i+1))]}"; break; fi
     done
