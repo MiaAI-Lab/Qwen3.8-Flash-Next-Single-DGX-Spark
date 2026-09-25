@@ -62,7 +62,7 @@
 # Env: MEMWATCH_MIN_FREE_GIB (2), MEMWATCH_FREE_GATE_GIB (10), MEMWATCH_GRACE (30), MEMWATCH_LOG (this
 # script's own log, for archiving; default logs/memwatch-<container>.log),
 # MEMWATCH_ARCHIVE_DIR (logs/archive).
-CONTAINER="${1:?container}"; MIN_GIB="${2:-6}"; CONSEC="${3:-5}"
+CONTAINER="${1:?container}"; MIN_GIB="${2:-6}"; CONSEC="${3:-${MEMWATCH_CONSEC:-5}}"
 MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 EXHAUSTED_GIB="${MEMWATCH_EXHAUSTED_GIB:-3}"

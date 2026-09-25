@@ -231,6 +231,8 @@ MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 # Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
+# Consecutive samples below the floor before the watchdog stops the container.
+MEMWATCH_CONSEC="${MEMWATCH_CONSEC:-5}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
 # PLE_GIB: the packed PLE table's size, subtracted from the on-disk
 # checkpoint size to get GPU-resident weights. The stock and ablit snapshots
@@ -1234,11 +1236,11 @@ if [[ -s "$MEMWATCH_LOG" ]]; then
     info "Previous watchdog log archived: logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-memwatch.log"
 fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
-    MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
+    MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_CONSEC="$MEMWATCH_CONSEC" MEMWATCH_LOG="$MEMWATCH_LOG" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
 printf 'V030=%s\nMEMWATCH_MIN_GIB=%s\nMEMWATCH_MIN_FREE_GIB=%s\n' "$V030" "$MEMWATCH_MIN_GIB" "$MEMWATCH_MIN_FREE_GIB" \
     > "$SCRIPT_DIR/logs/launch-lane"
-ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
+ok "Watchdog running (stops container after ${MEMWATCH_CONSEC:-5} samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
