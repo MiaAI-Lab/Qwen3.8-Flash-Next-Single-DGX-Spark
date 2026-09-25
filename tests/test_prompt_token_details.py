@@ -25,7 +25,9 @@ class PromptTokenDetailsTests(unittest.TestCase):
         self.assertEqual(argv.count("--enable-prompt-tokens-details"), 1)
         self.assertNotIn("--enable-prompt-token-details", source)
         self.assertNotIn("--no-enable-prompt-tokens-details", source)
-        self.assertEqual(source.count('VLLM_ARGS_STR="${VLLM_ARGS[*]}"'), 1)
+        # PR #76 replaced the lossy flatten with %q-escaping; the generated
+        # launch script must still reference VLLM_ARGS_STR exactly once.
+        self.assertEqual(source.count("printf -v VLLM_ARGS_STR '%q '"), 1)
         self.assertEqual(source.count('$VLLM_ARGS_STR \\'), 1)
 
 
