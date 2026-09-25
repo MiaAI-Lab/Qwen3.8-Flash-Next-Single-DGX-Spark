@@ -45,7 +45,9 @@
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
+!/files/mtp_block.py
 !/files/patch_qsa_fp8_kv.py
+!/files/patch_determinism.py
 !/files/patch_mtp_draft_vocab.py
 # shipped reduced draft vocabulary (47,149 ids, code-tuned). The 65k en+code
 # vocab the +25% decode win was measured with is a generated artifact and is
@@ -76,6 +78,9 @@
 # ple_layer.py; see README for the docker invocation.
 !/tests/test_nvidia_ple.py
 !/tests/test_nvidia_mtp.py
+!/tests/test_ple_staging_width.py
+!/tests/test_determinism_patch.py
+!/tests/test_mtp_block.py
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
@@ -105,6 +110,24 @@
 !/docs/cache-reporting.md
 !/tests/test_prompt_token_details.py
 
+# --- opt-in MTP patch: vllm#53388 block-drop backport --------------------
+# Generator only. start.sh runs it when MTP_DISABLE_BLOCK_DROP=1; its output
+# (files/block_drop/) stays ignored. The test runs on the host, CPU only.
+!/files/patch_block_drop.py
+!/tests/test_block_drop.py
+
+# --- opt-in vLLM 0.30 lane (start-v030.sh) -------------------------------
+# Generators only; files/v030_fp8kv/, files/v030_ple/ and
+# files/mtp_v030_patched.py* are generated per launch and stay ignored.
+!/start-v030.sh
+!/scripts/launch-lane.sh
+!/files/patch_mtp_draft_vocab_v030.py
+!/files/patch_qsa_fp8_kv_v030.py
+!/files/patch_ple_mmap_v030.py
+!/tests/test_v030_lane.py
+!/tests/test_qsa_fp8_kv_v030.py
+!/tests/test_ple_mmap_v030.py
+
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
 #   .env                      may contain HF_TOKEN
@@ -116,3 +139,4 @@
 #   files/ple_layer_patched.py, files/modelopt_patched.py,
 #   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch
+#   files/block_drop/         orig/ from the image, patched copies generated per launch

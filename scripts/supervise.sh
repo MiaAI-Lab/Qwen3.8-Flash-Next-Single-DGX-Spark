@@ -57,6 +57,9 @@ MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-6}"
 MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
+_DEFAULT_MEMWATCH_MIN_GIB="$MEMWATCH_MIN_GIB"
+_DEFAULT_MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB"
+source "$REPO_DIR/scripts/launch-lane.sh"
 # Windows during which an adopted container (one the supervisor did not launch)
 # is treated as possibly still starting: do NOT probe. start.sh is the only
 # authority on readiness; the supervisor must not emergency-stop a container
@@ -254,7 +257,7 @@ relaunch() {
     # symlink to the newest attempt. Old attempts rotate; keep 10.
     _attempt_ts=$(date '+%Y%m%dT%H%M%S')
     _attempt_log="$REPO_DIR/logs/supervise-start-${_attempt_ts}.log"
-    if "$REPO_DIR/start.sh" >"$_attempt_log" 2>&1; then
+    if "$START_SCRIPT" >"$_attempt_log" 2>&1; then
         ln -sfn "$(basename "$_attempt_log")" "$REPO_DIR/logs/supervise-start.log"
         ls -1t "$REPO_DIR/logs"/supervise-start-*.log 2>/dev/null | tail -n +11 \
             | while read -r _old; do rm -f "$_old"; done
@@ -319,6 +322,9 @@ last_probe_ts=0
 ensure_state
 
 while true; do
+    load_launch_lane
+    MEMWATCH_MIN_GIB="${LANE_MEMWATCH_MIN_GIB:-$_DEFAULT_MEMWATCH_MIN_GIB}"
+    MEMWATCH_MIN_FREE_GIB="${LANE_MEMWATCH_MIN_FREE_GIB:-$_DEFAULT_MEMWATCH_MIN_FREE_GIB}"
     if ! docker info >/dev/null 2>&1; then
         sleep "$BOOT_GATE_S"
         continue

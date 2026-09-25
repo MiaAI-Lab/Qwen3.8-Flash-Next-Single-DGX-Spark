@@ -118,7 +118,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -311,6 +311,24 @@ GDN_DECODE_KERNEL="${GDN_DECODE_KERNEL:-}"
 # that removes MTP's fixed prefix-cache-block back-off per turn. MTP_NUM_...
 # > 0 and this knob = merge into the speculative-config JSON.
 MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
+# The pinned image does not know that key (its SpeculativeConfig rejects
+# unknown keys), so Step 4 also mounts a backport of vllm#53388
+# (files/patch_block_drop.py) when this knob is 1 and MTP is on.
+[[ "$MTP_DISABLE_BLOCK_DROP" == 0 || "$MTP_DISABLE_BLOCK_DROP" == 1 ]] \
+    || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
+V030="${V030:-false}"
+V030_KV_GIB="${V030_KV_GIB:-12}"
+V030_MODEL_ID="nvidia/Qwen3.8-Flash-Next-NVFP4"
+if [[ "$V030" == "true" ]]; then
+    [[ "$ABLIT" == "1" ]] && err "V030: ABLIT=1 is not supported on the vLLM 0.30 lane."
+    [[ "$MODEL_ID" == "$V030_MODEL_ID" ]] || err "V030: the vLLM 0.30 lane serves only $V030_MODEL_ID (got: $MODEL_ID). Set TP1_MODEL_ID=$V030_MODEL_ID."
+    [[ "$YARN" == "1" ]] && err "V030: YARN=1 is untested on the vLLM 0.30 lane."
+    [[ -n "$MTP_K_SCHEDULE" ]] && err "V030: MTP_K_SCHEDULE is not supported on the vLLM 0.30 lane."
+    [[ -n "$VLLM_QSA_DET_TOPK" || -n "$VLLM_MOE_DET_FINALIZE" ]] && err "V030: the determinism knobs are not ported to the vLLM 0.30 lane."
+    [[ -n "$KV_CACHE_MEMORY" ]] && err "V030: set V030_KV_GIB instead of KV_CACHE_MEMORY on the vLLM 0.30 lane."
+    [[ "$V030_KV_GIB" =~ ^[1-9][0-9]*$ ]] || err "V030_KV_GIB must be a positive integer (got: '$V030_KV_GIB')"
+    KV_TARGET_GIB="$V030_KV_GIB"
+fi
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -533,6 +551,10 @@ print(f'{b:.2f} {kv:.2f} {int(max(kv,0)*2**30/($KV_BYTES_PER_TOKEN*$KV_MULT))}')
 else
     GPU_MEMORY_UTILIZATION="$DERIVED_GMU"
 fi
+if [[ "$V030" == "true" && "$CAP_BINDS" == 1 ]]; then
+    err "V030: --kv-cache-memory-bytes ${V030_KV_GIB}G is allocated regardless of GMU, but HOST_RESERVE_GIB=${HOST_RESERVE_GIB}
+       caps the GPU budget at ${BUDGET_CAP_GIB} GiB, which leaves ${KV_EXPECT_GIB} GiB for KV. Lower V030_KV_GIB."
+fi
 CONTAINER_MEM_GIB="${CONTAINER_MEM_GIB:-$(python3 -c "print(int($BUDGET_GIB+$HOST_SLACK_GIB))")}"
 MAX_CONTAINER_GIB=$(python3 -c "print(int($MEM_TOTAL_GIB-$OS_RESERVE_GIB))")
 
@@ -630,6 +652,35 @@ extract() {  # <path-in-image> <dest>
         docker rm "$tmp" >/dev/null 2>&1
     fi
 }
+if [[ "$V030" == "true" ]]; then
+    V030_NVIDIA_REL="models/qwen4_exp/nvidia"
+    V030_FP8KV_DIR="$SCRIPT_DIR/files/v030_fp8kv"
+    V030_PLE_DIR="$SCRIPT_DIR/files/v030_ple"
+    V030_MTP="$SCRIPT_DIR/files/mtp_v030_patched.py"
+    V030_FP8KV_FILES=$(python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv_v030.py" --list) \
+        || err "patch_qsa_fp8_kv_v030.py --list failed"
+    V030_MOUNTS=""
+    for f in $V030_FP8KV_FILES; do
+        mkdir -p "$(dirname "$V030_FP8KV_DIR/orig/${f#$V030_NVIDIA_REL/}")"
+        extract "$VLLM_PKG/$f" "$V030_FP8KV_DIR/orig/${f#$V030_NVIDIA_REL/}"
+    done
+    python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv_v030.py" || err "patch_qsa_fp8_kv_v030.py failed"
+    for f in $V030_FP8KV_FILES; do
+        [[ -f "$V030_FP8KV_DIR/${f#$V030_NVIDIA_REL/}" ]] || err "QSA fp8 KV v030 patch missing: $f"
+        V030_MOUNTS+="-v $V030_FP8KV_DIR/${f#$V030_NVIDIA_REL/}:$VLLM_PKG/$f:ro \\
+    "
+    done
+    mkdir -p "$V030_PLE_DIR/orig"
+    extract "$VLLM_PKG/$V030_NVIDIA_REL/ngram_embedding.py" "$V030_PLE_DIR/orig/ngram_embedding.py"
+    python3 "$SCRIPT_DIR/files/patch_ple_mmap_v030.py" || err "patch_ple_mmap_v030.py failed"
+    [[ -f "$V030_PLE_DIR/ngram_embedding.py" ]] || err "PLE mmap v030 patch missing: ngram_embedding.py"
+    V030_MOUNTS+="-v $V030_PLE_DIR/ngram_embedding.py:$VLLM_PKG/$V030_NVIDIA_REL/ngram_embedding.py:ro \\
+    "
+    extract "$VLLM_PKG/$V030_NVIDIA_REL/mtp.py" "$V030_MTP.orig"
+    python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab_v030.py" || err "patch_mtp_draft_vocab_v030.py failed"
+    [[ -f "$V030_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab_v030.py"
+    V030_MOUNTS+="-v $V030_MTP:$VLLM_PKG/$V030_NVIDIA_REL/mtp.py:ro"
+else
 PATCHED_PLE="$SCRIPT_DIR/files/ple_layer_patched.py"
 extract "$PLE_PKG" "$SCRIPT_DIR/files/ple_layer_patched.py.orig"
 python3 "$SCRIPT_DIR/files/patch_ple_layer.py"
@@ -649,12 +700,39 @@ extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
 
+DET_DIR="$SCRIPT_DIR/files/determinism"
+MOE_CUTLASS_PKG="$VLLM_PKG/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py"
+mkdir -p "$DET_DIR/orig"
+extract "$MOE_CUTLASS_PKG" "$DET_DIR/orig/flashinfer_cutlass_moe.py"
+python3 "$SCRIPT_DIR/files/patch_determinism.py" || err "patch_determinism.py failed"
+[[ -f "$DET_DIR/flashinfer_cutlass_moe.py" ]] || err "determinism patch missing: flashinfer_cutlass_moe.py"
+
 # Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
 # is set in the container, so it is applied unconditionally.
 PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
 extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
+
+# vllm#53388 backport: without it the image ignores "disable_eagle_block_drop".
+BLOCK_DROP_MOUNTS=""
+if [[ "$MTP_DISABLE_BLOCK_DROP" == 1 && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    BLOCK_DROP_DIR="$SCRIPT_DIR/files/block_drop"
+    # The paths under the vllm package that the backport changes.
+    BLOCK_DROP_FILES=$(python3 "$SCRIPT_DIR/files/patch_block_drop.py" --list) \
+        || err "patch_block_drop.py --list failed"
+    for f in $BLOCK_DROP_FILES; do
+        mkdir -p "$(dirname "$BLOCK_DROP_DIR/orig/$f")"
+        extract "$VLLM_PKG/$f" "$BLOCK_DROP_DIR/orig/$f"
+    done
+    python3 "$SCRIPT_DIR/files/patch_block_drop.py" || err "patch_block_drop.py failed"
+    for f in $BLOCK_DROP_FILES; do
+        # No output file: the image already has the option (see the patch script).
+        if [[ -f "$BLOCK_DROP_DIR/$f" ]]; then
+            BLOCK_DROP_MOUNTS+=" -v $BLOCK_DROP_DIR/$f:$VLLM_PKG/$f:ro"
+        fi
+    done
+fi
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -666,6 +744,7 @@ python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
 for f in ple_offload_layer connector worker protocol; do
     [[ -f "$OFFLOAD_DIR/$f.py" ]] || err "offload patch missing: $f.py"
 done
+fi
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
@@ -775,6 +854,7 @@ fi
 # shared with the Mia checkpoint instead of rebuilt (~27 GiB). Read that from the
 # checkpoint's own metadata rather than assuming it: if a future ablit ever
 # touches PLE, build a separate table instead of poisoning the stock cache.
+if [[ "$V030" != "true" ]]; then
 PLE_CACHE_ID="$MODEL_ID"
 if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
     if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["recipe"]["edit_ple"] is False else 1)' \
@@ -806,6 +886,7 @@ if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
         --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
 fi
 ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$PLE_CACHE_HOST" | cut -f1))"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Build vLLM args.
@@ -852,6 +933,7 @@ fi
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
+[[ "$V030" == "true" ]] && VLLM_ARGS+=("--engram-config" "'{\"cpu_offload\":true}'" "--kv-cache-memory-bytes" "${V030_KV_GIB}G")
 # MTP legality guard (review §5.3 / §6.1): legal k set derives from the
 # checkpoint's attention block size and the QSA ring compress ratio —
 #   capacity = compress_ratio * ceil((compress_ratio + k) / compress_ratio)
@@ -862,12 +944,25 @@ VLLM_ARGS+=("--distributed-executor-backend" "mp")
 # introspection cannot run (offline / old image), fall back to the known-good
 # table {0,2,3,4,9..12} for block 848 with a WARN. k=1 is rejected separately:
 # it is strictly dominated (same fixed cache-block cost as k=2, half the gain).
+# The engine derives the block for EACH k (the GDN conv state in the mamba page
+# has kernel - 1 + k rows) and for the SSM and KV dtypes, so one block for all
+# k is wrong: block 848 rejects k=6, which the engine runs at block 1728 with
+# the .env.sample dtypes. files/mtp_block.py calculates the block for this k
+# from config.json and goes first. The cache, introspection and 848 table stay
+# only for a checkpoint that the formula does not know.
 _MTP_CACHE_DIR="$HOME/.cache/vllm/ple_cache"
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _MTP_BLOCK=""; _MTP_CR=""; _MTP_INTRO_SRC="fallback"
+    _MTP_FORMULA=$(python3 "$SCRIPT_DIR/files/mtp_block.py" "$MODEL_PATH/$SNAPSHOT_REL/config.json" \
+        "$MTP_NUM_SPECULATIVE_TOKENS" "$MAMBA_SSM_CACHE_DTYPE" "$KV_CACHE_DTYPE" 2>/dev/null \
+        | grep -E '^[0-9]+ [0-9]+$' | tail -1 || true)
+    [[ -n "$_MTP_FORMULA" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_FORMULA" && _MTP_INTRO_SRC="formula"
     _MTP_INTRO_FILE="$_MTP_CACHE_DIR/mtp-ring-$(printf '%s' "$SNAP" | cut -c1-16)"
-    if [[ -r "$_MTP_INTRO_FILE" ]]; then
-        read -r _MTP_BLOCK _MTP_CR < "$_MTP_INTRO_FILE" && _MTP_INTRO_SRC="cache"
+    if [[ -z "$_MTP_BLOCK" && -r "$_MTP_INTRO_FILE" ]]; then
+        # Accept only "<int> <int>": an old cache could hold a vLLM log line
+        # ("INFO 09-23 ..."), and "09" then breaks bash arithmetic as octal.
+        _MTP_CACHED=$(grep -E '^[0-9]+ [0-9]+$' "$_MTP_INTRO_FILE" | tail -1 || true)
+        [[ -n "$_MTP_CACHED" ]] && read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_CACHED" && _MTP_INTRO_SRC="cache"
     fi
     if [[ -z "$_MTP_BLOCK" ]]; then
         # Best-effort; any failure falls through to the known-good table.
@@ -894,7 +989,7 @@ for mod in ("vllm.models.qwen3_8_flash_next.nvidia.qsa",
 if bs is None:
     bs = 0
 print(f"{int(bs)} {cr}")
-' 2>/dev/null || true)
+' 2>/dev/null | grep -E '^[0-9]+ [0-9]+$' | tail -1 || true)
         if [[ -n "$_MTP_INTRO" ]]; then
             read -r _MTP_BLOCK _MTP_CR <<< "$_MTP_INTRO"
             [[ -n "$_MTP_BLOCK" && -n "$_MTP_CR" ]] && _MTP_INTRO_SRC="introspect" \
@@ -916,6 +1011,7 @@ print(f"{int(bs)} {cr}")
     _CAP=$(( _MTP_CR * ((_MTP_CR + _K + _MTP_CR - 1) / _MTP_CR) ))
     _MTP_LEGAL=1
     (( _MTP_BLOCK % _CAP == 0 )) && _MTP_LEGAL=0
+    info "MTP legality: k=$_K block $_MTP_BLOCK ring $_CAP ($_MTP_INTRO_SRC)"
     if [[ "$_MTP_LEGAL" == "1" ]]; then
         err "MTP_NUM_SPECULATIVE_TOKENS=$_K is illegal for block ${_MTP_BLOCK}, compress ratio ${_MTP_CR} ($_MTP_INTRO_SRC): illegal k hard-fails the engine at config validation. Use a legal k (shipped default 3)."
     fi
@@ -936,8 +1032,10 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
     # disable_eagle_block_drop (vllm#53388, plan 2.4): removes MTP's fixed
     # prefix-cache-block back-off per turn. Merged the same way as the other
-    # scalars; a vLLM that does not know the key ignores it harmlessly.
+    # scalars. SpeculativeConfig forbids unknown keys, so Step 4 mounts the
+    # backport whenever this key is merged.
     [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
+    [[ "${V030:-}" == "true" ]] && _SPEC_ARGMAX+=',"index_share_for_mtp_iteration":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -1018,11 +1116,33 @@ info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup c
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
-info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
+info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}   Disable block drop: $MTP_DISABLE_BLOCK_DROP"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT  (bind $BIND)"
 info ""
 
+if [[ "$V030" == "true" ]]; then
+    PLE_ENV="-e VLLM_PLE_MMAP_DIR=/root/.cache/vllm/ple_mmap_v030 \\
+    -e VLLM_PLE_MMAP_ADVICE=1 \\
+    -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/fi_autotune"
+    OVERLAY_MOUNTS="$V030_MOUNTS"
+    BLOCK_DROP_MOUNTS=""
+    OFFLOAD_MOUNTS=""
+else
+    PLE_ENV="-e VLLM_PLE_CPU_OFFLOAD=1 \\
+    -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
+    -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300"
+    OVERLAY_MOUNTS="-v $PATCHED_PLE:$PLE_PKG:ro \\
+    -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
+    -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
+    -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
+    -v $PATCHED_MTP:$MTP_PKG:ro \\
+    -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro"
+    OFFLOAD_MOUNTS="-v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
+    -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
+    -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
+    -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro"
+fi
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
@@ -1034,28 +1154,21 @@ docker run \\
     --log-opt max-size=50m --log-opt max-file=3 \\
     -e HF_HUB_OFFLINE=1 \\
     -e TRANSFORMERS_OFFLINE=1 \\
-    -e VLLM_PLE_CPU_OFFLOAD=1 \\
-    -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
-    -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    $PLE_ENV \\
     -e MAX_JOBS=2 \\
     -e FLASHINFER_NVCC_THREADS=1 \\
     ${VLLM_QSA_DET_TOPK:+-e VLLM_QSA_DET_TOPK=$VLLM_QSA_DET_TOPK} \\
     ${VLLM_MOE_DET_FINALIZE:+-e VLLM_MOE_DET_FINALIZE=$VLLM_MOE_DET_FINALIZE} \\
+    $( [[ "$VLLM_MOE_DET_FINALIZE" == 1 ]] && echo "-e VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0 -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/root/.cache/vllm/flashinfer_autotune_cache_unfused" ) \\
     ${GDN_DECODE_KERNEL:+-e VLLM_GDN_DECODE_KERNEL=$GDN_DECODE_KERNEL} \\
     ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
     ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
     ${CHAT_TEMPLATE:+-v $CHAT_TEMPLATE:/root/chat_template.jinja:ro} \\
     -e HF_HOME=/root/.cache/huggingface \\
     ${HF_TOKEN:+-e HF_TOKEN=\$HF_TOKEN} \\
-    -v $PATCHED_PLE:$PLE_PKG:ro \\
-    -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
-    -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
-    -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
-    -v $PATCHED_MTP:$MTP_PKG:ro \\
-    -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
-    -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
-    -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
-    -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
+    $OVERLAY_MOUNTS \\
+    $BLOCK_DROP_MOUNTS \\
+    $OFFLOAD_MOUNTS \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $EXTRA_DOCKER_ARGS \\
@@ -1095,7 +1208,9 @@ ARCHIVE_TS=$(date '+%Y%m%dT%H%M%S')
 # -probe-latency.log) members. 24/7 relauches run on a scheduled cadence, so
 # without a prune the archive grows forever and threatens the checkpoint
 # disk cache.
-ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null | tail -n +21 | while read -r f; do
+# "|| true": on a fresh install the glob matches nothing, ls exits 2, and
+# pipefail would stop the launch here without a message.
+{ ls -1t "$SCRIPT_DIR"/logs/archive/*-container.log 2>/dev/null || true; } | tail -n +21 | while read -r f; do
     _set="${f%-container.log}"
     rm -f "${_set}-container.log" "${_set}-memwatch.log" "${_set}-probe-latency.log" "${_set}-timeout.log" 2>/dev/null || true
 done
@@ -1121,6 +1236,8 @@ fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
     MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
+printf 'V030=%s\nMEMWATCH_MIN_GIB=%s\nMEMWATCH_MIN_FREE_GIB=%s\n' "$V030" "$MEMWATCH_MIN_GIB" "$MEMWATCH_MIN_FREE_GIB" \
+    > "$SCRIPT_DIR/logs/launch-lane"
 ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 

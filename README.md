@@ -628,6 +628,61 @@ prefill/decode tables above are stock-checkpoint numbers and do not apply
 here; NVIDIA's own model card has the accuracy comparison against `Qwen3.8-27B`
 and other baselines.
 
+### vLLM 0.30 agentic lane (`start-v030.sh`, opt-in)
+
+`./start-v030.sh` serves `nvidia/Qwen3.8-Flash-Next-NVFP4` on stock
+`vllm/vllm-openai:v0.30.0` instead of the pinned image. It goes through the same
+`start.sh`, so the host reserve, memwatch, supervision and smoke test all apply.
+The supervisor and the maintenance relaunch restart it on the same lane.
+
+```bash
+docker pull vllm/vllm-openai:v0.30.0
+./download.sh nvidia/Qwen3.8-Flash-Next-NVFP4    # if not cached yet
+./stop.sh
+./start-v030.sh
+```
+
+**Pick it for quality and long-context agent turns, not for raw generation
+speed.** Measured on one GB10 against the default lane (`.env.sample`, MTP 3,
+47k draft vocab):
+
+| | default lane | v0.30 lane |
+|---|---|---|
+| Mean prompt NLL (15,776 positions) | 1.344 | **1.332** |
+| Prefill, 47k-token prompt | 1,953 tok/s | **2,140 tok/s** |
+| Turn-1 TTFT, 9.5k session | 0.81 s | **0.67 s** |
+| Decode prose, S=1 / 2 / 4 | 48.8 / 73.6 / 113.0 | 36.8 / 56.3 / 77.5 |
+| Decode code, S=1 / 2 / 4 | 61.9 / 102.9 / 168.2 | 54.5 / 97.4 / **178.7** |
+| KV cache | ~1.1M tokens | 801k tokens (3.06x a 262k request) |
+| Needles at 5/50/95% of 200k | – | 3/3 |
+
+Prose decode is 25-32% slower: the nvidia checkpoint keeps attention and the
+shared experts in BF16, so every step moves more bytes, and its 47.7 GiB PLE
+table is read from page cache. Draft acceptance is the same on both lanes.
+
+What the lane changes:
+
+- **PLE table in a file.** v0.30's `--engram-config cpu_offload` pins the
+  whole PLE table, which does not fit next to the nvidia weights on 121.7 GiB.
+  `files/patch_ple_mmap_v030.py` keeps it in a file under
+  `~/.cache/vllm/ple_mmap_v030/` and the GPU reads rows over ATS. The first
+  boot writes the 48 GB file (848 s); later boots reuse it (733 s). One file
+  per checkpoint snapshot.
+- **FP8 KV.** v0.30.0 accepts only BF16 KV on this model.
+  `files/patch_qsa_fp8_kv_v030.py` backports vllm#55557; delete it once the
+  image is vLLM 0.31 or later.
+- **Draft vocabulary.** `files/patch_mtp_draft_vocab_v030.py` ports the
+  reduced draft vocab to v0.30's `qwen4_exp/nvidia/mtp.py`.
+- **Knobs.** `V030_KV_GIB` (default 12, pinned KV in GiB). memwatch floors
+  default to 3 GiB MemAvailable and 1 GiB MemFree on this lane.
+- **Not supported on this lane:** `ABLIT=1`, `YARN=1`, `MTP_K_SCHEDULE`, other
+  checkpoints, and the determinism knobs (the smoke test's determinism step
+  warns).
+
+Stability: a 1-hour mixed-traffic soak (multi-turn, tools, 20-60k prompts,
+vision, reasoning, code; 3 workers) served 784 requests with 0 server errors,
+0 preemptions and MemAvailable never below 14.1 GiB.
+
 ### Reasoning is on by default
 
 This build reasons before answering, and `start.sh` passes
@@ -1112,6 +1167,10 @@ set (the shipped default), set `API_KEY` in the shell first or the call 401s;
   (27 GiB output under `~/.cache/vllm/ple_cache/`, memory-mapped at runtime).
 - `files/sysctl-spark3.conf` — recommended kernel VM tunables, not applied by
   anything here; read its header first.
+- `files/patch_block_drop.py` — opt-in generator for `MTP_DISABLE_BLOCK_DROP=1`
+  (see [What is patched and why](#what-is-patched-and-why)). `start.sh` runs
+  it only when the knob is 1. `tests/test_block_drop.py` checks it and its
+  `start.sh` wiring on CPU.
 
 - `bench/sweep.py` — decode sweep. Submits one
   [sparkDash](https://github.com/MiaAI-Lab/sparkDash) job per concurrency level
@@ -1164,7 +1223,12 @@ sparkDash's own figures include any other traffic on the port.
   `MADV_RANDOM`: without it the kernel faults in a ~64 KiB window to serve each
   90-byte row lookup, and measurements here showed **24x** more disk read per
   decoded token (1,366 -> 57 KiB/token) plus ~2 GiB of page cache wasted on
-  readahead that is never used.
+  readahead that is never used. The worker's pinned staging buffer is sized to
+  the 1,440-byte packed row (PR #67): at the old 2,560 width the `[:T, :1440]`
+  slice was not contiguous for T > 1, so every prefill chunk and MTP verify
+  step shipped stale rows to the GPU. Fixing it took mean NLL on 15,776 fixed
+  positions from 1.397 to 1.344 (every text improved), decode unchanged
+  (2026-09-24).
 - **FP8 KV cache** (`patch_qsa_fp8_kv.py`, via `KV_CACHE_DTYPE=fp8`): casts
   FP8 K/V tiles to BF16 for the tensor-core dots and applies the per-tensor
   scales once to the score and the normalised output, plumbs `k_scale`/
@@ -1180,6 +1244,33 @@ sparkDash's own figures include any other traffic on the port.
   (Apache-2.0), reimplemented here against this image's own sources. That
   credit applies to this one patch; nothing else in this repository derives
   from that project.
+- **vllm#53388 backport** (`patch_block_drop.py`, `MTP_DISABLE_BLOCK_DROP=1`,
+  on in `.env.sample`): adds `disable_eagle_block_drop` to the image's
+  `SpeculativeConfig`, the KV cache manager and the scheduler. The image's
+  `SpeculativeConfig` rejects unknown keys, so the key needs this backport.
+  With the key, a multi-turn request keeps its last full prefix-cache block
+  instead of computing it again. The drafter still runs. The change can move
+  acceptance only: the target verifies every draft token. On one GB10 at
+  MTP 3, the second turn of a session read 9,984 cached tokens instead of
+  8,320, and its server TTFT went from about 1.79 s to 0.91 s. After a 5K-token
+  tool output it went from 3.26 s to 2.58 s. Cold and first-turn TTFT did not
+  change. The backport changes six of the seven vllm
+  files that vllm#53388 changes. It leaves out the sliding-window fix in
+  `single_type_kv_cache_manager.py`, because this model has no sliding window.
+  Three of the six are KV transfer and offload connectors, so a connector
+  keeps the same block as the scheduler. `start.sh` extracts the files from
+  the image to `files/block_drop/orig/<path>` and mounts the patched copies.
+  The engine log says "EAGLE trailing prefix-cache block dropping is
+  disabled".
+- **Reproducible greedy decoding** (`patch_determinism.py`, opt-in via
+  `VLLM_QSA_DET_TOPK=1` and `VLLM_MOE_DET_FINALIZE=1`, #28): the QSA top-k
+  kernel returns the right block set in atomic arrival order and the sparse
+  attention sums in that order, so the patch sorts each row; the NVFP4 MoE
+  switches to FlashInfer's unfused finalize (vllm#54948) with its own autotune
+  cache dir, because the shared cache holds fused-mode tactics and fails the
+  launch. With both, identical requests give bit-identical logits (0 of 1,742
+  positions differ; before, median 0.19 and max 4.8 nats), NLL unchanged,
+  decode within noise, prefill -3.4% at 47k tokens.
 
 ## Credits
 

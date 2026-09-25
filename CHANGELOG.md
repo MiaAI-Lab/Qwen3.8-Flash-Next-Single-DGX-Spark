@@ -5,6 +5,58 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-25
+
+### Added
+
+- **`./start-v030.sh`: an opt-in lane on stock vLLM 0.30.0 with the nvidia
+  checkpoint.** Three overlays: a file-backed PLE table read over ATS
+  (persistent, one file per snapshot), a backport of vllm#55557 for FP8 KV,
+  and the reduced draft vocab ported to v0.30. Versus the default lane on one
+  GB10: NLL 1.344 -> 1.332, prefill +10%, turn-1 TTFT 0.81 -> 0.67 s, code
+  decode +6% at S=4, prose decode -25..-32%. KV 801k tokens at 12 GiB. A
+  1-hour soak: 784 requests, 0 errors. See the README section.
+- `scripts/supervise.sh` and `scripts/maintenance-relaunch.sh` relaunch
+  through the entry point recorded in `logs/launch-lane`.
+
+## 2026-09-24
+
+All measured on one GB10, `.env.sample` profile (262k, MTP 3, 47k vocab, FP8 KV,
+BF16 SSM, `MAX_NUM_SEQS=4`), one launch per arm. NLL = mean prompt NLL over
+15,776 positions of 8 fixed texts (code, EN/ES prose); decode = `bench/sweep.py`,
+3 repeats; prefill = cold 47,381-token prompt.
+
+### Fixed
+
+- **PLE rows now reach the GPU on multi-token forwards** (PR #67). The worker's
+  staging buffer was 2,560 wide; the `[:T, :1440]` slice is not contiguous for
+  T > 1, so each prefill chunk and MTP verify step shipped stale rows. NLL
+  1.397 -> **1.344** (every text improved), HumanEval 153 -> 157/164 (noise is
+  about ±3 on a non-deterministic server), decode unchanged.
+- **Launcher on a fresh install / poisoned MTP ring cache** (PR #65, #53).
+- **MTP guard computes the block per k** (PR #70): k=6 and k=16 are legal.
+- **`bench/sweep.py` survives sparkDash's 2-jobs-per-minute cooldown (429).**
+
+### Added
+
+- **`MTP_DISABLE_BLOCK_DROP=1` works and ships on in `.env.sample`** (PR #71,
+  vllm#53388 backport; the key used to fail the launch). Warm second turn
+  1.66 -> **0.81 s** TTFT, turn after a 4k tool output 3.61 -> 2.72 s (medians of 3), decode
+  unchanged. `start.sh` still defaults to 0 for existing `.env` files.
+- **`VLLM_QSA_DET_TOPK=1` / `VLLM_MOE_DET_FINALIZE=1` now work** (were
+  plumbing only; #28). `files/patch_determinism.py` sorts the QSA top-k rows
+  and selects FlashInfer's unfused MoE finalize with its own autotune cache.
+  Identical requests: prompt-logprob spread median 0.19 / max 4.8 nats -> **0 /
+  0**; greedy outputs 5/5 distinct -> 1/5, also cold and after another prompt.
+  NLL unchanged, decode within noise, prefill 1,953 -> 1,886 tok/s (-3.4%), so
+  opt-in.
+
+### Measured, not adopted
+
+- **k=6** (with block drop): code +16% / +14% / +4% at S=1/2/4, prose -9% /
+  -5% / -16%, NLL and prefill unchanged, warm turn 0.73 s. Worth it for
+  code-heavy traffic only; the default stays 3.
+
 ## 2026-09-18
 
 ### Measured
