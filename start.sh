@@ -1202,7 +1202,7 @@ while true; do
         echo ""
         REASON=$(docker logs "$CONTAINER_NAME" 2>&1 \
                  | grep -oE "(ValueError|RuntimeError|TimeoutError|torch\.[A-Za-z]*Error): .*" \
-                 | grep -viE "min_frames|max_frames" | tail -1 | cut -c1-400)
+                 | grep -viE "min_frames|max_frames" | tail -1 | cut -c1-400 || true)
         [[ -n "$REASON" ]] && { echo "  vLLM reported:"; echo "    $REASON"; }
         if docker inspect "$CONTAINER_NAME" --format '{{.State.OOMKilled}}' 2>/dev/null | grep -q true; then
             echo "  Container was OOM-killed by its cgroup cap (${CONTAINER_MEM_GIB} GiB) — the host survived as designed."
