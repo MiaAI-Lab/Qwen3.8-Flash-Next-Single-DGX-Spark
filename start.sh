@@ -341,6 +341,12 @@ if [[ "$V030" == "true" ]]; then
     [[ -n "$KV_CACHE_MEMORY" ]] && err "V030: set V030_KV_GIB instead of KV_CACHE_MEMORY on the vLLM 0.30 lane."
     [[ "$V030_KV_GIB" =~ ^[1-9][0-9]*$ ]] || err "V030_KV_GIB must be a positive integer (got: '$V030_KV_GIB')"
     KV_TARGET_GIB="$V030_KV_GIB"
+    # Lane-specific memwatch floors (the wrapper must not export these:
+    # an env export would override .env through the snapshot). Softer than
+    # the pinned-image lane's 6/2: v0.30 pins KV via --kv-cache-memory-bytes
+    # so host headroom is smaller by design. .env still wins.
+    MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-3}"
+    MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-1}"
 fi
 
 DO_LAUNCH=true
