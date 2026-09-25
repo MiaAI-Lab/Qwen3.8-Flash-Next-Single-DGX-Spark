@@ -93,11 +93,18 @@ def _ple_mmap_fingerprint(identity: dict, shape: tuple[int, int], dtype) -> dict
     }
 
 
+def _ple_mmap_identity_key(fingerprint: dict) -> dict:
+    if fingerprint.get("snapshot"):
+        return {k: v for k, v in fingerprint.items() if k != "model"}
+    return fingerprint
+
+
 def _ple_mmap_matches(path: str, fingerprint: dict, nbytes: int) -> bool:
     try:
         with open(_ple_mmap_sidecar(path)) as handle:
             stored = json.load(handle)
-        return stored == fingerprint and os.path.getsize(path) == nbytes
+        same = _ple_mmap_identity_key(stored) == _ple_mmap_identity_key(fingerprint)
+        return same and os.path.getsize(path) == nbytes
     except (OSError, ValueError):
         return False
 

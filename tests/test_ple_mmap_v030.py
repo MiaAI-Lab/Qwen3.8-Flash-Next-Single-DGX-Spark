@@ -135,6 +135,19 @@ class PersistentTable(unittest.TestCase):
         self.assertFalse(ready)
         self.assertFalse(os.path.exists(self.sidecar))
 
+    def test_same_snapshot_other_model_path_reuses(self):
+        weight, _ = self._open()
+        self.mod.Qwen4ExpPLEPinnedHostEmbedding.commit_mmap_table(self._layer(weight, False, [0], 1))
+        other = self.mod._ple_mmap_fingerprint({**IDENTITY, "model": "/elsewhere/snapshot"}, self.shape, self.dtype)
+        _, ready = self._open(other)
+        self.assertTrue(ready)
+
+    def test_no_snapshot_keys_on_model_path(self):
+        base = {**IDENTITY, "snapshot": None}
+        fp = self.mod._ple_mmap_fingerprint(base, self.shape, self.dtype)
+        moved = self.mod._ple_mmap_fingerprint({**base, "model": "/elsewhere"}, self.shape, self.dtype)
+        self.assertNotEqual(self.mod._ple_mmap_identity_key(fp), self.mod._ple_mmap_identity_key(moved))
+
     def test_size_mismatch_drops_sidecar_before_write(self):
         weight, _ = self._open()
         self.mod.Qwen4ExpPLEPinnedHostEmbedding.commit_mmap_table(self._layer(weight, False, [0], 1))
