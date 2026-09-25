@@ -118,7 +118,7 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -316,6 +316,19 @@ MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
 # (files/patch_block_drop.py) when this knob is 1 and MTP is on.
 [[ "$MTP_DISABLE_BLOCK_DROP" == 0 || "$MTP_DISABLE_BLOCK_DROP" == 1 ]] \
     || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
+V030="${V030:-false}"
+V030_KV_GIB="${V030_KV_GIB:-12}"
+V030_MODEL_ID="nvidia/Qwen3.8-Flash-Next-NVFP4"
+if [[ "$V030" == "true" ]]; then
+    [[ "$ABLIT" == "1" ]] && err "V030: ABLIT=1 is not supported on the vLLM 0.30 lane."
+    [[ "$MODEL_ID" == "$V030_MODEL_ID" ]] || err "V030: the vLLM 0.30 lane serves only $V030_MODEL_ID (got: $MODEL_ID). Set TP1_MODEL_ID=$V030_MODEL_ID."
+    [[ "$YARN" == "1" ]] && err "V030: YARN=1 is untested on the vLLM 0.30 lane."
+    [[ -n "$MTP_K_SCHEDULE" ]] && err "V030: MTP_K_SCHEDULE is not supported on the vLLM 0.30 lane."
+    [[ -n "$VLLM_QSA_DET_TOPK" || -n "$VLLM_MOE_DET_FINALIZE" ]] && err "V030: the determinism knobs are not ported to the vLLM 0.30 lane."
+    [[ -n "$KV_CACHE_MEMORY" ]] && err "V030: set V030_KV_GIB instead of KV_CACHE_MEMORY on the vLLM 0.30 lane."
+    [[ "$V030_KV_GIB" =~ ^[1-9][0-9]*$ ]] || err "V030_KV_GIB must be a positive integer (got: '$V030_KV_GIB')"
+    KV_TARGET_GIB="$V030_KV_GIB"
+fi
 
 DO_LAUNCH=true
 for arg in "$@"; do
@@ -538,6 +551,10 @@ print(f'{b:.2f} {kv:.2f} {int(max(kv,0)*2**30/($KV_BYTES_PER_TOKEN*$KV_MULT))}')
 else
     GPU_MEMORY_UTILIZATION="$DERIVED_GMU"
 fi
+if [[ "$V030" == "true" && "$CAP_BINDS" == 1 ]]; then
+    err "V030: --kv-cache-memory-bytes ${V030_KV_GIB}G is allocated regardless of GMU, but HOST_RESERVE_GIB=${HOST_RESERVE_GIB}
+       caps the GPU budget at ${BUDGET_CAP_GIB} GiB, which leaves ${KV_EXPECT_GIB} GiB for KV. Lower V030_KV_GIB."
+fi
 CONTAINER_MEM_GIB="${CONTAINER_MEM_GIB:-$(python3 -c "print(int($BUDGET_GIB+$HOST_SLACK_GIB))")}"
 MAX_CONTAINER_GIB=$(python3 -c "print(int($MEM_TOTAL_GIB-$OS_RESERVE_GIB))")
 
@@ -635,6 +652,35 @@ extract() {  # <path-in-image> <dest>
         docker rm "$tmp" >/dev/null 2>&1
     fi
 }
+if [[ "$V030" == "true" ]]; then
+    V030_NVIDIA_REL="models/qwen4_exp/nvidia"
+    V030_FP8KV_DIR="$SCRIPT_DIR/files/v030_fp8kv"
+    V030_PLE_DIR="$SCRIPT_DIR/files/v030_ple"
+    V030_MTP="$SCRIPT_DIR/files/mtp_v030_patched.py"
+    V030_FP8KV_FILES=$(python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv_v030.py" --list) \
+        || err "patch_qsa_fp8_kv_v030.py --list failed"
+    V030_MOUNTS=""
+    for f in $V030_FP8KV_FILES; do
+        mkdir -p "$(dirname "$V030_FP8KV_DIR/orig/${f#$V030_NVIDIA_REL/}")"
+        extract "$VLLM_PKG/$f" "$V030_FP8KV_DIR/orig/${f#$V030_NVIDIA_REL/}"
+    done
+    python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv_v030.py" || err "patch_qsa_fp8_kv_v030.py failed"
+    for f in $V030_FP8KV_FILES; do
+        [[ -f "$V030_FP8KV_DIR/${f#$V030_NVIDIA_REL/}" ]] || err "QSA fp8 KV v030 patch missing: $f"
+        V030_MOUNTS+="-v $V030_FP8KV_DIR/${f#$V030_NVIDIA_REL/}:$VLLM_PKG/$f:ro \\
+    "
+    done
+    mkdir -p "$V030_PLE_DIR/orig"
+    extract "$VLLM_PKG/$V030_NVIDIA_REL/ngram_embedding.py" "$V030_PLE_DIR/orig/ngram_embedding.py"
+    python3 "$SCRIPT_DIR/files/patch_ple_mmap_v030.py" || err "patch_ple_mmap_v030.py failed"
+    [[ -f "$V030_PLE_DIR/ngram_embedding.py" ]] || err "PLE mmap v030 patch missing: ngram_embedding.py"
+    V030_MOUNTS+="-v $V030_PLE_DIR/ngram_embedding.py:$VLLM_PKG/$V030_NVIDIA_REL/ngram_embedding.py:ro \\
+    "
+    extract "$VLLM_PKG/$V030_NVIDIA_REL/mtp.py" "$V030_MTP.orig"
+    python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab_v030.py" || err "patch_mtp_draft_vocab_v030.py failed"
+    [[ -f "$V030_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab_v030.py"
+    V030_MOUNTS+="-v $V030_MTP:$VLLM_PKG/$V030_NVIDIA_REL/mtp.py:ro"
+else
 PATCHED_PLE="$SCRIPT_DIR/files/ple_layer_patched.py"
 extract "$PLE_PKG" "$SCRIPT_DIR/files/ple_layer_patched.py.orig"
 python3 "$SCRIPT_DIR/files/patch_ple_layer.py"
@@ -698,6 +744,7 @@ python3 "$SCRIPT_DIR/files/patch_ple_offload.py"
 for f in ple_offload_layer connector worker protocol; do
     [[ -f "$OFFLOAD_DIR/$f.py" ]] || err "offload patch missing: $f.py"
 done
+fi
 ok "Patches ready."
 
 # ---------------------------------------------------------------------------
@@ -807,6 +854,7 @@ fi
 # shared with the Mia checkpoint instead of rebuilt (~27 GiB). Read that from the
 # checkpoint's own metadata rather than assuming it: if a future ablit ever
 # touches PLE, build a separate table instead of poisoning the stock cache.
+if [[ "$V030" != "true" ]]; then
 PLE_CACHE_ID="$MODEL_ID"
 if [[ "$ABLIT" == "1" && "$MODEL_ID" == "$ABLIT_MODEL_ID" ]]; then
     if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["recipe"]["edit_ple"] is False else 1)' \
@@ -838,6 +886,7 @@ if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
         --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
 fi
 ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$PLE_CACHE_HOST" | cut -f1))"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Build vLLM args.
@@ -884,6 +933,7 @@ fi
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
+[[ "$V030" == "true" ]] && VLLM_ARGS+=("--engram-config" "'{\"cpu_offload\":true}'" "--kv-cache-memory-bytes" "${V030_KV_GIB}G")
 # MTP legality guard (review §5.3 / §6.1): legal k set derives from the
 # checkpoint's attention block size and the QSA ring compress ratio —
 #   capacity = compress_ratio * ceil((compress_ratio + k) / compress_ratio)
@@ -985,6 +1035,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     # scalars. SpeculativeConfig forbids unknown keys, so Step 4 mounts the
     # backport whenever this key is merged.
     [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
+    [[ "${V030:-}" == "true" ]] && _SPEC_ARGMAX+=',"index_share_for_mtp_iteration":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -1070,6 +1121,28 @@ info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile
 info "  Port:       $PORT  (bind $BIND)"
 info ""
 
+if [[ "$V030" == "true" ]]; then
+    PLE_ENV="-e VLLM_PLE_MMAP_DIR=/root/.cache/vllm/ple_mmap_v030 \\
+    -e VLLM_PLE_MMAP_ADVICE=1 \\
+    -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/fi_autotune"
+    OVERLAY_MOUNTS="$V030_MOUNTS"
+    BLOCK_DROP_MOUNTS=""
+    OFFLOAD_MOUNTS=""
+else
+    PLE_ENV="-e VLLM_PLE_CPU_OFFLOAD=1 \\
+    -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
+    -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300"
+    OVERLAY_MOUNTS="-v $PATCHED_PLE:$PLE_PKG:ro \\
+    -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
+    -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
+    -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
+    -v $PATCHED_MTP:$MTP_PKG:ro \\
+    -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro"
+    OFFLOAD_MOUNTS="-v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
+    -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
+    -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
+    -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro"
+fi
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
 #!/bin/bash
@@ -1081,9 +1154,7 @@ docker run \\
     --log-opt max-size=50m --log-opt max-file=3 \\
     -e HF_HUB_OFFLINE=1 \\
     -e TRANSFORMERS_OFFLINE=1 \\
-    -e VLLM_PLE_CPU_OFFLOAD=1 \\
-    -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
-    -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    $PLE_ENV \\
     -e MAX_JOBS=2 \\
     -e FLASHINFER_NVCC_THREADS=1 \\
     ${VLLM_QSA_DET_TOPK:+-e VLLM_QSA_DET_TOPK=$VLLM_QSA_DET_TOPK} \\
@@ -1095,17 +1166,9 @@ docker run \\
     ${CHAT_TEMPLATE:+-v $CHAT_TEMPLATE:/root/chat_template.jinja:ro} \\
     -e HF_HOME=/root/.cache/huggingface \\
     ${HF_TOKEN:+-e HF_TOKEN=\$HF_TOKEN} \\
-    -v $PATCHED_PLE:$PLE_PKG:ro \\
-    -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
-    -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
-    -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
-    -v $PATCHED_MTP:$MTP_PKG:ro \\
-    -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro \\
+    $OVERLAY_MOUNTS \\
     $BLOCK_DROP_MOUNTS \\
-    -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
-    -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
-    -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
-    -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro \\
+    $OFFLOAD_MOUNTS \\
     -v $HF_CACHE_DIR:/root/.cache/huggingface \\
     -v $HOME/.cache/vllm:/root/.cache/vllm \\
     $EXTRA_DOCKER_ARGS \\
@@ -1173,6 +1236,8 @@ fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
     MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
+printf 'V030=%s\nMEMWATCH_MIN_GIB=%s\nMEMWATCH_MIN_FREE_GIB=%s\n' "$V030" "$MEMWATCH_MIN_GIB" "$MEMWATCH_MIN_FREE_GIB" \
+    > "$SCRIPT_DIR/logs/launch-lane"
 ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 
