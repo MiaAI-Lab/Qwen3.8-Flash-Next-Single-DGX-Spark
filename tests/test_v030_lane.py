@@ -17,7 +17,8 @@ MTP_ORIG = Path(os.environ.get("V030_MTP_ORIG", "/m/qwen-dual-wt/files/mtp_v030_
 
 LANE_ON = re.compile(r'"\$(V030|\{V030:-\})" == "true"')
 LANE_OFF = '"$V030" != "true"'
-LANE_TOKENS = ("v030_fp8kv", "v030_ple", "VLLM_PLE_MMAP_DIR", "index_share_for_mtp_iteration",
+LANE_TOKENS = ("v030_fp8kv", "v030_ple", "VLLM_PLE_MMAP_DIR", "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB",
+               "index_share_for_mtp_iteration",
                "--kv-cache-memory-bytes", "--engram-config", "patch_ple_mmap_v030.py",
                "patch_mtp_draft_vocab_v030.py", "patch_qsa_fp8_kv_v030.py", "fi_autotune")
 DAY0_TOKENS = ("patch_ple_layer.py", "patch_modelopt_mxfp8.py", "patch_qsa_fp8_kv.py\"",
@@ -113,6 +114,16 @@ class StartGates(unittest.TestCase):
                        'V030: the determinism knobs', 'V030: the vLLM 0.30 lane serves only'):
             self.assertIn(needle, src)
 
+    def test_indexer_logits_cap_defaults_and_validates(self):
+        src = START.read_text()
+        self.assertIn('V030_INDEXER_LOGITS_MB="${V030_INDEXER_LOGITS_MB:-128}"', src)
+        self.assertIn('V030_INDEXER_LOGITS_MB must be a positive integer', src)
+        # The validation sits inside the V030 gate, so the default lane never sees it.
+        lines, states = self.lines, self.states
+        for i, (line, state) in enumerate(zip(lines, states), 1):
+            if 'V030_INDEXER_LOGITS_MB must be a positive integer' in line:
+                self.assertIs(state, True, f"start.sh:{i} validation outside the V030 gate")
+
 
 class RenderedCommand(unittest.TestCase):
     def render(self, template_body, lane):
@@ -136,6 +147,7 @@ class RenderedCommand(unittest.TestCase):
     def test_lane_command_swaps_overlays(self):
         out = self.render(self.current_template(), lane=True)
         for needle in ("VLLM_PLE_MMAP_DIR=/root/.cache/vllm/ple_mmap_v030", "VLLM_PLE_MMAP_ADVICE=1",
+                       "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=@V030_INDEXER_LOGITS_MB@",
                        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/fi_autotune", "@V030_MOUNTS@"):
             self.assertIn(needle, out)
         for needle in ("VLLM_PLE_PACKED_TABLE_DIR", "@PATCHED_PLE@", "@OFFLOAD_DIR@", "@BLOCK_DROP_MOUNTS@"):
@@ -149,6 +161,7 @@ class LaunchWrapper(unittest.TestCase):
                        'TP1_MODEL_ID="${TP1_MODEL_ID:-nvidia/Qwen3.8-Flash-Next-NVFP4}"',
                        'KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"', 'PLE_GIB="${PLE_GIB:-47.68}"',
                        'MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-3}"', 'MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-1}"',
+                       'V030_INDEXER_LOGITS_MB="${V030_INDEXER_LOGITS_MB:-128}"',
                        'exec "$SCRIPT_DIR/start.sh"'):
             self.assertIn(needle, src)
 
@@ -162,7 +175,7 @@ class LaunchWrapper(unittest.TestCase):
     def test_new_knobs_beat_dotenv(self):
         snapshot = re.search(r"_ENV_SNAPSHOT_VARS=\((.*?)\)", START.read_text(), re.S).group(1).split()
         for name in ("V030", "V030_KV_GIB", "IMAGE", "PLE_GIB", "MEMWATCH_MIN_GIB", "MEMWATCH_MIN_FREE_GIB",
-                     "MTP_DISABLE_BLOCK_DROP"):
+                     "MTP_DISABLE_BLOCK_DROP", "V030_INDEXER_LOGITS_MB"):
             self.assertIn(name, snapshot)
 
 

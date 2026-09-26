@@ -673,7 +673,19 @@ What the lane changes:
   image is vLLM 0.31 or later.
 - **Draft vocabulary.** `files/patch_mtp_draft_vocab_v030.py` ports the
   reduced draft vocab to v0.30's `qwen4_exp/nvidia/mtp.py`.
-- **Knobs.** `V030_KV_GIB` (default 12, pinned KV in GiB). memwatch floors
+- **Indexer logits cap.** The lane sets vLLM's
+  `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` to 128 (`V030_INDEXER_LOGITS_MB`).
+  Since vllm#54915 the QSA indexer sizes its prefill logits buffer by the
+  batch's longest context, and PyTorch's caching allocator keeps every
+  earlier size, so a long cold prompt leaves memory that is never returned:
+  one 180k prompt kept 6.8 GiB on a GB10, and a 250k prompt reached
+  memwatch's floor. 128 MiB is the pinned image's fixed chunk; with it the
+  222k and 259k prompts that followed a 185k one moved the driver figure by
+  at most 32 MiB, and prefill was unchanged. The cap does not act below
+  64k of context at 2,048 batched tokens. Numbers in the CHANGELOG entry of
+  2026-09-26.
+- **Knobs.** `V030_KV_GIB` (default 12, pinned KV in GiB) and
+  `V030_INDEXER_LOGITS_MB` (default 128, above). memwatch floors
   default to 3 GiB MemAvailable and 1 GiB MemFree on this lane.
 - **Not supported on this lane:** `ABLIT=1`, `YARN=1`, `MTP_K_SCHEDULE`, other
   checkpoints, and the determinism knobs (the smoke test's determinism step
