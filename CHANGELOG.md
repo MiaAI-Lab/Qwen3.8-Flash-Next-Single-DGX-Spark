@@ -5,6 +5,30 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-26
+
+### Fixed
+
+- **`start-v030.sh` caps the QSA indexer's prefill logits buffer at 128 MiB**
+  (`V030_INDEXER_LOGITS_MB`, vLLM's `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`;
+  Antonio Cue Gervas, written by Claude). Since vllm#54915 the indexer sizes
+  that buffer by the batch's longest context, one fresh allocation per call,
+  and PyTorch's caching allocator keeps every earlier size. A cold prompt
+  that takes the context from A to L tokens, where A is the longest context
+  already prefilled since the engine started, keeps about (L² − A²)/2 bytes
+  that nothing returns while serving; the profile run skips attention and
+  never allocates the buffer. Measured on one GB10 at `V030_KV_GIB=12` with
+  19 GiB available idle and memwatch at an 8 GiB floor: +6.8 GiB kept by the
+  end of a 180k prompt (A was about 134k, a free block absorbed the smaller
+  sizes), +11.3 GiB in total by about 205k of a 250k prompt, where memwatch
+  stopped the engine at 6.6 GiB available. The default lane is unaffected:
+  the pinned image's QSA scoring works in fixed 128 MiB chunks over the full
+  block table. With the cap, the first 185k prompt after a boot raised the
+  driver figure by 1.4 GiB once, and the 222k and 259k prompts after it moved
+  it by at most 32 MiB; prefill 2,303 and 2,424 tok/s at 222k and 259k,
+  against 2,357 at 180k without the cap. The cap does not act below 64k of
+  context at 2,048 batched tokens.
+
 ## 2026-09-25
 
 ### Added

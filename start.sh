@@ -118,7 +118,8 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB
+                    V030_INDEXER_LOGITS_MB)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -318,6 +319,12 @@ MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
     || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
 V030="${V030:-false}"
 V030_KV_GIB="${V030_KV_GIB:-12}"
+# vLLM's VLLM_SPARSE_INDEXER_MAX_LOGITS_MB for this lane (the name mirrors vLLM's).
+# Since vllm#54915 the QSA indexer sizes its prefill logits buffer by the batch's
+# longest context, and the caching allocator keeps every earlier size, so one
+# long cold prompt kept 6.8 GiB at 180k tokens. 128 MiB is the pinned image's
+# fixed chunk. See the CHANGELOG entry of 2026-09-26.
+V030_INDEXER_LOGITS_MB="${V030_INDEXER_LOGITS_MB:-128}"
 V030_MODEL_ID="nvidia/Qwen3.8-Flash-Next-NVFP4"
 if [[ "$V030" == "true" ]]; then
     [[ "$ABLIT" == "1" ]] && err "V030: ABLIT=1 is not supported on the vLLM 0.30 lane."
@@ -327,6 +334,7 @@ if [[ "$V030" == "true" ]]; then
     [[ -n "$VLLM_QSA_DET_TOPK" || -n "$VLLM_MOE_DET_FINALIZE" ]] && err "V030: the determinism knobs are not ported to the vLLM 0.30 lane."
     [[ -n "$KV_CACHE_MEMORY" ]] && err "V030: set V030_KV_GIB instead of KV_CACHE_MEMORY on the vLLM 0.30 lane."
     [[ "$V030_KV_GIB" =~ ^[1-9][0-9]*$ ]] || err "V030_KV_GIB must be a positive integer (got: '$V030_KV_GIB')"
+    [[ "$V030_INDEXER_LOGITS_MB" =~ ^[1-9][0-9]*$ ]] || err "V030_INDEXER_LOGITS_MB must be a positive integer (got: '$V030_INDEXER_LOGITS_MB')"
     KV_TARGET_GIB="$V030_KV_GIB"
 fi
 
@@ -1118,13 +1126,15 @@ info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
 info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}   Disable block drop: $MTP_DISABLE_BLOCK_DROP"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
+[[ "$V030" == "true" ]] && info "  Indexer:    logits buffer capped at ${V030_INDEXER_LOGITS_MB} MiB (V030_INDEXER_LOGITS_MB)"
 info "  Port:       $PORT  (bind $BIND)"
 info ""
 
 if [[ "$V030" == "true" ]]; then
     PLE_ENV="-e VLLM_PLE_MMAP_DIR=/root/.cache/vllm/ple_mmap_v030 \\
     -e VLLM_PLE_MMAP_ADVICE=1 \\
-    -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/fi_autotune"
+    -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/tmp/fi_autotune \\
+    -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=$V030_INDEXER_LOGITS_MB"
     OVERLAY_MOUNTS="$V030_MOUNTS"
     BLOCK_DROP_MOUNTS=""
     OFFLOAD_MOUNTS=""
