@@ -5,6 +5,23 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-27
+
+### Added
+
+- **`FAST_LOAD=1`: cold start ~12 min -> ~5 min** (on in `.env.sample`).
+  Each routed-expert shard is read in one pass and copied to the GPU in one
+  transfer, its tensors handed out as views (py-spy: 81% of the main weight
+  pass was the MoE loader's per-expert host->device copies), and the MTP
+  drafter reads only the 2 shards holding its tensors. Over 5 launches vs 2:
+  main weight pass 483–504 -> 125–142 s, drafter 71–72 -> 23–26 s,
+  `start.sh` to first answered request 714–724 -> 293–313 s. KV pool
+  16.54–16.64 vs 15.99–16.74 GiB, mean prompt NLL 1.5262 vs 1.5246–1.5291,
+  smoke test passing on every launch. Not fastsafetensors: its reader
+  leaves 8 GiB pinned, which cost ~11 GiB of KV pool here. `FAST_LOAD=0`
+  launches the exact stock command. `files/patch_default_loader.py`,
+  `tests/test_default_loader.py`.
+
 ## 2026-09-25
 
 ### Added

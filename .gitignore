@@ -49,6 +49,7 @@
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_determinism.py
 !/files/patch_mtp_draft_vocab.py
+!/files/patch_default_loader.py
 # shipped reduced draft vocabulary (47,149 ids, code-tuned). The 65k en+code
 # vocab the +25% decode win was measured with is a generated artifact and is
 # not tracked; this smaller file makes the default path work out of the box.
@@ -115,6 +116,7 @@
 # (files/block_drop/) stays ignored. The test runs on the host, CPU only.
 !/files/patch_block_drop.py
 !/tests/test_block_drop.py
+!/tests/test_default_loader.py
 
 # --- opt-in vLLM 0.30 lane (start-v030.sh) -------------------------------
 # Generators only; files/v030_fp8kv/, files/v030_ple/ and
