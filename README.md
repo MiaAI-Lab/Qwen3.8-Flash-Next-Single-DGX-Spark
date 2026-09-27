@@ -16,7 +16,7 @@ model: text, images and video all work out of the box (see below). Nothing here 
 ```
 cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
 ./download.sh              # fetch the ~99 GiB checkpoint (resumable, sha256-verified)
-./start.sh                 # ~10-12 min to /health; serves on :8888
+./start.sh                 # ~5 min to /health (FAST_LOAD=1); serves on :8888
 ./stop.sh                  # container + watchdog, graceful
 ```
 
@@ -415,6 +415,66 @@ asks for, and `start.sh` prints "KV target X reduced to Y" when the cap binds.
 16.67 GiB here, ~1.13M FP8 tokens.
 `HOST_SLACK_GIB` sizes the container cgroup cap (GPU budget + this); it bounds
 host-side memory only and does not protect the host from the GPU side.
+
+### Faster cold start (`FAST_LOAD`, default)
+
+`FAST_LOAD=1` (on in `.env.sample`) cuts a cold start to `/health` from
+~12 min to ~5 min. It changes only how the weights get from disk to the GPU:
+the served model, its prompt NLL and the KV pool are the same.
+
+| | `FAST_LOAD=0` | `FAST_LOAD=1` |
+|---|---|---|
+| Main-model weight pass | 483–504 s | 125–142 s |
+| MTP drafter weight pass | 71–72 s | 23–26 s |
+| Model loading (vLLM's figure) | 561–583 s | 157–175 s |
+| Profile, KV pool, warmup | 76 s | 75–77 s |
+| `start.sh` to the first answered request | 714–724 s | 293–313 s |
+| Available KV cache memory | 16.54–16.64 GiB | 15.99–16.74 GiB |
+| Mean prompt NLL, 14,374 positions of 4 fixed texts | 1.5262 | 1.5246–1.5291 |
+| Lowest `MemAvailable` during the launch | 18.4 GiB | 18.6 GiB |
+
+Measured 2026-09-27 on this host, `.env.sample` profile: 5 launches with
+`FAST_LOAD=1` (3 with the checkpoint and packed PLE table evicted from the
+page cache first) and 2 with `FAST_LOAD=0` (one of each). Two NLL repeats
+inside one launch differ by up to 0.02, and the KV pool moves a few percent
+between restarts on either setting. Every launch passed
+`scripts/smoke-test.sh`; the one warning some runs show is the known
+temperature-0 nondeterminism (#28), on both settings. Four of the five
+`FAST_LOAD=1` launches logged one `NV_ERR_NO_MEMORY` during loading, at
+37–40 GiB `MemAvailable`: the benign startup pattern described under
+[Watchdog](#watchdog), not the fatal one. No watchdog stop.
+
+Where the time went, and what changed (`files/patch_default_loader.py`):
+
+- **The routed-expert shards.** 14 of the 35 shards are 4.8 GB of routed
+  experts, ~15,600 small tensors each, and each took ~30 s on the lazy mmap
+  path. It was not the disk: a sequential read of one takes 4.4 s, and a warm
+  page cache barely helps (27.9 s cold, 26.8 s warm for one shard). py-spy put
+  81% of the pass on `expert_data.copy_(loaded_weight)` in the MoE weight
+  loader: one synchronous pageable host->device copy per expert tensor.
+  `FAST_LOAD` reads each such shard with one sequential read and one
+  host->device copy, and hands out the tensors as views of that device
+  buffer, so each per-expert copy runs device-to-device (~5 s per shard,
+  bound by the read).
+- **Not fastsafetensors.** `--load-format fastsafetensors` does the same kind
+  of bulk transfer, but its reader leaves 8 GiB of pinned host memory
+  allocated for the life of the process (no reader setting changes it). On
+  unified memory vLLM's profile run counts that as used, and the KV pool
+  fell from ~16.6 to ~5.6 GiB. Its read-ahead also kept ~15 GiB of shard
+  buffers reserved during loading. The bulk path uses plain host memory and
+  holds one shard at a time, released before the next one is read.
+- **PLE shards stay lazy.** The PLE embedding loader keeps references to some
+  loaded tensors until the end of its `load_weights()`; a retained view would
+  pin a whole shard buffer on the GPU. Shards holding `ple_embedding` tensors
+  keep the lazy path, which was already fast for them (~1 s each).
+- **The MTP drafter** is loaded through the same loader and used to open all 35
+  shards to find its `mtp.*` tensors plus `embed_tokens`/`lm_head`. Its file
+  list is now narrowed through `model.safetensors.index.json` to the 2 shards
+  that hold them.
+
+The PLE offload worker keeps the stock lazy path in both settings.
+`FAST_LOAD=0` launches exactly the stock command. `FAST_LOAD` applies to the
+default lane only; `start-v030.sh` ignores it.
 
 ### Long context beyond 262k (YaRN)
 
@@ -1171,6 +1231,10 @@ set (the shipped default), set `API_KEY` in the shell first or the call 401s;
   (see [What is patched and why](#what-is-patched-and-why)). `start.sh` runs
   it only when the knob is 1. `tests/test_block_drop.py` checks it and its
   `start.sh` wiring on CPU.
+- `files/patch_default_loader.py` — generator for `FAST_LOAD=1` (see
+  [Faster cold start](#faster-cold-start-fast_load-default)). `start.sh` runs it
+  on every launch and mounts the output only when the knob is 1.
+  `tests/test_default_loader.py` checks it and its `start.sh` wiring on CPU.
 
 - `bench/sweep.py` — decode sweep. Submits one
   [sparkDash](https://github.com/MiaAI-Lab/sparkDash) job per concurrency level
@@ -1271,6 +1335,17 @@ sparkDash's own figures include any other traffic on the port.
   launch. With both, identical requests give bit-identical logits (0 of 1,742
   positions differ; before, median 0.19 and max 4.8 nats), NLL unchanged,
   decode within noise, prefill -3.4% at 47k tokens.
+- **Weight loading** (`patch_default_loader.py`, `FAST_LOAD=1`, on in
+  `.env.sample`): each routed-expert shard is read with one sequential read
+  and one host->device copy, and its tensors are handed out as views of that
+  device buffer, so the MoE loader's ~15,600 per-expert copies per shard run
+  device-to-device instead of as synchronous pageable host->device copies.
+  One shard at a time, plain host memory (fastsafetensors' reader leaves
+  8 GiB pinned and cost ~11 GiB of KV pool). Shards holding PLE embedding
+  tensors stay lazy. The MTP drafter's file list is narrowed through the
+  checkpoint index to the 2 shards holding its tensors. Cold start ~12 ->
+  ~5 min, NLL and KV pool unchanged; see
+  [Faster cold start](#faster-cold-start-fast_load-default).
 
 ## Credits
 

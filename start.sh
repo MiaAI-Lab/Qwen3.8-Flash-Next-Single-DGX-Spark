@@ -118,7 +118,8 @@ _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN BIND READY_TIMEOUT_S API_KEY
                     VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE GDN_DECODE_KERNEL
-                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB)
+                    MTP_DISABLE_BLOCK_DROP CHAT_TEMPLATE V030 V030_KV_GIB
+                    FAST_LOAD)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
     eval "_SNAP_$_v=\${$_v-}"
     eval "_SNAPSET_$_v=\${$_v+set}"
@@ -316,6 +317,11 @@ MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
 # (files/patch_block_drop.py) when this knob is 1 and MTP is on.
 [[ "$MTP_DISABLE_BLOCK_DROP" == 0 || "$MTP_DISABLE_BLOCK_DROP" == 1 ]] \
     || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
+# Faster cold start (files/patch_default_loader.py): each routed-expert shard
+# is read in one pass and copied to the GPU in one transfer, and the MTP drafter
+# reads only the shards that hold its tensors. Default lane only.
+FAST_LOAD="${FAST_LOAD:-0}"
+[[ "$FAST_LOAD" == 0 || "$FAST_LOAD" == 1 ]] || err "FAST_LOAD must be 0 or 1"
 V030="${V030:-false}"
 V030_KV_GIB="${V030_KV_GIB:-12}"
 V030_MODEL_ID="nvidia/Qwen3.8-Flash-Next-NVFP4"
@@ -713,6 +719,14 @@ PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
 extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
+
+# Faster weight loading (FAST_LOAD=1). Generated on every launch like the other
+# patches, but mounted only for FAST_LOAD=1; inert without VLLM_FAST_LOAD=1.
+LOADER_PKG="$VLLM_PKG/model_executor/model_loader/default_loader.py"
+PATCHED_LOADER="$SCRIPT_DIR/files/default_loader_patched.py"
+extract "$LOADER_PKG" "$PATCHED_LOADER.orig"
+python3 "$SCRIPT_DIR/files/patch_default_loader.py" || err "patch_default_loader.py failed"
+[[ -f "$PATCHED_LOADER" ]] || err "loader patch missing after patch_default_loader.py"
 
 # vllm#53388 backport: without it the image ignores "disable_eagle_block_drop".
 BLOCK_DROP_MOUNTS=""
@@ -1142,6 +1156,13 @@ else
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\
     -v $OFFLOAD_DIR/protocol.py:$VLLM_PKG/v1/ple_offload/protocol.py:ro"
+    # FAST_LOAD=1 only, so FAST_LOAD=0 launches exactly the stock command.
+    if [[ "$FAST_LOAD" == 1 ]]; then
+        PLE_ENV+=" \\
+    -e VLLM_FAST_LOAD=1"
+        OVERLAY_MOUNTS+=" \\
+    -v $PATCHED_LOADER:$LOADER_PKG:ro"
+    fi
 fi
 LAUNCH_SCRIPT=$(mktemp /tmp/vllm_tp1_XXXXXX.sh)
 cat > "$LAUNCH_SCRIPT" <<LAUNCH_EOF
