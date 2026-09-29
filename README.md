@@ -359,6 +359,70 @@ Use it when a meaningful share of your traffic is Spanish; otherwise stay on
 the shipped 47k and keep the extra byte saving. Both files are built by
 `files/build_draft_vocab.py` / `files/build_draft_vocab_extend.py`.
 
+### Serving other languages: 65k draft vocabs
+
+The same recipe as the Spanish file, for six more languages:
+`files/draft_vocab_{zh,ja,de,pt,fr,ru}_en_code_65k.txt` — each the 47k file
+whole as a floor plus 668 MiB of that language's Wikipedia at natural
+frequencies, byte-fallback range pinned, 65,536 rows. Same switch:
+`MTP_DRAFT_VOCAB=files/draft_vocab_<lang>_en_code_65k.txt`. Correctness is
+identical either way (rejection sampling); the only thing at stake is the
+speed of that language's traffic.
+
+The 47k file is an English+code vocabulary, and its coverage of other
+languages collapses. Measured on 68 MiB of held-out (disjoint) Wikipedia per
+language, 18–20M token occurrences each:
+
+| language | 47k coverage | 65k coverage | rows |
+|---|---|---|---|
+| Chinese | 34.7% | 96.7% | 65,536 |
+| Japanese | 30.0% | 99.7% | 65,536 |
+| German | 60.2% | 99.5% | 65,536 |
+| Portuguese | 65.4% | 99.2% | 65,536 |
+| French | 69.4% | 99.5% | 65,536 |
+| Russian | 31.5% | 99.7% | 65,536 |
+
+Chinese is the one language where 65k rows do not reach ~99%: zh Wikipedia
+alone yields 152,123 distinct ids against the 18,363 free slots, so held-out
+coverage lands at 96.7%. A larger zh file (see the coverage-vs-size report in
+`build_draft_vocab.py --report-only`) is the lever if zh acceptance measures
+low.
+
+**Measured** (2026-09-29, this host, `.env.sample` profile, one boot per arm:
+47k baseline → each language file → 47k again as a drift bound; 5 diverse
+prompts per language × 2 reps, temperature 0, thinking off, 400 completion
+tokens, medians; 3 English control prompts measured in every arm):
+
+| language | 47k (boot 1 / boot 2) | lang 65k | change |
+|---|---|---|---|
+| Russian | 32.5 / 30.0 | **53.1** | **+63% … +77%** |
+| Chinese | 37.5 / 35.5 | **50.8** | **+36% … +43%** |
+| Japanese | 34.5 / 32.4 | **46.5** | **+35% … +44%** |
+| French | 41.5 / 41.6 | 47.5 | +14% |
+| German | 42.7 / 41.8 | 48.6 | +14% … +16% |
+| Portuguese | 44.1 / 44.0 | 48.4 | +10% |
+| English (control) | 55.3 / 54.1 | 53.0–54.8 | ~flat (−1 to −3%) |
+
+The gain ordering tracks held-out coverage exactly — the three deepest
+coverage holes (ru 31.5%, zh 34.7%, ja 30.0%) take the three biggest wins,
+and Russian ends within ~3% of English. The two independent 47k boots agree
+within 0.3–7.7% per language, and the English control holds 53–55 across all
+nine boots. The small English dip is the expected cost of the larger draft
+head (0.22 → 0.31 GiB, the same trade the Spanish file makes). The per-arm
+accepted/draft counters were not captured in this pass (the `/metrics`
+spec-decode series read zero deltas on this boot path) — the tok/s table is
+the measurement; the acceptance mechanism behind it is inference from
+coverage until those counters are re-captured.
+
+One honest caveat versus the Spanish build remains. That build mixed Wikipedia
+with the model's own Spanish output before ranking; these six are
+Wikipedia-only, so per-language output quirks — reasoning markers, markdown,
+code comments in the target language — are not ranked by measurement. The
+Spanish experience says Wikipedia dominates the ranking; if a language's
+acceptance still measures low, regenerate output in that language and re-run
+`files/build_draft_vocab_extend.py` with it appended to `--corpus` (the floor
+keeps every id that already worked).
+
 ## Multimodal (images and video)
 
 The checkpoint is multimodal (`is_multimodal: true`, `language_model_only:
