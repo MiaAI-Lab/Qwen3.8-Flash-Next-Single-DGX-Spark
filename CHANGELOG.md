@@ -5,6 +5,32 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+
+## 2026-09-28
+
+### Added
+
+- **Language-extended draft vocabularies for zh, ja, de, pt, fr, ru** —
+  `files/draft_vocab_{zh,ja,de,pt,fr,ru}_en_code_65k.txt`, the Spanish recipe
+  (`files/build_draft_vocab_extend.py`) applied to each: the 47k file whole as
+  a floor (verified: all 47,172 ids present in every file), byte-fallback range
+  pinned (all 400), 668 MiB of that language's Wikipedia at natural
+  frequencies, 65,536 rows. Switch with
+  `MTP_DRAFT_VOCAB=files/draft_vocab_<lang>_en_code_65k.txt`.
+  Held-out Wikipedia coverage (68 MiB disjoint tail per language, 18–20M
+  occurrences): zh 34.7→96.7%, ja 30.0→99.7%, de 60.2→99.5%,
+  pt 65.4→99.2%, fr 69.4→99.5%, ru 31.5→99.7%. Wikipedia-only build (the
+  Spanish build also ranked model output; no live server at build time — see
+  the README section for the rebuild path if acceptance measures low).
+  **Measured (2026-09-29, one boot per arm, 5 prompts × 2 reps per language,
+  temp 0, thinking off, 47k baseline → language file → 47k again as drift
+  bound)**: ru 32.5/30.0 → 53.1 (+63…+77%), zh 37.5/35.5 → 50.8 (+36…+43%),
+  ja 34.5/32.4 → 46.5 (+35…+44%), fr 41.5 → 47.5 (+14%), de 42.7/41.8 → 48.6
+  (+14…+16%), pt 44.1/44.0 → 48.4 (+10%); English control 55.3/54.1 →
+  53.0–54.8 across all nine boots (~flat, the 0.22→0.31 GiB draft-head cost).
+  Gain ordering tracks held-out coverage exactly. See the README section for
+  the full protocol and the accepted/draft capture caveat.
+
 ## 2026-09-25
 
 ### Added
