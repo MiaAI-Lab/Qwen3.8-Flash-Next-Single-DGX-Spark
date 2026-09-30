@@ -6,6 +6,12 @@ one DGX Spark this repo is written for — treat them as that host's numbers, no
 as promises.
 
 
+## 2026-09-30
+
+### Fixed
+
+- **Draft vocab size report.** `build_draft_vocab.py --report-only` counted a size as pinned ids plus the first `size - pinned` ranked ids. A pinned id that is also frequent was counted in both, so the printed coverage was for a smaller vocabulary than `--size` would write. The report now uses the same selection as the file.
+
 ## 2026-09-28
 
 ### Added
