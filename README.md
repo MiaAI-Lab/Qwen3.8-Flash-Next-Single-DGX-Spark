@@ -1,7 +1,7 @@
 # Use the TensorFold recipe
 
 > [!IMPORTANT]
-> # A new recipe is now live, and it runs faster on TensorFold. Everything should use that.
+> # A new recipe is now live, and it runs faster on TensorFold. Everyone should use that.
 >
 > **[https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)**
 
