@@ -4,7 +4,7 @@
 # generation, determinism at temperature 0, decode speed, served context.
 #
 # Usage:
-#   ./scripts/smoke-test.sh                      # localhost:8888, no auth
+#   ./scripts/smoke-test.sh                      # probes the address BIND serves on, :8888, no auth
 #   PORT=9000 API_KEY=xyz ./scripts/smoke-test.sh
 #
 # Reads .env (repo-relative) for API_KEY/PORT/SERVED_MODEL_NAME when the
@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 _CLI_API_KEY="${API_KEY:-}"
 _CLI_PORT="${PORT:-}"
+_CLI_BIND="${BIND:-}"
 _CLI_SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 if [[ -f "$REPO_DIR/.env" ]]; then
     # shellcheck source=.env
@@ -25,6 +26,7 @@ if [[ -f "$REPO_DIR/.env" ]]; then
 fi
 [[ -n "$_CLI_API_KEY" ]] && API_KEY="$_CLI_API_KEY"
 [[ -n "$_CLI_PORT" ]] && PORT="$_CLI_PORT"
+[[ -n "$_CLI_BIND" ]] && BIND="$_CLI_BIND"
 [[ -n "$_CLI_SERVED_MODEL_NAME" ]] && SERVED_MODEL_NAME="$_CLI_SERVED_MODEL_NAME"
 
 PORT="${PORT:-8888}"
@@ -33,13 +35,27 @@ EXPECT_LEN="${EXPECT_LEN:-}"        # set to 262144 or 524288 to assert context
 # Fallback: the deployment may carry the key as --api-key <value> inside
 # .env's EXTRA_VLLM_ARGS instead of the API_KEY knob. The server requires it
 # either way; without this the smoke test 401s and maintenance windows hang.
+# Tokenized with start.sh's shlex semantics so quoted values survive.
+source "$REPO_DIR/scripts/launch-lane.sh"
 if [[ -z "${API_KEY:-}" && -n "${EXTRA_VLLM_ARGS:-}" ]]; then
-    _x=(); read -ra _x <<< "$EXTRA_VLLM_ARGS"
+    split_extra_vllm_args _x "$EXTRA_VLLM_ARGS" \
+        || { echo "EXTRA_VLLM_ARGS has an unterminated single quote" >&2; exit 1; }
     for ((i=0; i<${#_x[@]}-1; i++)); do
         if [[ "${_x[$i]}" == "--api-key" ]]; then API_KEY="${_x[$((i+1))]}"; break; fi
     done
 fi
-BASE="http://localhost:$PORT"
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
+BASE="http://$(probe_host):$PORT"
 AUTH=(); [[ -n "${API_KEY:-}" ]] && AUTH=(-H "Authorization: Bearer $API_KEY")
 
 pass=0; fail=0; warn=0

@@ -170,6 +170,17 @@ for _ch in '"' "'" ';' '$' '`' '\' '|' '<' '>' '&' '(' ')' '{' '}' ' ' '*' $'\n'
         err "BIND='$BIND' contains a shell metacharacter; refusing to use it."
     fi
 done
+# Host to probe. A wildcard bind (0.0.0.0, ::) also answers on loopback; a specific
+# address (a LAN or tailnet IP) answers ONLY on that address, so a probe hard-coded to
+# localhost reads a healthy server as down.
+probe_host() {
+    case "${BIND:-0.0.0.0}" in
+        0.0.0.0 | :: | '[::]') echo localhost ;;
+        \[*\]) echo "$BIND" ;;
+        *:*) echo "[$BIND]" ;;    # bare IPv6 literal: URLs need brackets
+        *) echo "$BIND" ;;
+    esac
+}
 # Cold start is ~11 min; the first boot additionally builds the ~27 GB packed
 # PLE table. Give the readiness loop this long before it archives + removes
 # the wedged container and exits non-zero for the supervisor to retry.
@@ -231,6 +242,8 @@ MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 MEMWATCH_FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 # Seconds the watchdog gives vLLM to exit on SIGTERM before SIGKILL.
 MEMWATCH_GRACE="${MEMWATCH_GRACE:-30}"
+# Consecutive samples below the floor before the watchdog stops the container.
+MEMWATCH_CONSEC="${MEMWATCH_CONSEC:-5}"
 PLE_OFFLOAD="${_CLI_PLE_OFFLOAD:-${PLE_OFFLOAD:-true}}"
 # PLE_GIB: the packed PLE table's size, subtracted from the on-disk
 # checkpoint size to get GPU-resident weights. The stock and ablit snapshots
@@ -328,6 +341,12 @@ if [[ "$V030" == "true" ]]; then
     [[ -n "$KV_CACHE_MEMORY" ]] && err "V030: set V030_KV_GIB instead of KV_CACHE_MEMORY on the vLLM 0.30 lane."
     [[ "$V030_KV_GIB" =~ ^[1-9][0-9]*$ ]] || err "V030_KV_GIB must be a positive integer (got: '$V030_KV_GIB')"
     KV_TARGET_GIB="$V030_KV_GIB"
+    # Lane-specific memwatch floors (the wrapper must not export these:
+    # an env export would override .env through the snapshot). Softer than
+    # the pinned-image lane's 6/2: v0.30 pins KV via --kv-cache-memory-bytes
+    # so host headroom is smaller by design. .env still wins.
+    MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-3}"
+    MEMWATCH_MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-1}"
 fi
 
 DO_LAUNCH=true
@@ -905,7 +924,7 @@ if [[ -n "$YARN_FACTOR" ]]; then
     # Deep-merged into text_config.rope_parameters, which is what this model
     # reads (nvidia/qsa.py) and what vLLM's max-len check scales by. The
     # existing mrope_section / rope_theta / partial_rotary_factor survive.
-    VLLM_ARGS+=("--hf-overrides" "$(printf "'{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":%s,\"original_max_position_embeddings\":%s}}}'" "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
+    VLLM_ARGS+=("--hf-overrides" "$(printf '{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":%s,"original_max_position_embeddings":%s}}}' "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
 fi
 VLLM_ARGS+=("--load-format" "safetensors")
 VLLM_ARGS+=("--safetensors-load-strategy" "lazy")
@@ -933,7 +952,7 @@ fi
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
 [[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
-[[ "$V030" == "true" ]] && VLLM_ARGS+=("--engram-config" "'{\"cpu_offload\":true}'" "--kv-cache-memory-bytes" "${V030_KV_GIB}G")
+[[ "$V030" == "true" ]] && VLLM_ARGS+=("--engram-config" '{"cpu_offload":true}' "--kv-cache-memory-bytes" "${V030_KV_GIB}G")
 # MTP legality guard (review §5.3 / §6.1): legal k set derives from the
 # checkpoint's attention block size and the QSA ring compress ratio —
 #   capacity = compress_ratio * ceil((compress_ratio + k) / compress_ratio)
@@ -1048,7 +1067,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
                 printf "%s", out
             }')]"
     fi
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
+    VLLM_ARGS+=("--speculative-config" "$(printf '{"method":"mtp","num_speculative_tokens":%s%s%s}' "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
 fi
 _CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
 if [[ "$_CG_SIZES" == "auto" ]]; then
@@ -1075,20 +1094,43 @@ print(",".join(str(x) for x in sorted(
     )
 fi
 if [[ -n "$_CG_SIZES" ]]; then
-    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\",\"cudagraph_capture_sizes\":[%s]}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
+    VLLM_ARGS+=("--compilation-config" "$(printf '{"mode":%s,"cudagraph_mode":"%s","cudagraph_capture_sizes":[%s]}' "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
 else
-    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
+    VLLM_ARGS+=("--compilation-config" "$(printf '{"mode":%s,"cudagraph_mode":"%s"}' "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
 fi
-# EXTRA_VLLM_ARGS is word-split with shell-word semantics, so quoting inside
-# the value is not supported (same contract as EXTRA_DOCKER_ARGS).
-[[ -n "$EXTRA_VLLM_ARGS" ]] && { read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"; VLLM_ARGS+=("${_EXTRA_VLLM[@]}"); }
+# EXTRA_VLLM_ARGS is split into argv tokens by shlex (eval-free): whitespace
+# separates and single quotes group, so '...' content is one literal token.
+# A double quote is data, not grouping -- the value is never re-parsed
+# (VLLM_ARGS_STR below), so JSON works bare (--kernel-config={"m":"b"})
+# AND single-quoted (--kernel-config '{"m":"b"}', the pattern
+# docs/overnight-2026-09-05.md ships). EXTRA_DOCKER_ARGS differs: it lands
+# raw in the launch heredoc and IS re-parsed by the shell at exec time.
+if [[ -n "$EXTRA_VLLM_ARGS" ]]; then
+    _EXTRA_PARSED=$(python3 - "$EXTRA_VLLM_ARGS" <<'PY'
+import sys, shlex
+lx = shlex.shlex(sys.argv[1], posix=True)
+lx.whitespace_split = True
+lx.quotes = "'"
+lx.commenters = ""
+print("\n".join(lx))
+PY
+    ) || err "EXTRA_VLLM_ARGS has an unterminated single quote"
+    if [[ -n "$_EXTRA_PARSED" ]]; then
+        _EXTRA_VLLM=()
+        while IFS= read -r _TOK; do _EXTRA_VLLM+=("$_TOK"); done <<< "$_EXTRA_PARSED"
+        VLLM_ARGS+=("${_EXTRA_VLLM[@]}")
+    fi
+fi
 # API_KEY -> --api-key: added ONLY in the heredoc body below, as
 # --api-key \$API_KEY. VLLM_ARGS_STR must not carry the flag: it flows through
 # the UNQUOTED heredoc, where any $-expansion happens at script-generation
 # time and would bake the secret into .last_launch.sh. The heredoc's
 # \$API_KEY resolves from the generated script's environment at exec time,
 # exactly like HF_TOKEN (see the export below).
-VLLM_ARGS_STR="${VLLM_ARGS[*]}"
+# %q-escape each element so the generated launch script's re-parse recovers
+# every argument verbatim; the old "${VLLM_ARGS[*]}" flatten lost quoting and
+# stripped the double quotes out of JSON values (issue #11).
+printf -v VLLM_ARGS_STR '%q ' "${VLLM_ARGS[@]}"
 
 # Non-loopback bind with no api key = the whole network the box is on can
 # reach an unauthenticated unfiltered model. Warn, do not refuse (this is
@@ -1234,11 +1276,11 @@ if [[ -s "$MEMWATCH_LOG" ]]; then
     info "Previous watchdog log archived: logs/archive/${CONTAINER_NAME}-${ARCHIVE_TS}-memwatch.log"
 fi
 MEMWATCH_MIN_FREE_GIB="$MEMWATCH_MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$MEMWATCH_FREE_GATE_GIB" \
-    MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
+    MEMWATCH_GRACE="$MEMWATCH_GRACE" MEMWATCH_CONSEC="$MEMWATCH_CONSEC" MEMWATCH_LOG="$MEMWATCH_LOG" \
     bash "$SCRIPT_DIR/scripts/start-memwatch.sh" "$CONTAINER_NAME" "$MEMWATCH_MIN_GIB"
 printf 'V030=%s\nMEMWATCH_MIN_GIB=%s\nMEMWATCH_MIN_FREE_GIB=%s\n' "$V030" "$MEMWATCH_MIN_GIB" "$MEMWATCH_MIN_FREE_GIB" \
     > "$SCRIPT_DIR/logs/launch-lane"
-ok "Watchdog running (stops container after 5 samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
+ok "Watchdog running (stops container after ${MEMWATCH_CONSEC:-5} samples of MemAvailable < ${MEMWATCH_MIN_GIB} GiB, or MemFree < ${MEMWATCH_MIN_FREE_GIB} GiB while MemAvailable < ${MEMWATCH_FREE_GATE_GIB} GiB): logs/memwatch-${CONTAINER_NAME}.log"
 info "Loading weights (~3-4 min). Following logs until ready..."
 
 docker logs -f "$CONTAINER_NAME" &
@@ -1267,14 +1309,14 @@ while true; do
         echo ""
         REASON=$(docker logs "$CONTAINER_NAME" 2>&1 \
                  | grep -oE "(ValueError|RuntimeError|TimeoutError|torch\.[A-Za-z]*Error): .*" \
-                 | grep -viE "min_frames|max_frames" | tail -1 | cut -c1-400)
+                 | grep -viE "min_frames|max_frames" | tail -1 | cut -c1-400 || true)
         [[ -n "$REASON" ]] && { echo "  vLLM reported:"; echo "    $REASON"; }
         if docker inspect "$CONTAINER_NAME" --format '{{.State.OOMKilled}}' 2>/dev/null | grep -q true; then
             echo "  Container was OOM-killed by its cgroup cap (${CONTAINER_MEM_GIB} GiB) — the host survived as designed."
         fi
         err "Container exited. Full logs: docker logs $CONTAINER_NAME"
     fi
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$PORT/health" 2>/dev/null || echo "000")
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$(probe_host):$PORT/health" 2>/dev/null || echo "000")
     if [[ "$CODE" == "200" ]]; then
         kill $LOGPID 2>/dev/null || true
         echo ""
