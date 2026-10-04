@@ -881,9 +881,9 @@ if ! ls "$PLE_CACHE_HOST"/*.packed_u8 >/dev/null 2>&1; then
     info "Building packed PLE table (one-time, ~40 s, <1 GiB RAM, no GPU)..."
     mkdir -p "$PLE_CACHE_HOST"
     docker run --rm --name "${CONTAINER_NAME}-plebuild" --memory 6g --cpus 8 \
-        -v "$MODEL_PATH:/m:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
+        -v "$(dirname "$MODEL_PATH"):/mhub:ro" -v "$HOME/.cache/vllm/ple_cache:/out" \
         -v "$SCRIPT_DIR/files/build_ple_packed_table.py:/b.py:ro" \
-        --entrypoint python3 "$IMAGE" -u /b.py "/m/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
+        --entrypoint python3 "$IMAGE" -u /b.py "/mhub/$(basename "$MODEL_PATH")/$SNAPSHOT_REL" "/out/${PLE_ORG}--${PLE_NAME}"
 fi
 ok "Packed PLE table: $(ls "$PLE_CACHE_HOST"/*.packed_u8 | head -1) ($(du -sh "$PLE_CACHE_HOST" | cut -f1))"
 fi
