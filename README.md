@@ -1,3 +1,10 @@
+# Use the TensorFold recipe
+
+> [!IMPORTANT]
+> # A new recipe is now live, and it runs faster on TensorFold. Everything should use that.
+>
+> **[https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)**
+
 <h1 align="center">Qwen3.8-Flash-Next on ONE DGX Spark (TP=1)</h1>
 
 <p align="center">
