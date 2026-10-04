@@ -31,6 +31,25 @@ from collections import Counter
 CHUNK = 1 << 20  # tokenize ~1 MiB at a time; the corpora are hundreds of MiB
 
 
+def select_vocab(special, ranked, size):
+    """Pinned ids, then frequent ids that are not already pinned, up to size.
+
+    Pinned ids stay even when there are more of them than size. A pinned id
+    that is also frequent does not take a second slot. This is the set the
+    script writes, and the set the size report should measure.
+    """
+    keep = set(special)
+    if len(keep) >= size:
+        return keep
+    for tid in ranked:
+        if tid in keep:
+            continue
+        keep.add(tid)
+        if len(keep) >= size:
+            break
+    return keep
+
+
 def iter_texts(path: str):
     """Yield bounded chunks of a corpus. `path` may carry a `:N` repeat weight,
     so a small in-distribution corpus can be given the same say as a large
@@ -116,14 +135,7 @@ def main() -> None:
     special = {i for i in special if 0 <= i < vocab_size}
 
     ranked = [tid for tid, _ in counts.most_common()]
-    keep: list[int] = sorted(special)
-    seen = set(keep)
-    for tid in ranked:
-        if len(keep) >= args.size:
-            break
-        if tid not in seen:
-            keep.append(tid)
-            seen.add(tid)
+    seen = select_vocab(special, ranked, args.size)
     keep = sorted(seen)
 
     covered = sum(counts[t] for t in seen if t in counts)
@@ -138,7 +150,7 @@ def main() -> None:
           f"outside; those become rejected drafts, never wrong output")
 
     for cut in (8192, 16384, 32768, 65536, 131072):
-        sub = set(sorted(special)) | set(ranked[:max(0, cut - len(special))])
+        sub = select_vocab(special, ranked, cut)
         cov = sum(counts[t] for t in sub if t in counts)
         print(f"  size {cut:>7,}: coverage {100.0 * cov / total:7.4f}%")
 
