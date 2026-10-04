@@ -13,6 +13,8 @@ with the PLE table offloaded and memory-mapped. This is a **vision-language**
 model: text, images and video all work out of the box (see below). Nothing here depends on the
 2-node files it was derived from.
 
+**local-inference-lab** — the byte-identical Spark checkpoint used as the splice base.
+
 ```
 cp .env.sample .env        # edit IMAGE / HF_TOKEN if needed
 ./download.sh              # fetch the ~99 GiB checkpoint (resumable, sha256-verified)
@@ -1347,8 +1349,6 @@ sparkDash's own figures include any other traffic on the port.
   not a re-quantization.
 - **MiaAI Lab** — the single-DGX-Spark NVFP4 recipe and
   [`Mia-AiLab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/Mia-AiLab/Qwen3.8-Flash-Next-NVFP4).
-- **local-inference-lab** — the byte-identical Spark checkpoint used as the
-  splice base.
 - **Keys (drowzeys)** — the abliteration splice served by `ABLIT=1` (QSA
   `o_proj` at L15–47 in MXFP8; MTP, routed experts, PLE and the chat template
   left stock) and its packaging.
