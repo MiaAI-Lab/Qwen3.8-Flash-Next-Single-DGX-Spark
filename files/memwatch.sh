@@ -24,6 +24,40 @@
 #     32 GiB, zero NVRM errors. Free pages backed by reclaimable cache are not
 #     what the driver runs out of; free pages with no cache left to reclaim are.
 #
+# Relief step for the MemFree trigger (MEMWATCH_RELIEF=drop_caches; default
+# off). At the default kernel watermarks kswapd reclaims page cache only near
+# 150 MiB free, so the MemFree trigger can fire while GiBs of clean page cache
+# are still resident (2026-09-23 on one Spark: stop at MemFree 1.2 GiB,
+# MemAvailable 8.3 GiB, 5.7 GiB cached). When the MemFree trigger has counted
+# MEMWATCH_RELIEF_AT samples (default 2, less than CONSEC) and the reclaimable
+# file cache is at least MEMWATCH_RELIEF_MIN_GIB (default 1), the watchdog
+# writes 1 to /proc/sys/vm/drop_caches through `sudo -n tee` under
+# `timeout -k 2 10`, logs the result, resets the MemFree counter and keeps
+# sampling. If the condition holds for CONSEC more samples, it stops the
+# container as before. No `sync`: drop_caches drops only clean pages, and
+# sync can block on dirty data while the watchdog must keep sampling.
+#   * The relief runs in the background. The watchdog waits at most 1 s for
+#     it in the sample that starts it, then keeps sampling: both triggers and
+#     the NV_ERR_NO_MEMORY check continue while a slow relief runs, and the
+#     MemFree counter resets only when the relief ends. A signal cannot stop
+#     the kernel's drop_caches scan, so `timeout` alone does not bound it.
+#     A relief that has not ended 14 s (timeout + 4 s) after its start is
+#     logged as stuck and relief is disabled for the rest of the run.
+#   * At most one relief per MEMWATCH_RELIEF_INTERVAL seconds (default 60).
+#     While that limit holds, the MemFree trigger works as with relief off.
+#   * If the relief command fails (for example no NOPASSWD sudo rule), the
+#     watchdog logs it once and disables relief for the rest of the run.
+#   * reclaimable = Active(file) + Inactive(file) - Mapped - Dirty - Writeback:
+#     drop_caches skips mapped, dirty and writeback pages. Mapped also counts
+#     mapped shmem, so this figure is low, never high.
+#   * The MemAvailable trigger has no relief: page cache already counts as
+#     available there.
+#   * The PLE table rows that the gather reads stay mapped through its
+#     np.memmap, so drop_caches skips them. It drops only unmapped cache,
+#     for example the checkpoint read at load time.
+# The sudoers rule the relief needs (visudo -f /etc/sudoers.d/memwatch):
+#   <user> ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
+#
 # Every 10 s it also counts NV_ERR_NO_MEMORY lines the kernel log gained since
 # the previous check; that is the earliest signal this box gives and is logged
 # whenever it is non-zero. (A fixed 12 s window every 10 s double-counted lines
@@ -45,7 +79,12 @@
 #
 # Env: MEMWATCH_MIN_FREE_GIB (2), MEMWATCH_FREE_GATE_GIB (10), MEMWATCH_GRACE (30), MEMWATCH_LOG (this
 # script's own log, for archiving; default logs/memwatch-<container>.log),
-# MEMWATCH_ARCHIVE_DIR (logs/archive).
+# MEMWATCH_ARCHIVE_DIR (logs/archive), MEMWATCH_RELIEF (off | drop_caches),
+# MEMWATCH_RELIEF_AT (2), MEMWATCH_RELIEF_MIN_GIB (1),
+# MEMWATCH_RELIEF_INTERVAL (60), MEMWATCH_RELIEF_CMD (the drop_caches command
+# above; tests replace it with a stub).
+# Test knobs: MEMWATCH_MEMINFO (/proc/meminfo), MEMWATCH_SAMPLE_S (1),
+# MEMWATCH_RELIEF_TIMEOUT_S (10).
 CONTAINER="${1:?container}"; MIN_GIB="${2:-6}"; CONSEC="${3:-5}"
 MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
@@ -54,6 +93,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 OWN_LOG="${MEMWATCH_LOG:-$REPO_DIR/logs/memwatch-${CONTAINER}.log}"
 ARCHIVE_DIR="${MEMWATCH_ARCHIVE_DIR:-$REPO_DIR/logs/archive}"
+MEMINFO="${MEMWATCH_MEMINFO:-/proc/meminfo}"
+SAMPLE_S="${MEMWATCH_SAMPLE_S:-1}"
+RELIEF="${MEMWATCH_RELIEF:-off}"
+RELIEF_AT="${MEMWATCH_RELIEF_AT:-2}"
+RELIEF_MIN_GIB="${MEMWATCH_RELIEF_MIN_GIB:-1}"
+RELIEF_INTERVAL="${MEMWATCH_RELIEF_INTERVAL:-60}"
+RELIEF_CMD="${MEMWATCH_RELIEF_CMD:-echo 1 | sudo -n tee /proc/sys/vm/drop_caches > /dev/null}"
+RELIEF_TIMEOUT_S="${MEMWATCH_RELIEF_TIMEOUT_S:-10}"
+RELIEF_KILL_S=2                   # timeout -k: SIGKILL this long after SIGTERM
+RELIEF_WAIT_STEPS=20              # wait up to 20 x 0.05 s for a relief inline
 
 MIN_KB=$(( MIN_GIB * 1048576 ))
 MIN_FREE_KB=$(( MIN_FREE_GIB * 1048576 ))
@@ -64,6 +113,143 @@ NEAR_FREE_KB=$(( MIN_FREE_KB + 1048576 ))  # verbose band: free floor + 1 GiB
 echo "$(date '+%F %T') watchdog start: container=$CONTAINER" \
      "floors: MemAvailable<${MIN_GIB}GiB, MemFree<${MIN_FREE_GIB}GiB (while MemAvailable<${FREE_GATE_GIB}GiB);" \
      "trigger=${CONSEC} consecutive samples; grace=${GRACE}s; archive=$ARCHIVE_DIR"
+
+# Relief knobs are checked once here. A bad value disables relief with one log
+# line; it never stops the watchdog.
+RELIEF_MIN_KB=0
+case "$RELIEF" in
+    off) ;;
+    drop_caches)
+        if ! [[ "$RELIEF_AT" =~ ^[0-9]+$ && "$RELIEF_MIN_GIB" =~ ^[0-9]+$ && "$RELIEF_INTERVAL" =~ ^[0-9]+$ && "$RELIEF_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]; then
+            echo "$(date '+%F %T') relief disabled: MEMWATCH_RELIEF_AT ($RELIEF_AT), MEMWATCH_RELIEF_MIN_GIB ($RELIEF_MIN_GIB), MEMWATCH_RELIEF_INTERVAL ($RELIEF_INTERVAL) and MEMWATCH_RELIEF_TIMEOUT_S ($RELIEF_TIMEOUT_S) must be whole numbers"
+            RELIEF=off
+        elif (( RELIEF_AT < 1 || RELIEF_AT >= CONSEC )); then
+            echo "$(date '+%F %T') relief disabled: MEMWATCH_RELIEF_AT ($RELIEF_AT) must be at least 1 and less than the trigger ($CONSEC samples)"
+            RELIEF=off
+        elif ! RELIEF_DIR=$(mktemp -d "${TMPDIR:-/tmp}/memwatch-relief.XXXXXX" 2>/dev/null); then
+            echo "$(date '+%F %T') relief disabled: mktemp -d in ${TMPDIR:-/tmp} failed"
+            RELIEF=off
+        else
+            trap 'rm -rf "$RELIEF_DIR"' EXIT
+            RELIEF_MIN_KB=$(( RELIEF_MIN_GIB * 1048576 ))
+            RELIEF_STUCK_S=$(( RELIEF_TIMEOUT_S + RELIEF_KILL_S + 2 ))
+            echo "$(date '+%F %T') relief: drop_caches after ${RELIEF_AT}/${CONSEC} sub-floor MemFree samples" \
+                 "when reclaimable cache >= ${RELIEF_MIN_GIB} GiB; at most one per ${RELIEF_INTERVAL}s; timeout ${RELIEF_TIMEOUT_S}s;" \
+                 "runs in the background"
+        fi
+        ;;
+    *)
+        echo "$(date '+%F %T') relief disabled: MEMWATCH_RELIEF must be off or drop_caches (got '$RELIEF')"
+        RELIEF=off
+        ;;
+esac
+
+# read_meminfo [prefix]: sets <prefix><field> (default prefix m_) from
+# $MEMINFO. Active(file) and Inactive(file) become <prefix>Activefile and
+# <prefix>Inactivefile.
+read_meminfo() {
+    eval "$(awk -v p="${1:-m_}" '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapFree|AnonPages|Shmem|Mapped|Slab|SUnreclaim|PageTables|KernelStack|Active\(file\)|Inactive\(file\)|Dirty|Writeback):/ {
+                     sub(":", "", $1); gsub(/[()]/, "", $1); print p $1 "=" $2 }' "$MEMINFO")"
+}
+
+# reclaimable_kb [prefix]: file cache that drop_caches can drop, in kB, from
+# the <prefix> fields (default m_). See the header for the formula.
+reclaimable_kb() {
+    local p="${1:-m_}"
+    local af="${p}Activefile" inf="${p}Inactivefile" mp="${p}Mapped" dt="${p}Dirty" wb="${p}Writeback"
+    local r=$(( ${!af:-0} + ${!inf:-0} - ${!mp:-0} - ${!dt:-0} - ${!wb:-0} ))
+    (( r < 0 )) && r=0
+    echo "$r"
+}
+
+now_ms() { local t; t=$(date '+%s%N'); echo $(( t / 1000000 )); }
+
+relief_last_s=""
+relief_pid=""                     # set while a relief runs in the background
+# Runs from the MemFree trigger at each sample once it has counted RELIEF_AT
+# samples, so a relief can still run if the rate limit ends mid-count. Skip
+# reasons are logged once per count, at RELIEF_AT. Returns 0 always: a relief
+# problem must never end the watchdog, even under set -e.
+try_relief() {
+    [[ "$RELIEF" == drop_caches && -z "$relief_pid" ]] || return 0
+    (( below_free >= RELIEF_AT )) || return 0
+    local rec_before; rec_before=$(reclaimable_kb)
+    if (( rec_before < RELIEF_MIN_KB )); then
+        (( below_free == RELIEF_AT )) && echo "$(date '+%F %T') relief skipped: reclaimable cache $((rec_before/1024)) MiB is under ${RELIEF_MIN_GIB} GiB"
+        return 0
+    fi
+    if [[ -n "$relief_last_s" ]] && (( SECONDS - relief_last_s < RELIEF_INTERVAL )); then
+        (( below_free == RELIEF_AT )) && echo "$(date '+%F %T') relief skipped: last relief $(( SECONDS - relief_last_s ))s ago, limit one per ${RELIEF_INTERVAL}s"
+        return 0
+    fi
+    relief_free_before=$free relief_avail_before=$avail relief_rec_before=$rec_before
+    relief_count=$below_free relief_start_s=$SECONDS
+    rm -f "$RELIEF_DIR/result" "$RELIEF_DIR/out"
+    # The subshell writes "<rc> <ms> <MemFree> <MemAvailable> <reclaimable>"
+    # (kB, read right after the command) to result when the command ends.
+    # Its own stdout and stderr go to /dev/null, so a relief that ends after
+    # the watchdog exits writes nothing into the log.
+    (
+        s0=$(now_ms); rc=0
+        timeout -k "$RELIEF_KILL_S" "$RELIEF_TIMEOUT_S" sh -c "$RELIEF_CMD" > "$RELIEF_DIR/out" 2>&1 || rc=$?
+        s1=$(now_ms)
+        read_meminfo r_
+        echo "$rc $(( s1 - s0 )) ${r_MemFree:-0} ${r_MemAvailable:-0} $(reclaimable_kb r_)" > "$RELIEF_DIR/result.tmp"
+        mv -f "$RELIEF_DIR/result.tmp" "$RELIEF_DIR/result"
+    ) < /dev/null > /dev/null 2>&1 &
+    relief_pid=$!
+    local i
+    for (( i = 0; i < RELIEF_WAIT_STEPS; i++ )); do
+        [[ -f "$RELIEF_DIR/result" ]] && break
+        sleep 0.05
+    done
+    if [[ -f "$RELIEF_DIR/result" ]]; then
+        relief_poll
+    else
+        echo "$(date '+%F %T') relief still running after 1 s; sampling continues, the MemFree counter resets when it ends"
+    fi
+    return 0
+}
+
+# relief_poll: handles the end of a background relief. Called once per
+# sample before the triggers and from try_relief. Returns 0 always.
+relief_poll() {
+    [[ -n "$relief_pid" ]] || return 0
+    if [[ ! -f "$RELIEF_DIR/result" ]]; then
+        if (( SECONDS - relief_start_s > RELIEF_STUCK_S )); then
+            echo "$(date '+%F %T') RELIEF STUCK: drop_caches still running after $(( SECONDS - relief_start_s ))s" \
+                 "(timeout ${RELIEF_TIMEOUT_S}s + ${RELIEF_KILL_S}s kill did not end it)"
+            echo "$(date '+%F %T') relief disabled for this run; the MemFree trigger stops the container after ${CONSEC} samples as with relief off"
+            RELIEF=off relief_pid=""
+        fi
+        return 0
+    fi
+    wait "$relief_pid" 2>/dev/null || true
+    relief_pid=""
+    relief_last_s=$SECONDS
+    local rc="" ms="" a_free="" a_avail="" a_rec="" out=""
+    read -r rc ms a_free a_avail a_rec < "$RELIEF_DIR/result" || true
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+    [[ "$a_free" =~ ^[0-9]+$ ]] || a_free=0
+    [[ "$a_avail" =~ ^[0-9]+$ ]] || a_avail=0
+    [[ "$a_rec" =~ ^[0-9]+$ ]] || a_rec=0
+    if (( rc != 0 )); then
+        [[ -f "$RELIEF_DIR/out" ]] && out=$(head -n 1 "$RELIEF_DIR/out" 2>/dev/null || true)
+        local why="exit $rc"
+        (( rc == 124 || rc == 137 )) && why="timed out after ${RELIEF_TIMEOUT_S}s"
+        echo "$(date '+%F %T') RELIEF FAILED ($why, $ms ms): $out"
+        echo "$(date '+%F %T') relief disabled for this run; the MemFree trigger stops the container after ${CONSEC} samples as with relief off"
+        RELIEF=off
+        return 0
+    fi
+    echo "$(date '+%F %T') RELIEF drop_caches at ${relief_count}/${CONSEC} sub-floor MemFree samples ($ms ms):" \
+         "before MemFree=$((relief_free_before/1024)) MiB MemAvailable=$((relief_avail_before/1024)) MiB reclaimable=$((relief_rec_before/1024)) MiB;" \
+         "after MemFree=$(( a_free / 1024 )) MiB MemAvailable=$(( a_avail / 1024 )) MiB reclaimable=$(( a_rec / 1024 )) MiB;" \
+         "MemFree counter reset"
+    below_free=0
+    return 0
+}
 
 archive_logs() {  # <timestamp>
     mkdir -p "$ARCHIVE_DIR"
@@ -109,9 +295,9 @@ TREND_GIB="${MEMWATCH_TREND_GIB:-4}"
 TREND_WARMUP_S="${MEMWATCH_TREND_WARMUP_S:-900}"
 TREND_BASELINE_S="${MEMWATCH_TREND_BASELINE_S:-600}"
 while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
-    eval "$(awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapFree|AnonPages|Shmem|Mapped|Slab|SUnreclaim|PageTables|KernelStack):/ {
-                     sub(":", "", $1); print "m_" $1 "=" $2 }' /proc/meminfo)"
+    read_meminfo
     avail=$m_MemAvailable; free=$m_MemFree
+    relief_poll
     driver=$(( m_MemTotal - m_MemFree - m_Buffers - m_Cached - m_AnonPages - m_Slab - m_PageTables - m_KernelStack ))
     if (( driver > 0 )); then
         # Baseline window: [TREND_WARMUP_S, TREND_WARMUP_S + TREND_BASELINE_S)
@@ -149,6 +335,7 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
         below_free=$(( below_free + 1 ))
         echo "$(date '+%F %T') below MemFree floor ${below_free}/${CONSEC}: MemFree=$((free/1024)) MiB MemAvailable=$((avail/1024)) MiB"
         (( below_free >= CONSEC )) && stop_container "MemFree under ${MIN_FREE_GIB} GiB for ${CONSEC} samples"
+        try_relief
     else
         (( below_free > 0 )) && echo "$(date '+%T') recovered after ${below_free} sub-floor MemFree sample(s): MemFree=$((free/1024)) MiB"
         below_free=0
@@ -172,6 +359,6 @@ while docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}\$"; do
              "sunreclaim=$((m_SUnreclaim/1024))MiB driver=$((driver/1024))MiB"
     fi
     tick=$((tick+1))
-    sleep 1
+    sleep "$SAMPLE_S"
 done
 echo "$(date '+%F %T') container gone; watchdog exit (NV_ERR_NO_MEMORY seen since watchdog start: $nvrm_total)"

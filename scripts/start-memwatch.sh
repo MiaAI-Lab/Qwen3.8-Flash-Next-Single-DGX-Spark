@@ -5,7 +5,9 @@
 # drift. Runs memwatch in the background (nohup) and prints the log path.
 #
 # Env honoured (passed through to memwatch): MEMWATCH_MIN_FREE_GIB,
-# MEMWATCH_FREE_GATE_GIB, MEMWATCH_GRACE. Defaults match memwatch.sh's own.
+# MEMWATCH_FREE_GATE_GIB, MEMWATCH_GRACE, MEMWATCH_RELIEF, MEMWATCH_RELIEF_AT,
+# MEMWATCH_RELIEF_MIN_GIB, MEMWATCH_RELIEF_INTERVAL. Defaults match
+# memwatch.sh's own.
 set -euo pipefail
 
 CONTAINER="${1:?container}"
@@ -16,6 +18,10 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 MIN_FREE_GIB="${MEMWATCH_MIN_FREE_GIB:-2}"
 FREE_GATE_GIB="${MEMWATCH_FREE_GATE_GIB:-10}"
 GRACE="${MEMWATCH_GRACE:-30}"
+RELIEF="${MEMWATCH_RELIEF:-off}"
+RELIEF_AT="${MEMWATCH_RELIEF_AT:-2}"
+RELIEF_MIN_GIB="${MEMWATCH_RELIEF_MIN_GIB:-1}"
+RELIEF_INTERVAL="${MEMWATCH_RELIEF_INTERVAL:-60}"
 MEMWATCH_LOG="${MEMWATCH_LOG:-$REPO_DIR/logs/memwatch-${CONTAINER}.log}"
 
 mkdir -p "$REPO_DIR/logs/archive"
@@ -26,6 +32,8 @@ pkill -f "[f]iles/memwatch.sh $CONTAINER" 2>/dev/null || true
 
 MEMWATCH_MIN_FREE_GIB="$MIN_FREE_GIB" MEMWATCH_FREE_GATE_GIB="$FREE_GATE_GIB" \
     MEMWATCH_GRACE="$GRACE" MEMWATCH_LOG="$MEMWATCH_LOG" \
+    MEMWATCH_RELIEF="$RELIEF" MEMWATCH_RELIEF_AT="$RELIEF_AT" \
+    MEMWATCH_RELIEF_MIN_GIB="$RELIEF_MIN_GIB" MEMWATCH_RELIEF_INTERVAL="$RELIEF_INTERVAL" \
     nohup bash "$REPO_DIR/files/memwatch.sh" "$CONTAINER" "$MIN_GIB" \
     > "$MEMWATCH_LOG" 2>&1 &
 echo "$MEMWATCH_LOG"

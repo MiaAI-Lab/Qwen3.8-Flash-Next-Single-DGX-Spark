@@ -5,7 +5,6 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
-
 ## 2026-09-28
 
 ### Added
@@ -82,6 +81,19 @@ BF16 SSM, `MAX_NUM_SEQS=4`), one launch per arm. NLL = mean prompt NLL over
 - **k=6** (with block drop): code +16% / +14% / +4% at S=1/2/4, prose -9% /
   -5% / -16%, NLL and prefill unchanged, warm turn 0.73 s. Worth it for
   code-heavy traffic only; the default stays 3.
+
+## 2026-09-23
+
+### Added
+
+- **Watchdog relief step for the MemFree floor (`MEMWATCH_RELIEF`).** With
+  `drop_caches`, `files/memwatch.sh` drops clean page cache once before the
+  MemFree floor stops the container, and stops only if MemFree stays low.
+  Default `off` keeps the old behaviour line for line. The floor stopped a
+  server at MemFree 1.2 GiB while 5.7 GiB of clean page cache was still
+  resident. Knobs, rate limit
+  and failure fallback are in README "Watchdog". Hermetic tests:
+  `tests/test_memwatch_relief.sh`.
 
 ## 2026-09-18
 

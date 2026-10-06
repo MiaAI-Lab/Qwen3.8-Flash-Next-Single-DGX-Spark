@@ -87,6 +87,9 @@
 # ple_layer.py; see README for the docker invocation.
 !/tests/test_nvidia_ple.py
 !/tests/test_nvidia_mtp.py
+# Hermetic bash test for files/memwatch.sh; runs on the host with fake
+# docker, journalctl and sudo.
+!/tests/test_memwatch_relief.sh
 !/tests/test_ple_staging_width.py
 !/tests/test_determinism_patch.py
 !/tests/test_mtp_block.py
