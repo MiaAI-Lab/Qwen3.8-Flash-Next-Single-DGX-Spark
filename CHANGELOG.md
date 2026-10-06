@@ -5,6 +5,83 @@ are grouped by date, newest first. Every measurement named here was taken on the
 one DGX Spark this repo is written for — treat them as that host's numbers, not
 as promises.
 
+## 2026-09-28
+
+### Added
+
+- **Language-extended draft vocabularies for zh, ja, de, pt, fr, ru** —
+  `files/draft_vocab_{zh,ja,de,pt,fr,ru}_en_code_65k.txt`, the Spanish recipe
+  (`files/build_draft_vocab_extend.py`) applied to each: the 47k file whole as
+  a floor (verified: all 47,172 ids present in every file), byte-fallback range
+  pinned (all 400), 668 MiB of that language's Wikipedia at natural
+  frequencies, 65,536 rows. Switch with
+  `MTP_DRAFT_VOCAB=files/draft_vocab_<lang>_en_code_65k.txt`.
+  Held-out Wikipedia coverage (68 MiB disjoint tail per language, 18–20M
+  occurrences): zh 34.7→96.7%, ja 30.0→99.7%, de 60.2→99.5%,
+  pt 65.4→99.2%, fr 69.4→99.5%, ru 31.5→99.7%. Wikipedia-only build (the
+  Spanish build also ranked model output; no live server at build time — see
+  the README section for the rebuild path if acceptance measures low).
+  **Measured (2026-09-29, one boot per arm, 5 prompts × 2 reps per language,
+  temp 0, thinking off, 47k baseline → language file → 47k again as drift
+  bound)**: ru 32.5/30.0 → 53.1 (+63…+77%), zh 37.5/35.5 → 50.8 (+36…+43%),
+  ja 34.5/32.4 → 46.5 (+35…+44%), fr 41.5 → 47.5 (+14%), de 42.7/41.8 → 48.6
+  (+14…+16%), pt 44.1/44.0 → 48.4 (+10%); English control 55.3/54.1 →
+  53.0–54.8 across all nine boots (~flat, the 0.22→0.31 GiB draft-head cost).
+  Gain ordering tracks held-out coverage exactly. See the README section for
+  the full protocol and the accepted/draft capture caveat.
+
+## 2026-09-25
+
+### Added
+
+- **`./start-v030.sh`: an opt-in lane on stock vLLM 0.30.0 with the nvidia
+  checkpoint.** Three overlays: a file-backed PLE table read over ATS
+  (persistent, one file per snapshot), a backport of vllm#55557 for FP8 KV,
+  and the reduced draft vocab ported to v0.30. Versus the default lane on one
+  GB10: NLL 1.344 -> 1.332, prefill +10%, turn-1 TTFT 0.81 -> 0.67 s, code
+  decode +6% at S=4, prose decode -25..-32%. KV 801k tokens at 12 GiB. A
+  1-hour soak: 784 requests, 0 errors. See the README section.
+- `scripts/supervise.sh` and `scripts/maintenance-relaunch.sh` relaunch
+  through the entry point recorded in `logs/launch-lane`.
+
+## 2026-09-24
+
+All measured on one GB10, `.env.sample` profile (262k, MTP 3, 47k vocab, FP8 KV,
+BF16 SSM, `MAX_NUM_SEQS=4`), one launch per arm. NLL = mean prompt NLL over
+15,776 positions of 8 fixed texts (code, EN/ES prose); decode = `bench/sweep.py`,
+3 repeats; prefill = cold 47,381-token prompt.
+
+### Fixed
+
+- **PLE rows now reach the GPU on multi-token forwards** (PR #67). The worker's
+  staging buffer was 2,560 wide; the `[:T, :1440]` slice is not contiguous for
+  T > 1, so each prefill chunk and MTP verify step shipped stale rows. NLL
+  1.397 -> **1.344** (every text improved), HumanEval 153 -> 157/164 (noise is
+  about ±3 on a non-deterministic server), decode unchanged.
+- **Launcher on a fresh install / poisoned MTP ring cache** (PR #65, #53).
+- **MTP guard computes the block per k** (PR #70): k=6 and k=16 are legal.
+- **`bench/sweep.py` survives sparkDash's 2-jobs-per-minute cooldown (429).**
+
+### Added
+
+- **`MTP_DISABLE_BLOCK_DROP=1` works and ships on in `.env.sample`** (PR #71,
+  vllm#53388 backport; the key used to fail the launch). Warm second turn
+  1.66 -> **0.81 s** TTFT, turn after a 4k tool output 3.61 -> 2.72 s (medians of 3), decode
+  unchanged. `start.sh` still defaults to 0 for existing `.env` files.
+- **`VLLM_QSA_DET_TOPK=1` / `VLLM_MOE_DET_FINALIZE=1` now work** (were
+  plumbing only; #28). `files/patch_determinism.py` sorts the QSA top-k rows
+  and selects FlashInfer's unfused MoE finalize with its own autotune cache.
+  Identical requests: prompt-logprob spread median 0.19 / max 4.8 nats -> **0 /
+  0**; greedy outputs 5/5 distinct -> 1/5, also cold and after another prompt.
+  NLL unchanged, decode within noise, prefill 1,953 -> 1,886 tok/s (-3.4%), so
+  opt-in.
+
+### Measured, not adopted
+
+- **k=6** (with block drop): code +16% / +14% / +4% at S=1/2/4, prose -9% /
+  -5% / -16%, NLL and prefill unchanged, warm turn 0.73 s. Worth it for
+  code-heavy traffic only; the default stays 3.
+
 ## 2026-09-23
 
 ### Added

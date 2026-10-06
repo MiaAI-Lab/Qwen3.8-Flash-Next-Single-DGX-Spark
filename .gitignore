@@ -45,7 +45,9 @@
 !/files/patch_ple_layer.py
 !/files/patch_modelopt_mxfp8.py
 !/files/patch_ple_offload.py
+!/files/mtp_block.py
 !/files/patch_qsa_fp8_kv.py
+!/files/patch_determinism.py
 !/files/patch_mtp_draft_vocab.py
 # shipped reduced draft vocabulary (47,149 ids, code-tuned). The 65k en+code
 # vocab the +25% decode win was measured with is a generated artifact and is
@@ -55,6 +57,15 @@
 # Wikipedia; +28.6% Spanish decode, English untouched). For deployments
 # serving Spanish traffic; see docs/spanish-drafting-and-performance-*.md.
 !/files/draft_vocab_es_en_code_65k.txt
+# Language-extended variants (65,536 rows each, the 47k file as floor +
+# that language's Wikipedia; same recipe as the ES file). For deployments
+# serving that language's traffic; see README "Serving other languages".
+!/files/draft_vocab_zh_en_code_65k.txt
+!/files/draft_vocab_ja_en_code_65k.txt
+!/files/draft_vocab_de_en_code_65k.txt
+!/files/draft_vocab_pt_en_code_65k.txt
+!/files/draft_vocab_fr_en_code_65k.txt
+!/files/draft_vocab_ru_en_code_65k.txt
 # builds the reduced draft vocabulary the MTP patch reads. Its output is a
 # generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
 !/files/build_draft_vocab.py
@@ -79,6 +90,9 @@
 # Hermetic bash test for files/memwatch.sh; runs on the host with fake
 # docker, journalctl and sudo.
 !/tests/test_memwatch_relief.sh
+!/tests/test_ple_staging_width.py
+!/tests/test_determinism_patch.py
+!/tests/test_mtp_block.py
 
 # --- benchmark harness (2026-09-05/06 overnight sweep) ------------------
 # The published numbers are sparkDash's; these drive sparkDash one
@@ -108,6 +122,24 @@
 !/docs/cache-reporting.md
 !/tests/test_prompt_token_details.py
 
+# --- opt-in MTP patch: vllm#53388 block-drop backport --------------------
+# Generator only. start.sh runs it when MTP_DISABLE_BLOCK_DROP=1; its output
+# (files/block_drop/) stays ignored. The test runs on the host, CPU only.
+!/files/patch_block_drop.py
+!/tests/test_block_drop.py
+
+# --- opt-in vLLM 0.30 lane (start-v030.sh) -------------------------------
+# Generators only; files/v030_fp8kv/, files/v030_ple/ and
+# files/mtp_v030_patched.py* are generated per launch and stay ignored.
+!/start-v030.sh
+!/scripts/launch-lane.sh
+!/files/patch_mtp_draft_vocab_v030.py
+!/files/patch_qsa_fp8_kv_v030.py
+!/files/patch_ple_mmap_v030.py
+!/tests/test_v030_lane.py
+!/tests/test_qsa_fp8_kv_v030.py
+!/tests/test_ple_mmap_v030.py
+
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts
 #   .env                      may contain HF_TOKEN
@@ -119,3 +151,4 @@
 #   files/ple_layer_patched.py, files/modelopt_patched.py,
 #   files/mtp_patched.py,
 #   files/ple_offload/*.py    generated from the .orig copies on every launch
+#   files/block_drop/         orig/ from the image, patched copies generated per launch

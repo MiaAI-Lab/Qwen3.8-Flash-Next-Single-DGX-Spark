@@ -56,7 +56,11 @@ done
 "$REPO_DIR/stop.sh" >"$REPO_DIR/logs/maintenance-stop.log" 2>&1 || true
 log "stop complete"
 
-if "$REPO_DIR/start.sh" >"$REPO_DIR/logs/maintenance-start.log" 2>&1; then
+source "$REPO_DIR/scripts/launch-lane.sh"
+load_launch_lane
+[[ -n "$LANE_MEMWATCH_MIN_GIB" ]] && export MEMWATCH_MIN_GIB="$LANE_MEMWATCH_MIN_GIB"
+[[ -n "$LANE_MEMWATCH_MIN_FREE_GIB" ]] && export MEMWATCH_MIN_FREE_GIB="$LANE_MEMWATCH_MIN_FREE_GIB"
+if "$START_SCRIPT" >"$REPO_DIR/logs/maintenance-start.log" 2>&1; then
     log "relaunch complete; running smoke test"
     if "$REPO_DIR/scripts/smoke-test.sh" >"$REPO_DIR/logs/maintenance-smoke.log" 2>&1; then
         log "smoke test PASS — closing maintenance window"

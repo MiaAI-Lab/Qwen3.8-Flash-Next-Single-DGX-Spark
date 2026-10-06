@@ -88,7 +88,7 @@ else
     # top-k kernel is non-deterministic (drops candidates, upstream
     # vllm#51782). Flaky in both directions — a pass does not prove the
     # kernel is deterministic either.
-    note "outputs differ at temperature 0 (known GB10 QSA top-k non-determinism — see issue #7)"
+    note "outputs differ at temperature 0 (QSA top-k + MoE finalize order; VLLM_QSA_DET_TOPK=1 VLLM_MOE_DET_FINALIZE=1 makes them identical, #28)"
 fi
 
 echo "== 5. decode speed (real answer, not ignore_eos) =="

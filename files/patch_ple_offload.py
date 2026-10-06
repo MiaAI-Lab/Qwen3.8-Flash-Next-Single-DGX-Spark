@@ -439,5 +439,56 @@ patch("worker.py", [
         "            for flag in flags:\n"
         "                flag[0] = request.seq\n",
     ),
+    # Size the pinned staging buffer to the packed row width. forward_impl
+    # slices the buffer to [:T, :row_width]. At the ple_embed_dim width
+    # (2560) that slice is not contiguous for T > 1, reshape() returns a
+    # copy, and index_select writes the rows into the copy: every forward
+    # with more than one token (each verify step, each prefill chunk) sent
+    # the stale or zero staging bytes to the GPU. The packed rows are
+    # ngram_heads x row bytes (16 x 90 = 1440), so a buffer of exactly that
+    # width makes the slice contiguous.
+    (
+        "logger = init_logger(__name__)\n",
+        "logger = init_logger(__name__)\n"
+        "\n"
+        "\n"
+        "def _staging_width(layer, embedding_dim: int) -> int:\n"
+        "    \"\"\"Width of one token's packed PLE rows, as forward_impl slices them.\n"
+        "\n"
+        "    Follows the branch order of forward_impl's offload path: the packed\n"
+        "    table, then separate codes and 2-D scales, then the plain weight.\n"
+        "    Returns embedding_dim when the width is not known.\n"
+        "    \"\"\"\n"
+        "    heads = getattr(layer, \"ngram_heads\", None)\n"
+        "    emb = getattr(layer, \"ngram_embedding\", None)\n"
+        "    width = None\n"
+        "    if heads is not None and emb is not None:\n"
+        "        packed = getattr(emb, \"_packed_table\", None)\n"
+        "        weight = getattr(emb, \"weight\", None)\n"
+        "        scales = getattr(emb, \"weight_scale\", None)\n"
+        "        if packed is not None:\n"
+        "            width = int(heads) * int(packed.shape[-1])\n"
+        "        elif weight is not None and scales is not None and scales.dim() == 2:\n"
+        "            width = int(heads) * (int(weight.shape[-1])\n"
+        "                                  + int(scales.view(torch.uint8).shape[-1]))\n"
+        "        elif weight is not None:\n"
+        "            width = int(heads) * int(weight.shape[-1])\n"
+        "    if width is None or width <= 0 or width > embedding_dim:\n"
+        "        logger.warning(\n"
+        "            \"PLE staging: row width %s is not usable; keeping %d\", width, embedding_dim\n"
+        "        )\n"
+        "        return embedding_dim\n"
+        "    if width != embedding_dim:\n"
+        "        logger.info(\"PLE staging: width %d (packed rows), not %d\", width, embedding_dim)\n"
+        "    return width\n",
+    ),
+    (
+        "                self._pinned_bufs[dp_rank][layer_name] = torch.empty(\n"
+        "                    max_tokens,\n"
+        "                    embedding_dim,\n",
+        "                self._pinned_bufs[dp_rank][layer_name] = torch.empty(\n"
+        "                    max_tokens,\n"
+        "                    _staging_width(self._layers[layer_name], embedding_dim),\n",
+    ),
 ])
 print("ok")
