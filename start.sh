@@ -905,7 +905,7 @@ if [[ -n "$YARN_FACTOR" ]]; then
     # Deep-merged into text_config.rope_parameters, which is what this model
     # reads (nvidia/qsa.py) and what vLLM's max-len check scales by. The
     # existing mrope_section / rope_theta / partial_rotary_factor survive.
-    VLLM_ARGS+=("--hf-overrides" "$(printf "'{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":%s,\"original_max_position_embeddings\":%s}}}'" "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
+    VLLM_ARGS+=("--hf-overrides" "$(printf '{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":%s,"original_max_position_embeddings":%s}}}' "$YARN_FACTOR" "$NATIVE_MAX_MODEL_LEN")")
 fi
 VLLM_ARGS+=("--load-format" "safetensors")
 VLLM_ARGS+=("--safetensors-load-strategy" "lazy")
@@ -1048,7 +1048,7 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
                 printf "%s", out
             }')]"
     fi
-    VLLM_ARGS+=("--speculative-config" "$(printf "'{\"method\":\"mtp\",\"num_speculative_tokens\":%s%s%s}'" "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
+    VLLM_ARGS+=("--speculative-config" "$(printf '{"method":"mtp","num_speculative_tokens":%s%s%s}' "$MTP_NUM_SPECULATIVE_TOKENS" "$_SPEC_SCHED" "$_SPEC_ARGMAX")")
 fi
 _CG_SIZES="$CUDAGRAPH_CAPTURE_SIZES"
 if [[ "$_CG_SIZES" == "auto" ]]; then
@@ -1075,20 +1075,43 @@ print(",".join(str(x) for x in sorted(
     )
 fi
 if [[ -n "$_CG_SIZES" ]]; then
-    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\",\"cudagraph_capture_sizes\":[%s]}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
+    VLLM_ARGS+=("--compilation-config" "$(printf '{"mode":%s,"cudagraph_mode":"%s","cudagraph_capture_sizes":[%s]}' "$COMPILATION_MODE" "$CUDAGRAPH_MODE" "$_CG_SIZES")")
 else
-    VLLM_ARGS+=("--compilation-config" "$(printf "'{\"mode\":%s,\"cudagraph_mode\":\"%s\"}'" "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
+    VLLM_ARGS+=("--compilation-config" "$(printf '{"mode":%s,"cudagraph_mode":"%s"}' "$COMPILATION_MODE" "$CUDAGRAPH_MODE")")
 fi
-# EXTRA_VLLM_ARGS is word-split with shell-word semantics, so quoting inside
-# the value is not supported (same contract as EXTRA_DOCKER_ARGS).
-[[ -n "$EXTRA_VLLM_ARGS" ]] && { read -ra _EXTRA_VLLM <<< "$EXTRA_VLLM_ARGS"; VLLM_ARGS+=("${_EXTRA_VLLM[@]}"); }
+# EXTRA_VLLM_ARGS is split into argv tokens by shlex (eval-free): whitespace
+# separates and single quotes group, so '...' content is one literal token.
+# A double quote is data, not grouping -- the value is never re-parsed
+# (VLLM_ARGS_STR below), so JSON works bare (--kernel-config={"m":"b"})
+# AND single-quoted (--kernel-config '{"m":"b"}', the pattern
+# docs/overnight-2026-09-05.md ships). EXTRA_DOCKER_ARGS differs: it lands
+# raw in the launch heredoc and IS re-parsed by the shell at exec time.
+if [[ -n "$EXTRA_VLLM_ARGS" ]]; then
+    _EXTRA_PARSED=$(python3 - "$EXTRA_VLLM_ARGS" <<'PY'
+import sys, shlex
+lx = shlex.shlex(sys.argv[1], posix=True)
+lx.whitespace_split = True
+lx.quotes = "'"
+lx.commenters = ""
+print("\n".join(lx))
+PY
+    ) || err "EXTRA_VLLM_ARGS has an unterminated single quote"
+    if [[ -n "$_EXTRA_PARSED" ]]; then
+        _EXTRA_VLLM=()
+        while IFS= read -r _TOK; do _EXTRA_VLLM+=("$_TOK"); done <<< "$_EXTRA_PARSED"
+        VLLM_ARGS+=("${_EXTRA_VLLM[@]}")
+    fi
+fi
 # API_KEY -> --api-key: added ONLY in the heredoc body below, as
 # --api-key \$API_KEY. VLLM_ARGS_STR must not carry the flag: it flows through
 # the UNQUOTED heredoc, where any $-expansion happens at script-generation
 # time and would bake the secret into .last_launch.sh. The heredoc's
 # \$API_KEY resolves from the generated script's environment at exec time,
 # exactly like HF_TOKEN (see the export below).
-VLLM_ARGS_STR="${VLLM_ARGS[*]}"
+# %q-escape each element so the generated launch script's re-parse recovers
+# every argument verbatim; the old "${VLLM_ARGS[*]}" flatten lost quoting and
+# stripped the double quotes out of JSON values (issue #11).
+printf -v VLLM_ARGS_STR '%q ' "${VLLM_ARGS[@]}"
 
 # Non-loopback bind with no api key = the whole network the box is on can
 # reach an unauthenticated unfiltered model. Warn, do not refuse (this is
